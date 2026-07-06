@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Xenia Canary UWP package manifest (Xbox Series S/X + Windows).
+
+  Capability rationale (Microsoft docs):
+    codeGeneration  - REQUIRED. Xenia JIT-compiles guest PPC into executable host
+                      memory; in the App Container, VirtualAllocFromApp with
+                      PAGE_EXECUTE_* is only permitted with this capability.
+                      https://learn.microsoft.com/windows/uwp/packaging/app-capability-declarations
+    removableStorage- Access games of the declared file types on USB / external
+                      drives (pairs with the fileTypeAssociation extension).
+    internetClient  - Outbound networking (updates / optional online features).
+
+  File access model: FilePicker (FolderPicker/FileOpenPicker) + FutureAccessList
+  (no broadFileSystemAccess / runFullTrust). The fileTypeAssociation lets the user
+  launch a game directly from the system file browser.
+
+  TargetDeviceFamily: Universal covers desktop + Xbox; Windows.Xbox pins the Xbox
+  console family explicitly. MinVersion 10.0.17134.0 = the first build exposing the
+  *FromApp file APIs and CreateFile2FromApp used by this port.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap mp rescap">
+
+  <Identity
+    Name="27d6ba69-e4f1-4b69-b391-8238bab5a431"
+    Publisher="CN=MNKE"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <mp:PhoneIdentity PhoneProductId="27d6ba69-e4f1-4b69-b391-8238bab5a431"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+    <Properties>
+    <DisplayName>Xenia Canary</DisplayName>
+    <PublisherDisplayName>MNKE</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17134.0"
+                        MaxVersionTested="10.0.26100.0" />
+    <TargetDeviceFamily Name="Windows.Xbox" MinVersion="10.0.17134.0"
+                        MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="x-generate" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App" Executable="$targetnametoken$.exe"
+                 EntryPoint="XeniaCanaryUwp.App">
+      <uap:VisualElements
+        DisplayName="Xenia Canary"
+        Description="Xenia Canary - Xbox 360 research emulator (UWP)."
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        BackgroundColor="transparent">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Launch a game directly from the file browser. -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="xenia">
+            <uap:SupportedFileTypes>
+              <uap:FileType>.xex</uap:FileType>
+              <uap:FileType>.iso</uap:FileType>
+              <uap:FileType>.zar</uap:FileType>
+              <uap:FileType>.con</uap:FileType>
+              <uap:FileType>.pirs</uap:FileType>
+              <uap:FileType>.live</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+        <!-- Frontend integration: xeniacanary:cmd=... -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="xeniacanary">
+            <uap:DisplayName>Xenia Canary</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Capability set matching the proven Xbox Dev Mode emulators (RetroArch
+         and Dolphin UWP ship exactly this combination). -->
+    <Capability Name="internetClient" />
+    <!-- For the emulated Xbox 360 network stack (system link / netplay). -->
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+    <!-- Mandatory for the JIT (FromApp executable memory). -->
+    <Capability Name="codeGeneration" />
+    <uap:Capability Name="removableStorage" />
+    <!-- Game Mode resources: on Xbox this grants the exclusive >=4GB memory
+         partition and exclusive CPU cores (the "Game" memory profile) without
+         having to re-select the app type in Dev Home after every redeploy.
+         Deprecated for Store submission, but Dev Mode sideloading is exactly
+         its remaining use case. -->
+    <rescap:Capability Name="expandedResources" />
+    <!-- Direct filesystem access by path (E:\..., D:\...) without going
+         through the picker/FutureAccessList broker - required for launching
+         from the recent-titles list and for content next to the games. -->
+    <rescap:Capability Name="broadFileSystemAccess" />
+    <!-- Full-trust process: relaxes App Container restrictions in Dev Mode
+         (both RetroArch and Dolphin UWP declare it; Store would reject it,
+         but this package targets Dev Mode sideloading only). -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
