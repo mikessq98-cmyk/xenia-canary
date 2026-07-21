@@ -10,7 +10,9 @@
 #ifndef XENIA_UI_IMGUI_DIALOG_H_
 #define XENIA_UI_IMGUI_DIALOG_H_
 
+#include <functional>
 #include <memory>
+#include <utility>
 
 #include "xenia/base/threading.h"
 #include "xenia/ui/imgui_drawer.h"
@@ -36,6 +38,15 @@ class ImGuiDialog {
 
   bool IsClosing() const { return has_close_pending_; }
 
+  // Dialogs delete themselves once closed (see Draw), so anything keeping a
+  // pointer to one must be told when that happens - otherwise the next use of
+  // that pointer touches freed memory. Opening the settings editor a second
+  // time crashed exactly this way: the owning unique_ptr still held the
+  // already-deleted dialog and destroyed it again.
+  void SetDestroyedCallback(std::function<void()> callback) {
+    destroyed_callback_ = std::move(callback);
+  }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 
@@ -55,6 +66,8 @@ class ImGuiDialog {
 
   ImGuiDrawer* imgui_drawer_ = nullptr;
   bool has_close_pending_ = false;
+  // Invoked from the destructor - see SetDestroyedCallback.
+  std::function<void()> destroyed_callback_;
   std::vector<xe::threading::Fence*> waiting_fences_;
 };
 

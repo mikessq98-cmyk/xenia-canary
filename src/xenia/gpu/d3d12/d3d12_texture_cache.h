@@ -775,6 +775,9 @@ class D3D12TextureCache final : public TextureCache {
   // within the host's means (and the d3d12_scaled_resolve_max_mb cap, if set),
   // releasing regions the game has stopped using if that's what it takes.
   bool MakeRoomForScaledResolveRegion(uint64_t bytes_needed);
+  // Whether the host can spare this many bytes on top of the reserve, without
+  // releasing anything.
+  bool HasHostMemoryFor(uint64_t bytes) const;
   // Frees the buffers of regions whose copies the GPU has finished with.
   void ReleaseCompletedRetiredScaledResolveBuffers();
 
@@ -952,6 +955,10 @@ class D3D12TextureCache final : public TextureCache {
   // surfaces, orders of magnitude smaller than this - only merging could ever
   // approach it, and it simply stops merging there.
   static constexpr uint64_t kScaledResolveMaxRegionSize = 1ULL << 31;
+  // Growth beyond the memory being given back that a merge may cost while the
+  // old buffers are still alive; past this the host must have the room to
+  // spare, or the request gets its own region instead.
+  static constexpr uint64_t kScaledResolveMergeTransientLimit = 64ULL << 20;
   // Host memory kept free for everything else (the driver's compilation
   // arenas, textures, render targets) when deciding whether another scaled
   // resolve region may be committed. Regions are individual surfaces - tens of

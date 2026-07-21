@@ -404,6 +404,11 @@ class PipelineCache {
   // gives up on reproducing the previous run's crash (see CreateD3D12Pipeline)
   // instead of starving the game of pipelines for the whole session.
   std::atomic<uint32_t> solver_safe_mode_creations_{0};
+  // Serializes pipeline creation while the host is short on memory (see
+  // d3d12_pipeline_creation_memory_throttle_mb), and whether that has been
+  // reported once.
+  std::mutex creation_memory_throttle_mutex_;
+  std::atomic<bool> creation_memory_throttle_logged_{false};
   static constexpr uint32_t kSolverSafeModeMaxCreations = 192;
   std::filesystem::path solver_toxic_path_;
   std::filesystem::path solver_journal_path_;

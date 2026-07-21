@@ -130,6 +130,17 @@ class BaseHeap {
     return committed;
   }
 
+  // Pages this heap has ever had committed ON THE HOST. Guest decommits and
+  // releases only clear the guest page table - the host commit is never given
+  // back (see the TODO in BaseHeap::Decommit: pages committed inside a mapped
+  // section view can't simply be decommitted), so the process is charged for
+  // the PEAK the title ever reached, not for what it currently uses. The
+  // difference between this and committed_page_count() is memory that is paid
+  // for and unused.
+  uint32_t host_committed_page_count() const {
+    return host_committed_page_count_;
+  }
+
   // Sum of unreserved pages in heap
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
 
@@ -242,6 +253,15 @@ class BaseHeap {
   uint32_t page_size_shift_;
   uint32_t host_address_offset_;
   uint32_t unreserved_page_count_;
+  // One bit per page, set when the page has been committed on the host (never
+  // cleared - see host_committed_page_count).
+  std::vector<uint64_t> host_committed_bits_;
+  uint32_t host_committed_page_count_ = 0;
+  // Gives the host pages of the range back (see
+  // guest_memory_decommit_on_release); no-op when disabled or unsupported.
+  void DecommitHostRange(uint32_t start_page_number, uint32_t page_count);
+  // Records a host commit of the range in host_committed_bits_.
+  void MarkHostCommitted(uint32_t start_page_number, uint32_t page_count);
   xe::global_critical_region global_critical_region_;
   std::vector<PageEntry> page_table_;
 
@@ -585,6 +605,9 @@ class Memory {
 
   bool AccessViolationCallback(global_unique_lock_type global_lock_locked_once,
                                void* host_address, bool is_write);
+  // Recommits (zeroed) a page that was given back to the host when the title
+  // released it; returns whether the fault was resolved this way.
+  bool TryRecommitReleasedPage(void* host_address);
   static bool AccessViolationCallbackThunk(
       global_unique_lock_type global_lock_locked_once, void* context,
       void* host_address, bool is_write);

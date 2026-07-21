@@ -238,9 +238,10 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   uint64_t render_targets_bytes =
       render_target_cache_ ? render_target_cache_->GetHostMemoryUsage() : 0;
   uint64_t render_targets_mb = render_targets_bytes >> 20;
-  size_t render_target_count =
-      render_target_cache_ ? render_target_cache_->GetCachedRenderTargetCount()
-                           : 0;
+  uint32_t render_target_count =
+      render_target_cache_
+          ? render_target_cache_->GetHostMemoryRenderTargetCount()
+          : 0;
   uint64_t gpu_budget = 0, gpu_usage = 0;
   bool have_gpu_budget =
       GetD3D12Provider().QueryVideoMemoryUsage(gpu_budget, gpu_usage);

@@ -664,9 +664,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // Safety net for the explicit keyboard hold: only dialogs may hold the
   // on-screen keyboard, so with no dialogs left, release it - a dialog
   // destroyed through any path (including ClearDialogs on title launch) must
-  // never leak the hold, which would suppress the keyboard everywhere.
+  // never leak the hold, which would suppress the keyboard everywhere. This
+  // releases the hold rather than hiding outright, so a keyboard the user
+  // opened themselves (the View button gesture, which has no dialog behind it)
+  // isn't closed again on the very next frame.
   if (dialogs_.empty() && window_) {
-    window_->HideOnScreenKeyboard();
+    window_->ReleaseOnScreenKeyboardHold();
   }
 #endif
   if (dialogs_.empty() && notifications_.empty() && !force_uwp_render) {

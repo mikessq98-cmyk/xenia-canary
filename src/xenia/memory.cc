@@ -9,6 +9,8 @@
 
 #include "xenia/memory.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <random>
 
@@ -37,6 +39,19 @@ DEFINE_int32(
     "headroom, guest virtual/physical committed, and host GPU/CPU caches) "
     "every N seconds. 0 disables it. Useful for understanding where RAM goes "
     "on the memory-constrained Xbox UWP target.",
+    "Memory");
+
+DEFINE_bool(
+    guest_memory_decommit_on_release, false,
+    "Give the host back the memory a title frees, instead of holding every "
+    "page the title ever committed until it exits. Guest memory lives in a "
+    "reserved section whose pages are committed on demand, and upstream never "
+    "decommits them, so the process is charged for the title's PEAK usage - "
+    "which matters on a fixed budget like the Xbox UWP one. Pages given back "
+    "are recommitted, zeroed, if anything reads them afterwards (their "
+    "contents are undefined once released, so this is safe). Disabled by "
+    "default: it depends on the host supporting decommit inside a mapped "
+    "section view, which is probed once and reported in the log.",
     "Memory");
 
 DEFINE_bool(protect_zero, true, "Protect the zero page from reads and writes.",
@@ -650,9 +665,52 @@ cpu::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+bool Memory::TryRecommitReleasedPage(void* host_address) {
+  if (!cvars::guest_memory_decommit_on_release) {
+    return false;
+  }
+  // Only guest memory is ours to recommit.
+  size_t address = reinterpret_cast<size_t>(host_address);
+  if (address < reinterpret_cast<size_t>(virtual_membase_) ||
+      address >= reinterpret_cast<size_t>(virtual_membase_) + 0x120000000ull) {
+    return false;
+  }
+  // A page that is committed but protected is a write watch, not ours - only
+  // a page with no storage behind it can be one the title released.
+  if (xe::memory::IsCommitted(host_address)) {
+    return false;
+  }
+  size_t host_page_size = xe::memory::page_size();
+  void* page_address = reinterpret_cast<void*>(address & ~(host_page_size - 1));
+  // The contents of released memory are undefined, so zeroed pages are a
+  // perfectly good answer - and far better than an access violation in
+  // whatever happened to still hold a pointer into it (the GPU's shared
+  // memory upload sweeps ranges the title has long freed).
+  if (!xe::memory::AllocFixed(page_address, host_page_size,
+                              xe::memory::AllocationType::kCommit,
+                              xe::memory::PageAccess::kReadWrite)) {
+    return false;
+  }
+  static std::atomic<uint32_t> recommit_count{0};
+  uint32_t count = recommit_count.fetch_add(1, std::memory_order_relaxed);
+  if (count < 4 || (count % 4096) == 0) {
+    XELOGW(
+        "Guest memory: something read a page the title had released - "
+        "recommitted it zeroed at {} (occurrence {})",
+        page_address, count + 1);
+  }
+  return true;
+}
+
 bool Memory::AccessViolationCallback(
     global_unique_lock_type global_lock_locked_once, void* host_address,
     bool is_write) {
+  // A page given back to the host after the title released it (see
+  // guest_memory_decommit_on_release) - bring it back before anything else
+  // tries to make sense of the fault.
+  if (TryRecommitReleasedPage(host_address)) {
+    return true;
+  }
   // Access via physical_membase_ is special, when need to bypass everything
   // (for instance, for a data provider to actually write the data) so only
   // triggering callbacks on virtual memory regions.
@@ -810,6 +868,14 @@ void Memory::LogMemoryStatistics() {
       committed_mb(heaps_.v00000000) + committed_mb(heaps_.v40000000) +
       committed_mb(heaps_.v80000000) + committed_mb(heaps_.v90000000);
   uint64_t guest_physical_mb = committed_mb(heaps_.physical);
+  auto host_committed_mb = [](const BaseHeap& heap) -> uint64_t {
+    return (uint64_t(heap.host_committed_page_count()) * heap.page_size()) >>
+           20;
+  };
+  uint64_t guest_host_committed_mb =
+      host_committed_mb(heaps_.v00000000) + host_committed_mb(heaps_.v40000000) +
+      host_committed_mb(heaps_.v80000000) + host_committed_mb(heaps_.v90000000) +
+      host_committed_mb(heaps_.physical);
 
 #if XE_PLATFORM_WIN32
   // K32GetProcessMemoryInfo is exported from kernel32 (always linked), so
@@ -849,9 +915,10 @@ void Memory::LogMemoryStatistics() {
   XELOGI(
       "[MEM] process commit {} MB, working set {} MB | commit {}/{} MB free | "
       "phys {}/{} MB free | guest committed: virtual {} MB, physical {} MB (of "
-      "512)",
+      "512), host holds {} MB for the guest",
       process_commit_mb, working_set_mb, avail_commit_mb, total_commit_mb,
-      avail_phys_mb, total_phys_mb, guest_virtual_mb, guest_physical_mb);
+      avail_phys_mb, total_phys_mb, guest_virtual_mb, guest_physical_mb,
+      guest_host_committed_mb);
 #else
   XELOGI(
       "[MEM] guest committed: virtual {} MB, physical {} MB (of 512)",
@@ -1233,6 +1300,9 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
         XELOGE("BaseHeap::AllocFixed failed to alloc range from host");
         return false;
       }
+      if (alloc_type == xe::memory::AllocationType::kCommit) {
+        MarkHostCommitted(start_page_number, page_count);
+      }
 
       if (cvars::scribble_heap && protect & kMemoryProtectWrite) {
         RandomizeMemory(result, page_count * page_size_);
@@ -1423,6 +1493,9 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
         InsertFreeBlock(start_page_number, page_count);
         return false;
       }
+      if (alloc_type == xe::memory::AllocationType::kCommit) {
+        MarkHostCommitted(start_page_number, page_count);
+      }
 
       if (cvars::scribble_heap && (protect & kMemoryProtectWrite)) {
         RandomizeMemory(result, page_count << page_size_shift_);
@@ -1467,6 +1540,75 @@ bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment,
                     protect, top_down, out_address);
 }
 
+// Set once the host has been asked to decommit and refused - there is no
+// point asking again, and the answer is a property of the OS, not of a heap.
+static std::atomic<bool> host_decommit_unsupported{false};
+
+void BaseHeap::DecommitHostRange(uint32_t start_page_number,
+                                 uint32_t page_count) {
+  if (!cvars::guest_memory_decommit_on_release || !page_count ||
+      host_decommit_unsupported.load(std::memory_order_relaxed) ||
+      ShouldSkipHostCommit(*this)) {
+    return;
+  }
+  // Only whole host pages can be given back - a guest page smaller than the
+  // host's would take its neighbours with it.
+  size_t host_page_size = xe::memory::page_size();
+  if (page_size_ < host_page_size) {
+    return;
+  }
+  uint8_t* range_start = TranslateRelative(size_t(start_page_number) *
+                                           size_t(page_size_));
+  size_t range_length = size_t(page_count) * size_t(page_size_);
+  if (!xe::memory::DeallocFixed(range_start, range_length,
+                                xe::memory::DeallocationType::kDecommit)) {
+    // The first refusal settles it for the whole run.
+    if (!host_decommit_unsupported.exchange(true, std::memory_order_relaxed)) {
+      XELOGW(
+          "Guest memory: the host refused to decommit released pages - "
+          "keeping every page the title has ever committed, as before "
+          "(guest_memory_decommit_on_release has no effect here)");
+    }
+    return;
+  }
+  static std::atomic<bool> decommit_confirmed{false};
+  if (!decommit_confirmed.exchange(true, std::memory_order_relaxed)) {
+    XELOGI(
+        "Guest memory: released pages are given back to the host "
+        "(guest_memory_decommit_on_release)");
+  }
+  // Let the telemetry - and the fault path - know these are gone.
+  if (!host_committed_bits_.empty()) {
+    uint32_t end_page_number =
+        std::min(uint32_t(page_table_.size()), start_page_number + page_count);
+    for (uint32_t page = start_page_number; page < end_page_number; ++page) {
+      uint64_t& word = host_committed_bits_[page >> 6];
+      uint64_t bit = uint64_t(1) << (page & 63);
+      if (word & bit) {
+        word &= ~bit;
+        --host_committed_page_count_;
+      }
+    }
+  }
+}
+
+void BaseHeap::MarkHostCommitted(uint32_t start_page_number,
+                                 uint32_t page_count) {
+  if (host_committed_bits_.empty()) {
+    host_committed_bits_.resize((page_table_.size() + 63) / 64, 0);
+  }
+  uint32_t end_page_number =
+      std::min(uint32_t(page_table_.size()), start_page_number + page_count);
+  for (uint32_t page = start_page_number; page < end_page_number; ++page) {
+    uint64_t& word = host_committed_bits_[page >> 6];
+    uint64_t bit = uint64_t(1) << (page & 63);
+    if (!(word & bit)) {
+      word |= bit;
+      ++host_committed_page_count_;
+    }
+  }
+}
+
 bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   uint32_t page_count = get_page_count(size, page_size_);
   uint32_t start_page_number = (address - heap_base_) / page_size_;
@@ -1477,16 +1619,12 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 
   auto global_lock = global_critical_region_.Acquire();
 
-  // Release from host.
-  // TODO(benvanik): find a way to actually decommit memory;
-  //     mapped memory cannot be decommitted.
-  /*BOOL result =
-      VirtualFree(TranslateRelative(start_page_number * page_size_),
-                  page_count * page_size_, MEM_DECOMMIT);
-  if (!result) {
-    PLOGW("BaseHeap::Decommit failed due to host VirtualFree failure");
-    return false;
-  }*/
+  // Release from host. Upstream leaves this to a TODO ("mapped memory cannot
+  // be decommitted") - which holds for an ordinary view, but the guest mapping
+  // is a RESERVED section whose pages are committed on demand, and those can
+  // be given back. Whether this host actually allows it is probed once; if it
+  // doesn't, nothing changes from upstream's behaviour.
+  DecommitHostRange(start_page_number, end_page_number - start_page_number + 1);
 
   // Perform table change.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number;

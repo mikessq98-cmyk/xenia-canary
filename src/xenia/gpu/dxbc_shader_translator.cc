@@ -9,12 +9,14 @@
 
 #include "xenia/gpu/dxbc_shader_translator.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "third_party/dxbc/DXBCChecksum.h"
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/xenos.h"
@@ -278,8 +280,26 @@ bool DxbcShaderTranslator::UseSwitchBreakDispatch() const {
 }
 
 bool DxbcShaderTranslator::UseMainLoopGuard() const {
-  return cvars::dxbc_main_loop_guard_iterations > 0 &&
-         !is_depth_only_pixel_shader_;
+  bool use = cvars::dxbc_main_loop_guard_iterations > 0 &&
+             !is_depth_only_pixel_shader_;
+  // Say once whether the guard is actually in the shaders - when a game still
+  // hangs the GPU, the first question is whether the setting took effect at
+  // all, and the guard is otherwise invisible from the outside.
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true, std::memory_order_relaxed)) {
+    if (use) {
+      XELOGI(
+          "DXBC translation: main loop guard active, {} iterations per shader "
+          "invocation (dxbc_main_loop_guard_iterations)",
+          uint32_t(cvars::dxbc_main_loop_guard_iterations));
+    } else {
+      XELOGI(
+          "DXBC translation: main loop guard disabled "
+          "(dxbc_main_loop_guard_iterations = {})",
+          int32_t(cvars::dxbc_main_loop_guard_iterations));
+    }
+  }
+  return use;
 }
 
 uint32_t DxbcShaderTranslator::PushSystemTemp(uint32_t zero_mask,

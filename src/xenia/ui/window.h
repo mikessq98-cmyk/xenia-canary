@@ -328,6 +328,10 @@ class Window {
   // so it can't immediately hide an explicitly requested keyboard. No-ops on
   // platforms with a physical keyboard.
   virtual void ShowOnScreenKeyboard() {}
+  // Gives up a hold taken by ShowOnScreenKeyboard, hiding the keyboard only if
+  // this code is what put it on screen - a keyboard the user opened themselves
+  // (the View button gesture) must not be closed from under them.
+  virtual void ReleaseOnScreenKeyboardHold() {}
   virtual void HideOnScreenKeyboard() {}
 
   // While a game is running the ImGui main menu must not render at all on UWP

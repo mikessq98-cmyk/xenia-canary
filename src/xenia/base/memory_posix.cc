@@ -190,6 +190,12 @@ bool DeallocFixed(void* base_address, size_t length,
   }
 }
 
+bool IsCommitted(void* address) {
+  // No cheap equivalent of VirtualQuery's committed/reserved distinction -
+  // report committed so callers don't try to recommit anything.
+  return true;
+}
+
 bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
   if (out_old_access) {

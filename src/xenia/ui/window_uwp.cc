@@ -521,30 +521,12 @@ void UWPWindow::CheckKeyboardHoldGesture() {
   if (now_ms - start_ms < 2000) {
     return;
   }
-  bool shown = false;
-  try {
-    auto input_view = winrt::Windows::UI::ViewManagement::Core::CoreInputView::
-        GetForCurrentView();
-    if (input_view) {
-      shown = input_view.TryShowPrimaryView();
-      if (!shown) {
-        XELOGW("UWPWindow: CoreInputView.TryShowPrimaryView returned false");
-      }
-    } else {
-      XELOGW("UWPWindow: CoreInputView.GetForCurrentView returned null");
-    }
-  } catch (const winrt::hresult_error& e) {
-    XELOGE("UWPWindow: CoreInputView failed: 0x{:08X} {}",
-           uint32_t(e.code().value), winrt::to_string(e.message()));
-  }
-  if (shown) {
-    XELOGI("UWPWindow: View button held - on-screen keyboard opened");
-    view_hold_fired_ = true;
-  } else {
-    // The system sometimes refuses transiently (e.g. focus transitions);
-    // retry roughly twice a second while the button is still held.
-    view_hold_start_ms_.store(now_ms - 1500, std::memory_order_relaxed);
-  }
+  // Same path as everything else asking for the keyboard: a high-priority UI
+  // work item rather than a call made from inside the paint, with the request
+  // rate-limited and retried until the system reports the keyboard as shown.
+  view_hold_fired_ = true;
+  XELOGI("UWPWindow: View button held - requesting the on-screen keyboard");
+  RequestOnScreenKeyboardState(true);
 }
 
 void UWPWindow::RequestOnScreenKeyboardState(bool show) {
@@ -566,6 +548,18 @@ void UWPWindow::RequestOnScreenKeyboardState(bool show) {
   }
   keyboard_request_pending_ = true;
   keyboard_request_ms_ = now_ms;
+  // Without this, a keyboard that never appears leaves no trace at all in the
+  // log - there is no way to tell "the request was never made" from "the
+  // system refused it".
+  static std::atomic<uint32_t> request_log_count{0};
+  uint32_t request_count = request_log_count.fetch_add(1);
+  if (request_count < 8 || (request_count % 200) == 0) {
+    XELOGI(
+        "UWPWindow: requesting the on-screen keyboard to be {} (request {}, "
+        "explicit hold {})",
+        show ? "shown" : "hidden", request_count + 1,
+        explicit_keyboard_hold_ ? "yes" : "no");
+  }
 
   // Apply it as its own HIGH-priority UI work item. Called from a dialog's
   // draw, this used to run inside the paint work item itself - which is the
@@ -645,6 +639,15 @@ void UWPWindow::ShowOnScreenKeyboard() {
   // system-side dismissal, is retried on a later frame.
   explicit_keyboard_hold_ = true;
   RequestOnScreenKeyboardState(true);
+}
+
+void UWPWindow::ReleaseOnScreenKeyboardHold() {
+  if (!explicit_keyboard_hold_.exchange(false)) {
+    // Nothing was holding it - if the keyboard is up, the user opened it with
+    // the View button gesture and it stays until they close it.
+    return;
+  }
+  RequestOnScreenKeyboardState(false);
 }
 
 void UWPWindow::HideOnScreenKeyboard() {

@@ -1657,6 +1657,10 @@ void EmulatorWindow::ToggleDisplayConfigDialog() {
   if (!display_config_dialog_) {
     display_config_dialog_ =
         std::make_unique<DisplayConfigDialog>(imgui_drawer_.get(), *this);
+    // The dialog deletes itself when it is closed - drop our pointer then, or
+    // the next toggle acts on freed memory.
+    display_config_dialog_->SetDestroyedCallback(
+        [this]() { display_config_dialog_.release(); });
   } else {
     if (display_config_dialog_->IsClosing()) {
       display_config_dialog_.release();
@@ -1672,6 +1676,8 @@ void EmulatorWindow::ToggleProfilesConfigDialog() {
     emulator_->kernel_state()->BroadcastNotification(kXNotificationSystemUI, 1);
     profile_config_dialog_ =
         std::make_unique<ProfileConfigDialog>(imgui_drawer_.get(), this);
+    profile_config_dialog_->SetDestroyedCallback(
+        [this]() { profile_config_dialog_.release(); });
     emulator_->kernel_state()->xam_state()->xam_dialogs_shown_++;
   } else {
     disable_hotkeys_ = false;
@@ -1689,6 +1695,8 @@ void EmulatorWindow::ToggleXMPConfigDialog() {
   if (!xmp_config_dialog_) {
     xmp_config_dialog_ = std::unique_ptr<XMPConfigDialog>(
         new XMPConfigDialog(imgui_drawer_.get(), *this));
+    xmp_config_dialog_->SetDestroyedCallback(
+        [this]() { xmp_config_dialog_.release(); });
   } else {
     xmp_config_dialog_.reset();
   }
@@ -1699,6 +1707,8 @@ void EmulatorWindow::ToggleConsoleSettingsDialog() {
     console_settings_dialog_ =
         std::unique_ptr<ConsoleSettingsDialog>(new ConsoleSettingsDialog(
             imgui_drawer_.get(), *this, emulator_->kernel_state()->xconfig()));
+    console_settings_dialog_->SetDestroyedCallback(
+        [this]() { console_settings_dialog_.release(); });
   } else {
     if (console_settings_dialog_->IsClosing()) {
       console_settings_dialog_.release();
@@ -1712,6 +1722,8 @@ void EmulatorWindow::ToggleSettingsEditorDialog() {
   if (!settings_editor_dialog_) {
     settings_editor_dialog_ = std::make_unique<SettingsEditorDialog>(
         imgui_drawer_.get(), this);
+    settings_editor_dialog_->SetDestroyedCallback(
+        [this]() { settings_editor_dialog_.release(); });
   } else {
     if (settings_editor_dialog_->IsClosing()) {
       settings_editor_dialog_.release();

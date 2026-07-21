@@ -51,6 +51,15 @@
 
 #include "third_party/fmt/include/fmt/xchar.h"
 
+DEFINE_int32(
+    d3d12_pipeline_creation_memory_throttle_mb, 768,
+    "Host memory, in megabytes, below which pipelines are compiled strictly "
+    "one at a time. The driver's shader compiler needs a large temporary "
+    "allocation for the time it runs, so parallel compilations multiply the "
+    "peak - which is what tips a title that otherwise fits into running out "
+    "of memory. 0 disables the throttle.",
+    "D3D12");
+
 DEFINE_bool(d3d12_dxbc_disasm, false,
             "Disassemble DXBC shaders after generation.", "D3D12");
 DEFINE_bool(
@@ -3810,6 +3819,34 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     SolverJournalBegin(vs_hash, ps_hash);
     solver_probe.active = true;
   }
+#if XE_PLATFORM_WINRT
+  // The driver's shader compiler allocates hundreds of megabytes while it
+  // works, and it releases them when it's done - so two compilations at once
+  // cost twice the peak. Every out-of-memory death observed on this target
+  // happened exactly at such a burst, with the game itself already fitting.
+  // While the host is short on memory, let only one through at a time: the
+  // pipelines still arrive, just not all at once.
+  std::unique_lock<std::mutex> memory_throttle_lock;
+  if (cvars::d3d12_pipeline_creation_memory_throttle_mb > 0 &&
+      !solver_probe.serialize_lock.owns_lock()) {
+    MEMORYSTATUSEX throttle_status = {sizeof(throttle_status)};
+    if (GlobalMemoryStatusEx(&throttle_status) &&
+        throttle_status.ullAvailPageFile <
+            (uint64_t(cvars::d3d12_pipeline_creation_memory_throttle_mb)
+             << 20)) {
+      memory_throttle_lock =
+          std::unique_lock<std::mutex>(creation_memory_throttle_mutex_);
+      if (!creation_memory_throttle_logged_.exchange(
+              true, std::memory_order_relaxed)) {
+        XELOGW(
+            "Pipeline cache: {} MB of host memory left - compiling one "
+            "pipeline at a time from now on to keep the driver's compilation "
+            "peak down (expect slower shader warm-up, not a smaller cache)",
+            throttle_status.ullAvailPageFile >> 20);
+      }
+    }
+  }
+#endif  // XE_PLATFORM_WINRT
   DWORD creation_exception_code = 0;
   HRESULT hr = CreateGraphicsPipelineStateGuarded(
       device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);

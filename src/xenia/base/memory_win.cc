@@ -221,6 +221,15 @@ bool DeallocFixed(void* base_address, size_t length,
   return VirtualFree(base_address, length, free_type) ? true : false;
 }
 
+bool IsCommitted(void* address) {
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!VirtualQuery(address, &mbi, sizeof(mbi))) {
+    // Can't tell - assume it is, so nothing tries to "fix" it.
+    return true;
+  }
+  return mbi.State == MEM_COMMIT;
+}
+
 bool Protect(void* base_address, size_t length, PageAccess access,
              PageAccess* out_old_access) {
   if (out_old_access) {

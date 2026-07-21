@@ -49,9 +49,12 @@ DEFINE_int32(
     "allocation on the Xbox UWP target. Over the budget, render targets that "
     "hold no rendering anymore and that the GPU has finished with are "
     "released, least recently used first (they are recreated, with a brief "
-    "hitch, if the game comes back to them). 0 (the default) means automatic: "
-    "no fixed budget, but trimming whenever the host is running short of "
-    "memory.",
+    "hitch, if the game comes back to them). A budget is a HARD limit: if "
+    "that isn't enough, render targets that still hold the guest's rendering "
+    "are released too, which can briefly show a surface as empty - worth it "
+    "only against running out of memory, e.g. 1024 for a heavy game at 2x2. "
+    "0 (the default) means automatic: no fixed budget, trimming only what "
+    "costs nothing when the host is running short of memory.",
     "D3D12");
 
 DEFINE_bool(
@@ -1201,11 +1204,16 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
   }
   uint64_t bytes_to_free = 0;
   uint64_t host_memory_left = 0;
+  // Only an explicit budget may release render targets that still hold the
+  // guest's rendering - automatic trimming never loses data.
+  bool evict_owners = false;
+  bool housekeeping_only = false;
   if (cvars::d3d12_render_target_cache_max_mb > 0) {
     uint64_t budget_bytes =
         uint64_t(cvars::d3d12_render_target_cache_max_mb) << 20;
     if (resident_bytes > budget_bytes) {
       bytes_to_free = resident_bytes - budget_bytes;
+      evict_owners = true;
     }
   } else {
 #if XE_PLATFORM_WIN32
@@ -1223,6 +1231,15 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
       // Free the deficit plus a margin, so this doesn't run every submission.
       bytes_to_free = kHostMemoryTrimThreshold - host_memory_left +
                       kHostMemoryTrimExtra;
+    } else if (resident_bytes > kHousekeepingBytes) {
+      // Not under pressure - but render targets the game stopped using long
+      // ago cost nothing to release and everything to keep: a game that walked
+      // through several surface configurations was seen holding 2 GB of them
+      // while the host still had just enough memory free to never trigger the
+      // pressure path, and then died of exhaustion anyway. Only long-idle ones
+      // that hold no rendering are touched here.
+      bytes_to_free = resident_bytes - kHousekeepingBytes;
+      housekeeping_only = true;
     }
 #else
     return;
@@ -1249,7 +1266,9 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
   // sure nothing references them on the device either.
   uint64_t freed_bytes = TrimUnusedRenderTargets(
       bytes_to_free, command_processor_.GetCompletedSubmission(),
-      kRenderTargetIdleSubmissions);
+      housekeeping_only ? kRenderTargetHousekeepingIdleSubmissions
+                        : kRenderTargetIdleSubmissions,
+      evict_owners);
   if (freed_bytes >= kRenderTargetTrimUselessBytes) {
     render_target_trim_interval_ = kRenderTargetTrimIntervalSubmissions;
     XELOGI(
@@ -2095,7 +2114,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(
       key, resource.Get(), std::move(descriptor_draw),
       std::move(descriptor_load_separate), std::move(descriptor_srv),
       std::move(descriptor_srv_stencil), resource_state, host_memory_bytes,
-      &render_target_host_memory_bytes_);
+      &render_target_host_memory_bytes_, &render_target_count_);
 }
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(

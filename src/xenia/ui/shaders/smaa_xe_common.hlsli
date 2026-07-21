@@ -14,6 +14,9 @@
 
 cbuffer XeSmaaConstants : register(b0) {
   float4 xe_smaa_rt_metrics;
+  // x - edge detection threshold (see SMAA_XE_THRESHOLD_OVERRIDE below),
+  // y - local contrast adaptation factor, z and w reserved.
+  float4 xe_smaa_params;
 };
 
 SamplerState LinearSampler : register(s0);
@@ -21,6 +24,11 @@ SamplerState PointSampler : register(s1);
 #define SMAA_XE_EXTERNAL_SAMPLERS 1
 
 #define SMAA_RT_METRICS xe_smaa_rt_metrics
+// Runtime edge detection threshold and local contrast adaptation factor - the
+// preset values assume rendering at output resolution, which is not the case
+// with a draw resolution scale (see the override in the vendored SMAA.hlsl).
+#define SMAA_XE_THRESHOLD_OVERRIDE xe_smaa_params.x
+#define SMAA_LOCAL_CONTRAST_ADAPTATION_FACTOR xe_smaa_params.y
 // SMAA_HLSL_4, not SMAA_HLSL_4_1: the 4_1 profile's Gather in the blend
 // weight pass crashes the Xbox UWP driver's shader compiler (newbe_xs.dll,
 // access violation compiling "quality 0, pass 1"); the 4 profile uses plain

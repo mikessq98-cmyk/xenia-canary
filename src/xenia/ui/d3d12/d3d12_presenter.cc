@@ -65,6 +65,28 @@ DEFINE_string(
     "chromatic aliasing the luma metric misses, slightly costlier.",
     "Display");
 
+DEFINE_double(
+    postprocess_smaa_threshold, 0.0,
+    "Edge detection sensitivity for SMAA (postprocess_smaa). Direct3D 12 "
+    "only. Can be changed while running. 0 uses the value the quality preset "
+    "was tuned for (0.15 low, 0.1 medium and high, 0.05 ultra), which assumes "
+    "the image is rendered at output resolution. With draw_resolution_scale "
+    "the image is already supersampled - its edges span several pixels and so "
+    "have lower per-pixel contrast - and those presets then reject most of "
+    "them, which looks like SMAA doing almost nothing. Try 0.02-0.03 at 2x2. "
+    "Lower detects more edges (and eventually blurs texture detail), higher "
+    "detects fewer.",
+    "Display");
+
+DEFINE_double(
+    postprocess_smaa_local_contrast_adaptation, 2.0,
+    "How much stronger a neighbouring edge has to be for SMAA "
+    "(postprocess_smaa) to discard the current one as an interior detail. "
+    "Direct3D 12 only. Can be changed while running. The SMAA default is 2; "
+    "raising it keeps more edges in high-contrast areas, lowering it keeps "
+    "fewer.",
+    "Display");
+
 DEFINE_string(
     postprocess_sgsr_base, "catrom",
     "Base image reconstruction filter for SGSR "
@@ -884,15 +906,26 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
       // if it ran, the scaling chain reads the anti-aliased image instead of
       // the raw guest output.
       bool smaa_applied = false;
-      if (guest_output_flow.effect_count) {
-        size_t smaa_quality = GetSmaaQualityFromCvar();
-        if (smaa_quality != SIZE_MAX) {
-          smaa_applied = PaintSmaaPasses(
-              command_list, guest_output_resource.Get(),
-              guest_output_flow.properties.frontbuffer_width,
-              guest_output_flow.properties.frontbuffer_height, smaa_quality,
-              current_paint_submission);
-        }
+      size_t smaa_quality = guest_output_flow.effect_count
+                                ? GetSmaaQualityFromCvar()
+                                : SIZE_MAX;
+      if (smaa_quality != SIZE_MAX) {
+        smaa_applied = PaintSmaaPasses(
+            command_list, guest_output_resource.Get(),
+            guest_output_flow.properties.frontbuffer_width,
+            guest_output_flow.properties.frontbuffer_height, smaa_quality,
+            current_paint_submission);
+      } else if (paint_context_.smaa_output_texture) {
+        // SMAA has been switched off while running - give its working textures
+        // back instead of holding tens of megabytes of them for the rest of
+        // the session (at a resolution scale they are far from free, and this
+        // target has no memory to spare).
+        paint_context_.paint_completion_timeline
+            ->AwaitSubmissionAndUpdateCompleted(
+                paint_context_.smaa_texture_last_usage);
+        paint_context_.smaa_edges_texture.Reset();
+        paint_context_.smaa_weights_texture.Reset();
+        paint_context_.smaa_output_texture.Reset();
       }
 
       // This effect loop must not be aborted so the states of the resources
@@ -1771,7 +1804,9 @@ bool D3D12Presenter::InitializeSmaaStaticObjects() {
       D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   smaa_root_parameters[0].Constants.ShaderRegister = 0;
   smaa_root_parameters[0].Constants.RegisterSpace = 0;
-  smaa_root_parameters[0].Constants.Num32BitValues = 4;
+  // float4 SMAA_RT_METRICS + float4 of runtime tuning (threshold, local
+  // contrast adaptation).
+  smaa_root_parameters[0].Constants.Num32BitValues = 8;
   smaa_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_DESCRIPTOR_RANGE smaa_srv_range;
   smaa_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -2414,10 +2449,23 @@ bool D3D12Presenter::PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
   smaa_scissor.bottom = LONG(frontbuffer_height);
   command_list->RSSetScissorRects(1, &smaa_scissor);
   command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  // (1/w, 1/h, w, h) - SMAA_RT_METRICS.
-  float smaa_rt_metrics[4] = {
-      1.0f / float(frontbuffer_width), 1.0f / float(frontbuffer_height),
-      float(frontbuffer_width), float(frontbuffer_height)};
+  // (1/w, 1/h, w, h) - SMAA_RT_METRICS - followed by the runtime tuning the
+  // shaders read instead of the preset's baked-in values.
+  static constexpr float kSmaaPresetThresholds[kSmaaQualityCount] = {
+      0.15f, 0.1f, 0.1f, 0.05f};
+  float smaa_threshold = float(cvars::postprocess_smaa_threshold);
+  if (!(smaa_threshold > 0.0f)) {
+    smaa_threshold = kSmaaPresetThresholds[quality];
+  }
+  float smaa_constants[8] = {
+      1.0f / float(frontbuffer_width),
+      1.0f / float(frontbuffer_height),
+      float(frontbuffer_width),
+      float(frontbuffer_height),
+      smaa_threshold,
+      float(cvars::postprocess_smaa_local_contrast_adaptation),
+      0.0f,
+      0.0f};
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
       paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
   D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
@@ -2447,7 +2495,7 @@ bool D3D12Presenter::PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
     command_list->ClearRenderTargetView(edges_rtv, kSmaaClearColor, 0,
                                         nullptr);
     command_list->SetGraphicsRootSignature(smaa_root_signature_2_srvs_.Get());
-    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRoot32BitConstants(0, 8, smaa_constants, 0);
     command_list->SetGraphicsRootDescriptorTable(
         1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
                                           PaintContext::kViewIndexSmaaColor));
@@ -2481,7 +2529,7 @@ bool D3D12Presenter::PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
     command_list->ClearRenderTargetView(weights_rtv, kSmaaClearColor, 0,
                                         nullptr);
     command_list->SetGraphicsRootSignature(smaa_root_signature_3_srvs_.Get());
-    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRoot32BitConstants(0, 8, smaa_constants, 0);
     command_list->SetGraphicsRootDescriptorTable(
         1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
                                           PaintContext::kViewIndexSmaaEdges));
@@ -2509,7 +2557,7 @@ bool D3D12Presenter::PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
     command_list->DiscardResource(paint_context_.smaa_output_texture.Get(),
                                   nullptr);
     command_list->SetGraphicsRootSignature(smaa_root_signature_2_srvs_.Get());
-    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRoot32BitConstants(0, 8, smaa_constants, 0);
     command_list->SetGraphicsRootDescriptorTable(
         1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
                                           PaintContext::kViewIndexSmaaColor));

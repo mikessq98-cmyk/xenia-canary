@@ -587,7 +587,7 @@ void RenderTargetCache::MarkLastUpdateRenderTargetsUsedInSubmission(
 
 uint64_t RenderTargetCache::TrimUnusedRenderTargets(
     uint64_t bytes_to_free, uint64_t completed_submission,
-    uint64_t min_idle_submissions) {
+    uint64_t min_idle_submissions, bool evict_owners) {
   if (render_targets_.empty() || !bytes_to_free) {
     return 0;
   }
@@ -614,6 +614,7 @@ uint64_t RenderTargetCache::TrimUnusedRenderTargets(
     RenderTargetKey key;
     uint64_t last_use_submission;
     uint64_t bytes;
+    bool owns_edram_data;
   };
   std::vector<TrimCandidate> candidates;
   for (const auto& render_target_pair : render_targets_) {
@@ -625,8 +626,9 @@ uint64_t RenderTargetCache::TrimUnusedRenderTargets(
     if (!bytes) {
       continue;
     }
-    if (owning_render_targets.find(render_target->key()) !=
-        owning_render_targets.end()) {
+    bool owns_edram_data = owning_render_targets.find(render_target->key()) !=
+                           owning_render_targets.end();
+    if (owns_edram_data && !evict_owners) {
       continue;
     }
     // Still possibly referenced by a command list the GPU hasn't finished.
@@ -634,15 +636,20 @@ uint64_t RenderTargetCache::TrimUnusedRenderTargets(
         completed_submission) {
       continue;
     }
-    candidates.push_back(
-        {render_target->key(), render_target->last_use_submission(), bytes});
+    candidates.push_back({render_target->key(),
+                          render_target->last_use_submission(), bytes,
+                          owns_edram_data});
   }
   if (candidates.empty()) {
     return 0;
   }
-  // Least recently used first.
+  // Render targets holding no EDRAM data first (releasing those costs nothing
+  // but a recreation), then least recently used.
   std::sort(candidates.begin(), candidates.end(),
             [](const TrimCandidate& a, const TrimCandidate& b) {
+              if (a.owns_edram_data != b.owns_edram_data) {
+                return !a.owns_edram_data;
+              }
               return a.last_use_submission < b.last_use_submission;
             });
   uint64_t freed_bytes = 0;
@@ -650,6 +657,22 @@ uint64_t RenderTargetCache::TrimUnusedRenderTargets(
     auto it = render_targets_.find(candidate.key);
     if (it == render_targets_.end()) {
       continue;
+    }
+    if (candidate.owns_edram_data) {
+      // Its EDRAM ranges have to be given up as well, or they would keep
+      // pointing at a render target that no longer exists.
+      for (auto& ownership_range_pair : ownership_ranges_) {
+        OwnershipRange& ownership_range = ownership_range_pair.second;
+        if (ownership_range.render_target == candidate.key) {
+          ownership_range.render_target = RenderTargetKey();
+        }
+        if (ownership_range.host_depth_render_target_unorm24 == candidate.key) {
+          ownership_range.host_depth_render_target_unorm24 = RenderTargetKey();
+        }
+        if (ownership_range.host_depth_render_target_float24 == candidate.key) {
+          ownership_range.host_depth_render_target_float24 = RenderTargetKey();
+        }
+      }
     }
     delete it->second;
     render_targets_.erase(it);

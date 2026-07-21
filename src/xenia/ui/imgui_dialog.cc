@@ -26,6 +26,13 @@ ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer)
 
 ImGuiDialog::~ImGuiDialog() {
   imgui_drawer_->RemoveDialog(this);
+  // Let whoever kept a pointer to this dialog drop it before the memory goes
+  // away - dialogs delete themselves when closed.
+  if (destroyed_callback_) {
+    auto callback = std::move(destroyed_callback_);
+    destroyed_callback_ = nullptr;
+    callback();
+  }
   for (auto fence : waiting_fences_) {
     fence->Signal();
   }

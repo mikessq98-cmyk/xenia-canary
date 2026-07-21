@@ -13,6 +13,8 @@
 #include <signal.h>
 #endif
 
+#include <new>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -431,7 +433,22 @@ X_STATUS XThread::Create() {
     current_thread_ = this;
     cpu::ThreadState::Bind(this->thread_state());
     running_ = true;
-    Execute();
+    // Guest code and everything it calls into (the kernel, XAM, the GPU) does
+    // allocate, and on a memory-constrained host those allocations fail. An
+    // escaping std::bad_alloc terminates the emulator with nothing but a
+    // 0xE06D7363 in the log; ending just this guest thread leaves the process
+    // alive - the title will usually misbehave from there, but the user can
+    // read what happened and quit cleanly. (Kept out of Execute() itself,
+    // which mixes setjmp with the guest fiber reentry on Windows.)
+    try {
+      Execute();
+    } catch (const std::bad_alloc&) {
+      XELOGE(
+          "Guest thread {:08X} ('{}') ran OUT OF MEMORY - ending the thread "
+          "instead of the emulator (host memory is exhausted; lower the "
+          "memory usage, e.g. the resolution scale)",
+          handle(), thread_name_);
+    }
     running_ = false;
     current_thread_ = nullptr;
     current_xthread_tls_ = nullptr;

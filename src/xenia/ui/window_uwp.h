@@ -46,6 +46,7 @@ class UWPWindow final : public Window {
   // that suspends the automatic WantTextInput-driven show/hide.
   void ShowOnScreenKeyboard() override;
   void HideOnScreenKeyboard() override;
+  void ReleaseOnScreenKeyboardHold() override;
 
  protected:
   uint32_t GetLatestDpiImpl() const override;

@@ -215,12 +215,15 @@ class RenderTargetCache {
   // memory-constrained host that is the difference between running and dying.
   // The caller must ensure nothing still references the released targets (no
   // recorded command list in flight, accumulated render targets reset).
+  // With evict_owners, render targets that still hold EDRAM data may be
+  // released too once the ones that don't aren't enough. Their contents are
+  // lost, which the guest sees as a surface it rendered earlier coming back
+  // empty - only worth it against running out of memory entirely, so it is
+  // opt-in (an explicit cache size limit).
   uint64_t TrimUnusedRenderTargets(uint64_t bytes_to_free,
                                    uint64_t completed_submission,
-                                   uint64_t min_idle_submissions);
-
-  // Number of host render targets currently cached, for telemetry.
-  size_t GetCachedRenderTargetCount() const { return render_targets_.size(); }
+                                   uint64_t min_idle_submissions,
+                                   bool evict_owners = false);
 
   // Stamps the render targets bound by the last update as used in the given
   // submission, so trimming can tell live ones from leftovers.

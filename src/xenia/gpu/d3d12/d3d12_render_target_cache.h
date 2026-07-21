@@ -83,6 +83,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     return edram_buffer_size_ +
            render_target_host_memory_bytes_.load(std::memory_order_relaxed);
   }
+  // Live host render targets. Counted here rather than read from the base
+  // class's map, which the GPU thread mutates while the telemetry thread
+  // reads.
+  uint32_t GetHostMemoryRenderTargetCount() const {
+    return render_target_count_.load(std::memory_order_relaxed);
+  }
 
   void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteEdramRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
@@ -205,6 +211,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // released (it is recreated if the game comes back to it, so this only needs
   // to be long enough to not thrash on alternating frames).
   static constexpr uint64_t kRenderTargetIdleSubmissions = 60;
+  // Size above which render targets the game has long stopped using are
+  // released even with memory to spare, and how long "long" is (~10 seconds of
+  // gameplay). Housekeeping only ever releases targets holding no rendering,
+  // so the worst it can cost is recreating one.
+  static constexpr uint64_t kHousekeepingBytes = 768ULL << 20;
+  static constexpr uint64_t kRenderTargetHousekeepingIdleSubmissions = 600;
   // Minimum spacing between trims, and the spacing after a trim that freed
   // almost nothing - when the pressure is structural (the live render targets
   // themselves don't fit), retrying every submission only costs recreations.
@@ -222,6 +234,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Total host memory of the live D3D12RenderTarget resources (maintained by
   // them, as they're owned by the base class and deleted through it).
   std::atomic<uint64_t> render_target_host_memory_bytes_{0};
+  std::atomic<uint32_t> render_target_count_{0};
   D3D12_GPU_VIRTUAL_ADDRESS edram_buffer_gpu_address_ = 0;
   D3D12_RESOURCE_STATES edram_buffer_state_;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
@@ -282,7 +295,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv_stencil,
         D3D12_RESOURCE_STATES resource_state, uint64_t host_memory_bytes = 0,
-        std::atomic<uint64_t>* host_memory_counter = nullptr)
+        std::atomic<uint64_t>* host_memory_counter = nullptr,
+        std::atomic<uint32_t>* count_counter = nullptr)
         : RenderTarget(key),
           resource_(resource),
           descriptor_draw_(std::move(descriptor_draw)),
@@ -291,12 +305,20 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
           descriptor_srv_stencil_(std::move(descriptor_srv_stencil)),
           resource_state_(resource_state),
           host_memory_bytes_(host_memory_bytes),
-          host_memory_counter_(host_memory_counter) {}
+          host_memory_counter_(host_memory_counter),
+          count_counter_(count_counter) {
+      if (count_counter_) {
+        count_counter_->fetch_add(1, std::memory_order_relaxed);
+      }
+    }
 
     ~D3D12RenderTarget() override {
       if (host_memory_counter_) {
         host_memory_counter_->fetch_sub(host_memory_bytes_,
-                                       std::memory_order_relaxed);
+                                        std::memory_order_relaxed);
+      }
+      if (count_counter_) {
+        count_counter_->fetch_sub(1, std::memory_order_relaxed);
       }
     }
 
@@ -360,6 +382,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     // allocations, so they need to show up in the [MEM] breakdown.
     uint64_t host_memory_bytes_ = 0;
     std::atomic<uint64_t>* host_memory_counter_ = nullptr;
+    std::atomic<uint32_t>* count_counter_ = nullptr;
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
     uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;

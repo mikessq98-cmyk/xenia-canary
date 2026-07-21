@@ -991,6 +991,19 @@ void D3D12TextureCache::ReleaseCompletedRetiredScaledResolveBuffers() {
       scaled_resolve_retired_buffers_.end());
 }
 
+bool D3D12TextureCache::HasHostMemoryFor(uint64_t bytes) const {
+#if XE_PLATFORM_WIN32
+  MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
+  if (!GlobalMemoryStatusEx(&memory_status)) {
+    return true;
+  }
+  return memory_status.ullAvailPageFile >=
+         bytes + kScaledResolveHostMemoryReserve;
+#else
+  return true;
+#endif  // XE_PLATFORM_WIN32
+}
+
 bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
   // An explicit cap, if the user set one, is absolute.
   if (cvars::d3d12_scaled_resolve_max_mb > 0) {
@@ -1110,6 +1123,9 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
   // an overlapping region would have to be absorbed, but the result would
   // exceed the maximum region size.
   bool span_impossible = false;
+  // Set when a merge was given up on to keep the transient peak down (see
+  // below) - the request still gets its own region.
+  bool span_merge_refused = false;
   auto compute_span = [&]() {
     new_base = request_base;
     new_end = request_end;
@@ -1117,6 +1133,7 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
     last_absorbed = SIZE_MAX;
     absorbed_bytes = 0;
     span_impossible = false;
+    span_merge_refused = false;
     // Regions are disjoint and sorted by base, so everything within the merge
     // gap of the request forms one contiguous run - and the run's last region
     // is the one that ends the highest.
@@ -1132,6 +1149,11 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
       }
       last_absorbed = i;
     }
+    for (size_t i = 0; first_absorbed != SIZE_MAX && i <= last_absorbed; ++i) {
+      if (i >= first_absorbed) {
+        absorbed_bytes += scaled_resolve_regions_[i].size;
+      }
+    }
     // Give up the outermost neighbours while the merged buffer would be
     // larger than a buffer may be. Regions that overlap the request itself
     // can't be given up - two buffers may never cover the same scaled address
@@ -1141,7 +1163,38 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
       const ScaledResolveRegion& last = scaled_resolve_regions_[last_absorbed];
       uint64_t merged_base = std::min(request_base, first.base);
       uint64_t merged_end = std::max(request_end, last.base + last.size);
-      if (merged_end - merged_base <= kScaledResolveMaxRegionSize) {
+      uint64_t merged_size = merged_end - merged_base;
+      // A merge costs the merged size TWICE for a moment: the new buffer is
+      // created while the old ones are still alive, and they're only freed
+      // once the GPU has run the copy. That's fine with memory to spare and
+      // exactly the wrong thing to do when there isn't - then a separate
+      // region for the request alone (which needs no copy at all) is what
+      // keeps the peak down.
+      if (merged_size > absorbed_bytes + kScaledResolveMergeTransientLimit &&
+          !HasHostMemoryFor(merged_size)) {
+        // Only neighbours may be given up like this. A region that OVERLAPS
+        // the request has to be absorbed no matter the cost - leaving it in
+        // place would mean two buffers covering the same scaled addresses,
+        // and writes through one would be invisible through the other.
+        bool any_overlaps = false;
+        for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
+          const ScaledResolveRegion& candidate = scaled_resolve_regions_[i];
+          if (candidate.base < request_end &&
+              candidate.base + candidate.size > request_base) {
+            any_overlaps = true;
+            break;
+          }
+        }
+        if (!any_overlaps) {
+          span_merge_refused = true;
+          first_absorbed = SIZE_MAX;
+          last_absorbed = SIZE_MAX;
+          new_base = request_base;
+          new_end = request_end;
+          break;
+        }
+      }
+      if (merged_size <= kScaledResolveMaxRegionSize) {
         new_base = merged_base;
         new_end = merged_end;
         break;
@@ -1166,6 +1219,7 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
         --last_absorbed;
       }
     }
+    absorbed_bytes = 0;
     if (first_absorbed != SIZE_MAX) {
       for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
         absorbed_bytes += scaled_resolve_regions_[i].size;

@@ -112,6 +112,12 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+// Whether the page containing the address currently has physical storage
+// behind it, as opposed to being merely reserved. Distinguishes a page that
+// was decommitted from one that is committed but protected - which look the
+// same to QueryProtect, and only one of which may be recommitted on a fault.
+bool IsCommitted(void* address);
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>
