@@ -268,7 +268,13 @@ Function* Processor::ResolveFunction(uint32_t address) {
     }
 
     if (!DemandFunction(function)) {
-      entry->status = Entry::STATUS_FAILED;
+      // A definition that failed only because the host ran out of memory
+      // leaves the symbol declared (see DemandFunction) - keep the entry
+      // resolvable so a later call retries once memory has been freed, instead
+      // of failing this address for the rest of the run.
+      entry->status = function->status() == Symbol::Status::kDeclared
+                          ? Entry::STATUS_NEW
+                          : Entry::STATUS_FAILED;
       return nullptr;
     }
     // only add it to the list of resolved functions if resolving succeeded
@@ -344,8 +350,17 @@ bool Processor::DemandFunction(Function* function) {
   if (symbol_status == Symbol::Status::kNew) {
     // Symbol is undefined, so define now.
     assert_true(function->is_guest());
+    bool definition_out_of_memory = false;
     if (!frontend_->DefineFunction(static_cast<GuestFunction*>(function),
-                                   debug_info_flags_)) {
+                                   debug_info_flags_,
+                                   &definition_out_of_memory)) {
+      if (definition_out_of_memory) {
+        // Transient - the host may have memory again once the caches are
+        // trimmed, so put the symbol back to declared and let a later call
+        // retry, instead of failing this function for the rest of the run.
+        function->set_status(Symbol::Status::kDeclared);
+        return false;
+      }
       function->set_status(Symbol::Status::kFailed);
       return false;
     }
@@ -357,8 +372,11 @@ bool Processor::DemandFunction(Function* function) {
     symbol_status = function->status();
   }
 
-  if (symbol_status == Symbol::Status::kFailed) {
-    // Symbol likely failed.
+  if (symbol_status == Symbol::Status::kFailed ||
+      symbol_status == Symbol::Status::kDeclared) {
+    // Symbol likely failed - or another thread's definition ran out of memory
+    // and put it back to declared for a later retry, in which case there's no
+    // code to run yet either.
     return false;
   }
 
@@ -1093,6 +1111,12 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     return 0;
   }
   auto thread_info = QueryThreadDebugInfo(thread_id);
+  if (!thread_info || !thread_info->thread || !thread_info->thread->thread()) {
+    // The thread is unknown or already gone (games that aggressively suspend
+    // and terminate their own threads - e.g. Max Payne 3 - can race this);
+    // there is nothing to step.
+    return 0;
+  }
   auto thread = thread_info->thread;
 
   // Now the fun part begins: Registers are only guaranteed to be synchronized
@@ -1126,6 +1150,9 @@ uint32_t Processor::StepToGuestSafePoint(uint32_t thread_id, bool ignore_host) {
     auto& frame = first_frame;
     if (!frame.guest_pc) {
       // Lame. The guest->host thunk is a "guest" function.
+      if (count < 2) {
+        return 0;
+      }
       frame = cpu_frames[1];
     }
 

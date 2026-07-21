@@ -138,6 +138,13 @@ class CommandProcessor {
 
   virtual void ClearCaches();
 
+  // Logs a one-line [MEM] breakdown of host GPU cache memory (shared memory
+  // buffer, texture cache, etc.) as a companion to Memory::LogMemoryStatistics.
+  // Called on the frame-limiter thread on an interval, so it must only read
+  // scalar counters (no container traversal) - racy reads are fine for
+  // telemetry. Default no-op; the backend overrides it.
+  virtual void LogHostMemoryStatistics() {}
+
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect GetDesiredSwapPostEffect() const {
     return swap_post_effect_desired_;
@@ -172,6 +179,11 @@ class CommandProcessor {
       const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
       uint32_t new_gamma_ramp_rw_component);
   virtual void RestoreEdramSnapshot(const void* snapshot) = 0;
+
+  // Called (from any thread) when the host GPU device has been lost, right
+  // before the fatal-error teardown - lets backends preserve crash-diagnosis
+  // state (e.g. the Xbox UWP toxic-shader solver's journal).
+  virtual void OnHostGpuLossFromAnyThread() {}
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);

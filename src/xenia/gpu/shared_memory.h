@@ -106,6 +106,15 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Bytes of the host GPU shared-memory buffer actually backed by physical
+  // memory via sparse (tiled) allocation. On backends/devices without usable
+  // tiled resources (Xbox UWP tier-1) the buffer is fully committed, so this
+  // reads 0 and the whole kBufferSize is resident - reported separately. A
+  // scalar; safe to read racily for telemetry.
+  uint32_t host_gpu_memory_sparse_used_bytes() const {
+    return host_gpu_memory_sparse_used_bytes_;
+  }
+
  protected:
   SharedMemory(Memory& memory);
   // Call in implementation-specific initialization.

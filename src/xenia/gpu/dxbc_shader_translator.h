@@ -700,6 +700,17 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Whether to use switch-case rather than if (pc >= label) for control flow.
   bool UseSwitchForControlFlow() const;
+  // In switch-based control flow, whether label jumps `break` out of the
+  // switch (falling through to the end of the main loop, which re-enters the
+  // dispatcher) instead of `continue`-ing the main loop from inside the
+  // switch. Semantically identical, but avoids the continue-across-switch
+  // construct that the Xbox UWP driver's shader compiler appears to
+  // miscompile into GPU-hanging code (DEVICE_HUNG with different pipelines
+  // each time - a systemic codegen issue, not per-shader).
+  bool UseSwitchBreakDispatch() const;
+  // Whether to emit the main-loop iteration watchdog (see
+  // system_temp_main_loop_guard_).
+  bool UseMainLoopGuard() const;
 
   // Allocates new consecutive r# registers for internal use and returns the
   // index of the first.
@@ -1170,6 +1181,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // .w stores `base + index * stride` in bytes from the last vfetch_full as it
   // may be needed by vfetch_mini.
   uint32_t system_temp_grad_v_vfetch_address_;
+  // .x is the main-loop iteration counter, .y is scratch for its limit test -
+  // the in-shader watchdog that turns a miscompiled infinite dispatcher loop
+  // into a finite (wrongly-rendered) one instead of a GPU hang and device
+  // removal. Only allocated when UseMainLoopGuard().
+  uint32_t system_temp_main_loop_guard_ = UINT32_MAX;
 
   // The bool constant number containing the condition for the currently
   // processed exec (or the last - unless a label has reset this), or

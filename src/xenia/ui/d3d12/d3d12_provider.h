@@ -49,6 +49,25 @@ class D3D12Provider : public GraphicsProvider {
   IDXGraphicsAnalysis* GetGraphicsAnalysis() const {
     return graphics_analysis_;
   }
+
+  // Fills the OS-granted GPU memory budget and current usage (bytes) for the
+  // local memory segment (system memory on UMA like Xbox). Returns false if
+  // the query is unavailable. This is the ceiling D3D12 committed-resource
+  // creation actually hits - useful for diagnosing E_OUTOFMEMORY that occurs
+  // while system physical RAM still shows free.
+  bool QueryVideoMemoryUsage(uint64_t& budget_out, uint64_t& usage_out) const {
+    if (!adapter3_) {
+      return false;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(adapter3_->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+      return false;
+    }
+    budget_out = info.Budget;
+    usage_out = info.CurrentUsage;
+    return true;
+  }
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
@@ -193,6 +212,9 @@ class D3D12Provider : public GraphicsProvider {
   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
+  // For QueryVideoMemoryInfo telemetry; may be null if the interface is
+  // unavailable.
+  IDXGIAdapter3* adapter3_ = nullptr;
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;

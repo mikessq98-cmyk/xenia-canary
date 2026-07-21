@@ -93,6 +93,12 @@ class TextureCache {
 
   virtual void ClearCache();
 
+  // Total host memory (bytes) currently used by cached host textures. A plain
+  // scalar - safe to read racily from another thread for telemetry.
+  uint64_t GetTexturesTotalHostMemoryUsage() const {
+    return textures_total_host_memory_usage_;
+  }
+
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();

@@ -88,6 +88,9 @@ D3D12Provider::~D3D12Provider() {
   if (device_ != nullptr) {
     device_->Release();
   }
+  if (adapter3_ != nullptr) {
+    adapter3_->Release();
+  }
   if (dxgi_factory_ != nullptr) {
     dxgi_factory_->Release();
   }
@@ -345,6 +348,13 @@ bool D3D12Provider::Initialize() {
   }
   adapter_vendor_id_ = GpuVendorID(adapter_desc.VendorId);
   adapter_device_id_ = adapter_desc.DeviceId;
+
+  // Keep an IDXGIAdapter3 for QueryVideoMemoryInfo - on UMA (Xbox) this reports
+  // the GPU memory budget the OS grants the process and its current usage, the
+  // ceiling that D3D12 committed-resource creation actually hits (an alloc
+  // fails with E_OUTOFMEMORY when usage nears budget, even while system
+  // physical RAM still shows free). Optional - only used for telemetry.
+  adapter->QueryInterface(IID_PPV_ARGS(&adapter3_));
 
   int adapter_name_mb_size = WideCharToMultiByte(
       CP_UTF8, 0, adapter_desc.Description, -1, nullptr, 0, nullptr, nullptr);

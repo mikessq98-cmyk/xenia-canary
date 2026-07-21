@@ -154,6 +154,7 @@ class D3D12Presenter final : public Presenter {
     kGuestOutputPaintRootSignatureIndexCasResample,
     kGuestOutputPaintRootSignatureIndexFsrEasu,
     kGuestOutputPaintRootSignatureIndexFsrRcas,
+    kGuestOutputPaintRootSignatureIndexSgsr,
 
     kGuestOutputPaintRootSignatureCount,
   };
@@ -175,6 +176,8 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintRootSignatureIndexFsrRcas;
+      case GuestOutputPaintEffect::kSgsr:
+        return kGuestOutputPaintRootSignatureIndexSgsr;
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintRootSignatureCount;
@@ -198,8 +201,14 @@ class D3D12Presenter final : public Presenter {
       kRTVIndexGuestOutputIntermediate0 =
           kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount =
+      // SMAA working render targets (edges, blend weights, anti-aliased
+      // output) - the last usage is smaa_texture_last_usage.
+      kRTVIndexSmaaEdges =
           kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+      kRTVIndexSmaaWeights,
+      kRTVIndexSmaaOutput,
+
+      kRTVCount,
     };
 
     enum ViewIndex : UINT {
@@ -212,8 +221,26 @@ class D3D12Presenter final : public Presenter {
       kViewIndexGuestOutputIntermediate0Srv =
           kViewIndexGuestOutput0Srv + kGuestOutputMailboxSize,
 
-      kViewCount = kViewIndexGuestOutputIntermediate0Srv +
-                   kMaxGuestOutputPaintEffects - 1,
+      // SMAA descriptors. The layout is dictated by the passes' descriptor
+      // tables (consecutive SRVs starting at t0):
+      // - Blend weight calculation, 3-SRV table starting at
+      //   kViewIndexSmaaEdges: [edges, area, search].
+      // - Edge detection and neighborhood blending, 2-SRV table starting at
+      //   kViewIndexSmaaColor: [color, weights] (edge detection reads only
+      //   t0; keeping the table free of the pass's own render target).
+      // - kViewIndexSmaaOutput is standalone - the scaling chain's source
+      //   when SMAA is active.
+      // kViewIndexSmaaColor holds an SRV of the CURRENT guest output resource,
+      // recreated whenever the painted guest output texture changes.
+      kViewIndexSmaaEdges = kViewIndexGuestOutputIntermediate0Srv +
+                            kMaxGuestOutputPaintEffects - 1,
+      kViewIndexSmaaArea,
+      kViewIndexSmaaSearch,
+      kViewIndexSmaaColor,
+      kViewIndexSmaaWeights,
+      kViewIndexSmaaOutput,
+
+      kViewCount,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -274,6 +301,17 @@ class D3D12Presenter final : public Presenter {
         guest_output_intermediate_textures;
     uint64_t guest_output_intermediate_texture_last_usage = 0;
 
+    // SMAA working textures (sized to the guest output frontbuffer, recreated
+    // on size changes). While not in use, they are in
+    // D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.
+    Microsoft::WRL::ComPtr<ID3D12Resource> smaa_edges_texture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> smaa_weights_texture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> smaa_output_texture;
+    uint64_t smaa_texture_last_usage = 0;
+    // The guest output resource for which the SRV at kViewIndexSmaaColor was
+    // created (raw pointer for identity comparison only).
+    ID3D12Resource* smaa_color_srv_resource = nullptr;
+
     // Connection-specific.
 
     uint32_t swap_chain_width = 0;
@@ -311,6 +349,59 @@ class D3D12Presenter final : public Presenter {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,
              size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_final_pipelines_;
+
+  // --- SMAA 1x pre-pass (see cvars::postprocess_smaa) ----------------------
+  // Anti-aliases the guest output at its native resolution BEFORE the scaling
+  // chain. Self-contained: its own root signature, per-quality-preset
+  // pipelines, working render targets in PaintContext, and the two
+  // precomputed SMAA lookup textures.
+  enum SmaaPass : size_t {
+    kSmaaPassEdges,
+    kSmaaPassWeights,
+    kSmaaPassBlend,
+    kSmaaPassCount,
+  };
+  enum SmaaQuality : size_t {
+    kSmaaQualityLow,
+    kSmaaQualityMedium,
+    kSmaaQualityHigh,
+    kSmaaQualityUltra,
+    kSmaaQualityCount,
+  };
+  // Returns SIZE_MAX if SMAA is disabled or the cvar value is unknown.
+  static size_t GetSmaaQualityFromCvar();
+  bool InitializeSmaaStaticObjects();
+  // Runs the three SMAA passes on the guest output resource (its SRV must be
+  // at PaintContext::kViewIndexSmaaColor), leaving the result in
+  // paint_context_.smaa_output_texture in the PIXEL_SHADER_RESOURCE state.
+  // Returns false if SMAA can't be applied this frame (resources unavailable).
+  bool PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
+                       ID3D12Resource* guest_output_resource,
+                       uint32_t frontbuffer_width, uint32_t frontbuffer_height,
+                       size_t quality, uint64_t current_paint_submission);
+  // Root signatures: root constants b0 (the RT metrics, visible to VS and
+  // PS), an SRV table starting at t0 (2 entries for the edge detection and
+  // neighborhood blending passes, 3 for the blend weight pass), static
+  // samplers s0 (linear clamp) and s1 (point clamp).
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_2_srvs_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_3_srvs_;
+  // [quality][pass].
+  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,
+                        kSmaaPassCount>,
+             kSmaaQualityCount>
+      smaa_pipelines_;
+  // Optional per-quality edge detection pass replacement using the color
+  // (max per-channel delta) metric instead of luma - selected at paint time
+  // via cvars::postprocess_smaa_edge_detection; missing entries fall back to
+  // the luma pipeline.
+  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kSmaaQualityCount>
+      smaa_edge_color_pipelines_;
+  // Precomputed SMAA lookup textures (AreaTex 160x560 RG8, SearchTex 64x16
+  // R8), uploaded on first use; the upload buffer is retained (it's tiny).
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_search_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_lut_upload_buffer_;
+  bool smaa_luts_uploaded_ = false;
 
   // The first is the refresher completion timeline submission index at which
   // the guest output texture was last refreshed, the second is the reference to

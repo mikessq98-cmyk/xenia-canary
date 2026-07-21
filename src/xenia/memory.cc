@@ -26,6 +26,19 @@
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
 
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#include <psapi.h>  // PROCESS_MEMORY_COUNTERS_EX (process commit charge).
+#endif
+
+DEFINE_int32(
+    memory_statistics_interval_seconds, 30,
+    "Log a one-line [MEM] breakdown of memory usage (process commit and "
+    "headroom, guest virtual/physical committed, and host GPU/CPU caches) "
+    "every N seconds. 0 disables it. Useful for understanding where RAM goes "
+    "on the memory-constrained Xbox UWP target.",
+    "Memory");
+
 DEFINE_bool(protect_zero, true, "Protect the zero page from reads and writes.",
             "Memory");
 DEFINE_bool(emit_inline_mmio_checks, false,
@@ -110,6 +123,18 @@ static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
   if (xe::memory::page_size() > 0x1000) {
     return true;
   }
+#if XE_PLATFORM_WINRT
+  // With winrt_guest_memory_swap_file, the guest virtual heaps live in views
+  // of file-backed sections, whose pages are all committed at map time (RW) -
+  // committing again is a no-op at best and may be rejected on mapped
+  // file-backed pages, so skip it like on large-host-page systems. Checked
+  // per range: a view may have individually fallen back to the pagefile
+  // section, where commit is still required.
+  if (heap.heap_type() == HeapType::kGuestVirtual &&
+      xe::memory::IsGuestMemoryRangeSwapBacked(heap.heap_base())) {
+    return true;
+  }
+#endif  // XE_PLATFORM_WINRT
   return false;
 }
 
@@ -211,6 +236,33 @@ bool Memory::Initialize() {
       break;
     }
   }
+#if XE_PLATFORM_WINRT
+  if (!mapping_base_ && xe::memory::LastFileMappingUsedGuestSwapFile()) {
+    // The swap-file-backed section was created, but its views can't be mapped
+    // on this system - retry with the standard pagefile-backed section instead
+    // of failing to boot (winrt_guest_memory_swap_file is best-effort).
+    XELOGW(
+        "Unable to map views of the swap-file-backed guest memory section; "
+        "falling back to the pagefile-backed section (the "
+        "winrt_guest_memory_swap_file technique is unavailable here)");
+    xe::memory::CloseFileMappingHandle(mapping_, file_name_);
+    xe::memory::DisableGuestMemorySwapFile();
+    mapping_ = xe::memory::CreateFileMappingHandle(
+        file_name_, 0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
+    if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
+      XELOGE("Unable to reserve the 4gb guest address space.");
+      assert_always();
+      return false;
+    }
+    for (size_t n = 32; n < 64; n++) {
+      auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
+      if (!MapViews(mapping_base)) {
+        mapping_base_ = mapping_base;
+        break;
+      }
+    }
+  }
+#endif  // XE_PLATFORM_WINRT
   if (!mapping_base_) {
     XELOGE("Unable to find a continuous block in the 64bit address space.");
     assert_always();
@@ -740,6 +792,71 @@ void Memory::DumpMap() {
   heaps_.vC0000000.DumpMap();
   heaps_.vE0000000.DumpMap();
   XELOGE("");
+}
+
+void Memory::LogMemoryStatistics() {
+  // Lock-free (racy) walk of a heap's page table counting committed pages.
+  // A stale read of a page's state byte only skews the count by a page or
+  // two, which is irrelevant for telemetry, and avoids stalling the heavily
+  // contended global critical region on the emulation threads.
+  auto committed_mb = [](const BaseHeap& heap) -> uint64_t {
+    return (uint64_t(heap.committed_page_count()) * heap.page_size()) >> 20;
+  };
+
+  // The vA0/vC0/vE0 heaps are additional views of the SAME physical pages as
+  // heaps_.physical - counting only the base physical heap avoids triple
+  // counting. The 0x7F000000 (GPU writeback) view is folded into physical too.
+  uint64_t guest_virtual_mb =
+      committed_mb(heaps_.v00000000) + committed_mb(heaps_.v40000000) +
+      committed_mb(heaps_.v80000000) + committed_mb(heaps_.v90000000);
+  uint64_t guest_physical_mb = committed_mb(heaps_.physical);
+
+#if XE_PLATFORM_WIN32
+  // K32GetProcessMemoryInfo is exported from kernel32 (always linked), so
+  // resolving it dynamically avoids any dependency on psapi.lib, which isn't
+  // linked on every toolchain (notably the Xbox one). If it can't be found,
+  // the process-commit fields just read 0 and the budget line below (from the
+  // always-available GlobalMemoryStatusEx) still tells the important story.
+  uint64_t process_commit_mb = 0, working_set_mb = 0;
+  using PfnK32GetProcessMemoryInfo = BOOL(WINAPI*)(
+      HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD);
+  static auto k32_get_process_memory_info =
+      reinterpret_cast<PfnK32GetProcessMemoryInfo>(GetProcAddress(
+          GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo"));
+  if (k32_get_process_memory_info) {
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (k32_get_process_memory_info(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+      process_commit_mb = uint64_t(pmc.PrivateUsage) >> 20;
+      working_set_mb = uint64_t(pmc.WorkingSetSize) >> 20;
+    }
+  }
+  MEMORYSTATUSEX mem_status = {sizeof(mem_status)};
+  uint64_t avail_phys_mb = 0, total_phys_mb = 0;
+  uint64_t avail_commit_mb = 0, total_commit_mb = 0;
+  if (GlobalMemoryStatusEx(&mem_status)) {
+    avail_phys_mb = mem_status.ullAvailPhys >> 20;
+    total_phys_mb = mem_status.ullTotalPhys >> 20;
+    // The COMMIT limit (page file + physical the process may commit) is a
+    // separate, usually smaller, ceiling than free physical RAM - allocations
+    // fail with E_OUTOFMEMORY when commit is exhausted even while ullAvailPhys
+    // still shows plenty free. This is the number that actually gates us.
+    avail_commit_mb = mem_status.ullAvailPageFile >> 20;
+    total_commit_mb = mem_status.ullTotalPageFile >> 20;
+  }
+  XELOGI(
+      "[MEM] process commit {} MB, working set {} MB | commit {}/{} MB free | "
+      "phys {}/{} MB free | guest committed: virtual {} MB, physical {} MB (of "
+      "512)",
+      process_commit_mb, working_set_mb, avail_commit_mb, total_commit_mb,
+      avail_phys_mb, total_phys_mb, guest_virtual_mb, guest_physical_mb);
+#else
+  XELOGI(
+      "[MEM] guest committed: virtual {} MB, physical {} MB (of 512)",
+      guest_virtual_mb, guest_physical_mb);
+#endif
 }
 
 bool Memory::Save(ByteStream* stream) {

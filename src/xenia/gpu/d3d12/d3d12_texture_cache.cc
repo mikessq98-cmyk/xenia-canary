@@ -9,14 +9,19 @@
 
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
 
+#include <algorithm>
 #include <array>
 #include <cfloat>
 #include <cstddef>
 #include <cstring>
+#include <string>
+#include <utility>
 
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
@@ -26,6 +31,25 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+
+#if XE_PLATFORM_WIN32
+// GlobalMemoryStatusEx - the host commit headroom the scaled resolve regions
+// are budgeted against.
+#include "xenia/base/platform_win.h"
+#endif
+
+DEFINE_int32(
+    d3d12_scaled_resolve_max_mb, 0,
+    "Hard cap, in megabytes, on the memory backing draw_resolution_scale "
+    "resolves on devices without usable tiled resources (the Xbox UWP "
+    "driver). 0 (the default) means automatic: the memory is committed on "
+    "demand for exactly the address ranges the game resolves to, grows and "
+    "shrinks with what the game uses, and stops growing while the host is "
+    "short on memory. Set a number only to force a ceiling; ranges that don't "
+    "fit under it are skipped (logged; usually visible as missing "
+    "render-to-texture effects). No effect on devices with working tiled "
+    "resources.",
+    "D3D12");
 
 namespace xe {
 namespace gpu {
@@ -117,6 +141,10 @@ D3D12TextureCache::~D3D12TextureCache() {
        scaled_resolve_2gb_buffers_) {
     scaled_resolve_buffer_ptr.reset();
   }
+  scaled_resolve_committed_current_region_ = nullptr;
+  scaled_resolve_regions_.clear();
+  scaled_resolve_retired_buffers_.clear();
+  scaled_resolve_committed_bytes_ = 0;
   scaled_resolve_heaps_.clear();
   COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb", 0);
 }
@@ -432,6 +460,14 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
         scaled_resolve_buffer->ClearUAVBarrierPending();
       }
     }
+    for (ScaledResolveRegion& region : scaled_resolve_regions_) {
+      if (region.buffer) {
+        region.buffer->ClearUAVBarrierPending();
+      }
+    }
+    // Buffers of grown or released regions become free once the GPU reaches
+    // the submission that last used them.
+    ReleaseCompletedRetiredScaledResolveBuffers();
     std::memset(scaled_resolve_1gb_buffer_indices_, UINT8_MAX,
                 sizeof(scaled_resolve_1gb_buffer_indices_));
   }
@@ -916,6 +952,353 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
   device->CreateSampler(&desc, handle);
 }
 
+bool D3D12TextureCache::UseTiledScaledResolveBuffers() const {
+  D3D12_TILED_RESOURCES_TIER tier =
+      command_processor_.GetD3D12Provider().GetTiledResourcesTier();
+#if XE_PLATFORM_WINRT
+  // The Xbox UWP driver reports tier 1 but its tier-1 UpdateTileMappings
+  // crashes (umd12ddi_arden) - only trust tier 2+ there.
+  return tier >= D3D12_TILED_RESOURCES_TIER_2;
+#else
+  return tier >= D3D12_TILED_RESOURCES_TIER_1;
+#endif
+}
+
+size_t D3D12TextureCache::FindScaledResolveRegion(uint64_t first_scaled,
+                                                 uint64_t last_scaled) const {
+  for (size_t i = 0; i < scaled_resolve_regions_.size(); ++i) {
+    const ScaledResolveRegion& region = scaled_resolve_regions_[i];
+    if (first_scaled >= region.base &&
+        last_scaled < region.base + region.size) {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+
+void D3D12TextureCache::ReleaseCompletedRetiredScaledResolveBuffers() {
+  if (scaled_resolve_retired_buffers_.empty()) {
+    return;
+  }
+  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  scaled_resolve_retired_buffers_.erase(
+      std::remove_if(scaled_resolve_retired_buffers_.begin(),
+                     scaled_resolve_retired_buffers_.end(),
+                     [completed_submission](
+                         const RetiredScaledResolveBuffer& retired) {
+                       return retired.submission <= completed_submission;
+                     }),
+      scaled_resolve_retired_buffers_.end());
+}
+
+bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
+  // An explicit cap, if the user set one, is absolute.
+  if (cvars::d3d12_scaled_resolve_max_mb > 0) {
+    uint64_t cap_bytes = uint64_t(cvars::d3d12_scaled_resolve_max_mb) << 20;
+    if (scaled_resolve_committed_bytes_ + bytes_needed > cap_bytes) {
+      // Regions the game has stopped using may be given up for this one.
+      uint64_t completed_submission =
+          command_processor_.GetCompletedSubmission();
+      for (auto it = scaled_resolve_regions_.begin();
+           it != scaled_resolve_regions_.end() &&
+           scaled_resolve_committed_bytes_ + bytes_needed > cap_bytes;) {
+        if (it->last_use_submission + kScaledResolveRegionIdleSubmissions >
+            completed_submission) {
+          ++it;
+          continue;
+        }
+        scaled_resolve_committed_bytes_ -= it->size;
+        if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
+          scaled_resolve_committed_current_region_ = nullptr;
+        }
+        scaled_resolve_retired_buffers_.push_back(
+            {command_processor_.GetCurrentSubmission(),
+             std::move(it->buffer)});
+        it = scaled_resolve_regions_.erase(it);
+      }
+      if (scaled_resolve_committed_bytes_ + bytes_needed > cap_bytes) {
+        return false;
+      }
+    }
+    return true;
+  }
+  // Automatic: keep a reserve of host memory free for everything else. The
+  // commit limit is what actually fails allocations on Xbox (E_OUTOFMEMORY
+  // while free physical RAM still looks plentiful), so budget against it.
+#if XE_PLATFORM_WIN32
+  MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
+  if (!GlobalMemoryStatusEx(&memory_status)) {
+    return true;
+  }
+  uint64_t available = memory_status.ullAvailPageFile;
+  if (available >= bytes_needed + kScaledResolveHostMemoryReserve) {
+    return true;
+  }
+  // Short on memory - reclaim regions the game hasn't touched in a while
+  // before giving up on this one. Their contents are lost, so this only
+  // happens under real pressure: a surface untouched for hundreds of
+  // submissions is almost certainly a finished effect, and if the game does
+  // come back to it, it re-resolves into a freshly committed region.
+  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  uint64_t released_bytes = 0;
+  for (auto it = scaled_resolve_regions_.begin();
+       it != scaled_resolve_regions_.end();) {
+    if (it->last_use_submission + kScaledResolveRegionIdleSubmissions >
+        completed_submission) {
+      ++it;
+      continue;
+    }
+    released_bytes += it->size;
+    scaled_resolve_committed_bytes_ -= it->size;
+    if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
+      scaled_resolve_committed_current_region_ = nullptr;
+    }
+    scaled_resolve_retired_buffers_.push_back(
+        {command_processor_.GetCurrentSubmission(), std::move(it->buffer)});
+    it = scaled_resolve_regions_.erase(it);
+  }
+  if (released_bytes) {
+    XELOGI(
+        "D3D12TextureCache: released {} MB of idle scaled resolve regions "
+        "under memory pressure ({} MB commit left), {} MB still resident",
+        released_bytes >> 20, available >> 20,
+        scaled_resolve_committed_bytes_ >> 20);
+    // The buffers are only freed once the GPU is done with them, so this
+    // doesn't help the current allocation - but it does stop the growth.
+  }
+  return available >= bytes_needed + kScaledResolveHostMemoryReserve;
+#else
+  return true;
+#endif  // XE_PLATFORM_WIN32
+}
+
+bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
+    uint64_t first_scaled, uint64_t last_scaled) {
+  ReleaseCompletedRetiredScaledResolveBuffers();
+
+  // Already covered - the common case, no allocation at all.
+  if (FindScaledResolveRegion(first_scaled, last_scaled) != SIZE_MAX) {
+    return true;
+  }
+
+  uint64_t scaled_space_size =
+      uint64_t(SharedMemory::kBufferSize) *
+      (draw_resolution_scale_x() * draw_resolution_scale_y());
+  uint64_t request_base =
+      first_scaled & ~(kScaledResolveRegionAlignment - 1);
+  uint64_t request_end =
+      std::min(xe::round_up(last_scaled + 1, kScaledResolveRegionAlignment),
+               scaled_space_size);
+  if (request_end - request_base > kScaledResolveMaxRegionSize) {
+    XELOGE(
+        "D3D12TextureCache: scaled resolve range 0x{:X}-0x{:X} is larger than "
+        "a single buffer may be - skipping",
+        first_scaled, last_scaled);
+    return false;
+  }
+
+  // Absorb every region the request overlaps or nearly touches, so the result
+  // stays one contiguous buffer per cluster of surfaces. The absorbed regions
+  // are always a contiguous run of the (base-sorted) list: anything between
+  // two absorbed regions lies inside the resulting span as well.
+  uint64_t new_base = request_base;
+  uint64_t new_end = request_end;
+  uint64_t new_size = 0;
+  size_t first_absorbed = SIZE_MAX, last_absorbed = SIZE_MAX;
+  uint64_t absorbed_bytes = 0;
+  // Set when the request can only be served by a buffer that may not exist -
+  // an overlapping region would have to be absorbed, but the result would
+  // exceed the maximum region size.
+  bool span_impossible = false;
+  auto compute_span = [&]() {
+    new_base = request_base;
+    new_end = request_end;
+    first_absorbed = SIZE_MAX;
+    last_absorbed = SIZE_MAX;
+    absorbed_bytes = 0;
+    span_impossible = false;
+    // Regions are disjoint and sorted by base, so everything within the merge
+    // gap of the request forms one contiguous run - and the run's last region
+    // is the one that ends the highest.
+    for (size_t i = 0; i < scaled_resolve_regions_.size(); ++i) {
+      const ScaledResolveRegion& region = scaled_resolve_regions_[i];
+      if (region.base + region.size + kScaledResolveRegionMergeGap <=
+              request_base ||
+          region.base >= request_end + kScaledResolveRegionMergeGap) {
+        continue;
+      }
+      if (first_absorbed == SIZE_MAX) {
+        first_absorbed = i;
+      }
+      last_absorbed = i;
+    }
+    // Give up the outermost neighbours while the merged buffer would be
+    // larger than a buffer may be. Regions that overlap the request itself
+    // can't be given up - two buffers may never cover the same scaled address
+    // (writes to one wouldn't be visible through the other).
+    while (first_absorbed != SIZE_MAX) {
+      const ScaledResolveRegion& first = scaled_resolve_regions_[first_absorbed];
+      const ScaledResolveRegion& last = scaled_resolve_regions_[last_absorbed];
+      uint64_t merged_base = std::min(request_base, first.base);
+      uint64_t merged_end = std::max(request_end, last.base + last.size);
+      if (merged_end - merged_base <= kScaledResolveMaxRegionSize) {
+        new_base = merged_base;
+        new_end = merged_end;
+        break;
+      }
+      bool drop_first = (request_base - merged_base) >=
+                        (merged_end - request_end);
+      const ScaledResolveRegion& to_drop =
+          drop_first ? first : last;
+      if (to_drop.base < request_end &&
+          to_drop.base + to_drop.size > request_base) {
+        span_impossible = true;
+        return;
+      }
+      if (first_absorbed == last_absorbed) {
+        first_absorbed = SIZE_MAX;
+        last_absorbed = SIZE_MAX;
+        break;
+      }
+      if (drop_first) {
+        ++first_absorbed;
+      } else {
+        --last_absorbed;
+      }
+    }
+    if (first_absorbed != SIZE_MAX) {
+      for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
+        absorbed_bytes += scaled_resolve_regions_[i].size;
+      }
+    }
+    new_size = new_end - new_base;
+  };
+  compute_span();
+  if (span_impossible) {
+    XELOGE(
+        "D3D12TextureCache: scaled resolve range 0x{:X}-0x{:X} would need a "
+        "buffer larger than the maximum region size - skipping",
+        first_scaled, last_scaled);
+    return false;
+  }
+
+  // Only the growth is new memory - the absorbed regions are given back.
+  if (new_size > absorbed_bytes &&
+      !MakeRoomForScaledResolveRegion(new_size - absorbed_bytes)) {
+    // Keep reporting periodically - a silent stream of these is the
+    // difference between "a few effects missing" and "the game can't render".
+    if (++scaled_resolve_budget_skips_ <= 8 ||
+        (scaled_resolve_budget_skips_ % 1000) == 0) {
+      XELOGW(
+          "D3D12TextureCache: no host memory for a {} MB scaled resolve "
+          "region at 0x{:X} ({} MB already resident) - skipping the range "
+          "(occurrence {})",
+          (new_size - absorbed_bytes) >> 20, new_base,
+          scaled_resolve_committed_bytes_ >> 20, scaled_resolve_budget_skips_);
+    }
+    return false;
+  }
+
+  // Making room may have released regions this request would have absorbed -
+  // recompute against the list as it is now.
+  compute_span();
+  if (span_impossible) {
+    return false;
+  }
+
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_RESOURCE_DESC region_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      region_desc, new_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  // Contents of the absorbed regions are copied in, so start as a copy
+  // destination when there's anything to copy.
+  D3D12_RESOURCE_STATES initial_state =
+      first_absorbed != SIZE_MAX ? D3D12_RESOURCE_STATE_COPY_DEST
+                                 : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  Microsoft::WRL::ComPtr<ID3D12Resource> region_resource;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &region_desc, initial_state,
+          nullptr, IID_PPV_ARGS(&region_resource)))) {
+    XELOGE(
+        "D3D12TextureCache: Failed to create a {} MB scaled resolve region at "
+        "0x{:X} ({} MB already resident)",
+        new_size >> 20, new_base, scaled_resolve_committed_bytes_ >> 20);
+    return false;
+  }
+
+  ScaledResolveRegion new_region;
+  new_region.base = new_base;
+  new_region.size = new_size;
+  new_region.last_use_submission = command_processor_.GetCurrentSubmission();
+  new_region.buffer = std::unique_ptr<ScaledResolveVirtualBuffer>(
+      new ScaledResolveVirtualBuffer(region_resource.Get(), initial_state));
+
+  if (first_absorbed != SIZE_MAX) {
+    // Preserve what the game has already resolved into the absorbed regions -
+    // some surfaces (baked reflections, static shadow maps) are resolved once
+    // and sampled for many frames, so dropping them would leave the game
+    // reading garbage until it happens to resolve them again.
+    DeferredCommandList& command_list =
+        command_processor_.GetDeferredCommandList();
+    for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
+      ScaledResolveRegion& old_region = scaled_resolve_regions_[i];
+      ScaledResolveVirtualBuffer& old_buffer = *old_region.buffer;
+      command_processor_.PushTransitionBarrier(
+          old_buffer.resource(),
+          old_buffer.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
+          D3D12_RESOURCE_STATE_COPY_SOURCE);
+      command_processor_.SubmitBarriers();
+      command_list.D3DCopyBufferRegion(
+          new_region.buffer->resource(), old_region.base - new_base,
+          old_buffer.resource(), 0, old_region.size);
+      new_region.last_use_submission =
+          std::max(new_region.last_use_submission,
+                   old_region.last_use_submission);
+      if (scaled_resolve_committed_current_region_ == &old_buffer) {
+        // The range must be made current again through the new buffer.
+        scaled_resolve_committed_current_region_ = nullptr;
+      }
+      scaled_resolve_retired_buffers_.push_back(
+          {command_processor_.GetCurrentSubmission(),
+           std::move(old_region.buffer)});
+    }
+    scaled_resolve_regions_.erase(
+        scaled_resolve_regions_.begin() + first_absorbed,
+        scaled_resolve_regions_.begin() + last_absorbed + 1);
+    command_processor_.PushTransitionBarrier(
+        new_region.buffer->resource(),
+        new_region.buffer->SetResourceState(
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+
+  scaled_resolve_committed_bytes_ += new_size;
+  scaled_resolve_committed_bytes_ -= absorbed_bytes;
+  // Keep the list sorted by base so lookups and merges stay simple.
+  auto insertion_point = std::lower_bound(
+      scaled_resolve_regions_.begin(), scaled_resolve_regions_.end(), new_base,
+      [](const ScaledResolveRegion& region, uint64_t base) {
+        return region.base < base;
+      });
+  scaled_resolve_regions_.insert(insertion_point, std::move(new_region));
+
+  COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb",
+                    uint32_t(scaled_resolve_committed_bytes_ >> 20));
+  XELOGI(
+      "D3D12TextureCache: scaled resolve region 0x{:X}-0x{:X} ({} MB){} - {} "
+      "MB resident across {} region(s)",
+      new_base, new_base + new_size - 1, new_size >> 20,
+      absorbed_bytes ? fmt::format(", grown from {} MB of {} region(s)",
+                                   absorbed_bytes >> 20,
+                                   last_absorbed - first_absorbed + 1)
+                     : std::string(),
+      scaled_resolve_committed_bytes_ >> 20, scaled_resolve_regions_.size());
+  return true;
+}
+
 bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(
     uint32_t start_unscaled, uint32_t length_unscaled,
     uint32_t length_scaled_alignment_log2) {
@@ -943,6 +1326,12 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+
+  // Committed (non-tiled, Xbox UWP) path: back exactly the touched ranges with
+  // dynamically sized regions instead of one buffer spanning everything.
+  if (!UseTiledScaledResolveBuffers()) {
+    return EnsureScaledResolveRegionCommitted(first_scaled, last_scaled);
+  }
 
   // Ensure GPU virtual memory for buffers that may be used to access the range
   // is allocated - buffers are created. Always creating both buffers for all
@@ -1070,6 +1459,23 @@ bool D3D12TextureCache::MakeScaledResolveRangeCurrent(
       ~length_scaled_alignment_bits;
   uint64_t last_scaled = start_scaled + (length_scaled - 1);
 
+  // Committed path: the range lives entirely in one region (regions are grown
+  // to cover whatever is requested, so this only fails if the memory for it
+  // couldn't be obtained earlier).
+  if (!UseTiledScaledResolveBuffers()) {
+    size_t region_index = FindScaledResolveRegion(start_scaled, last_scaled);
+    if (region_index == SIZE_MAX) {
+      return false;
+    }
+    ScaledResolveRegion& region = scaled_resolve_regions_[region_index];
+    region.last_use_submission = command_processor_.GetCurrentSubmission();
+    scaled_resolve_committed_current_region_ = region.buffer.get();
+    scaled_resolve_committed_buffer_base_ = region.base;
+    scaled_resolve_current_range_start_scaled_ = start_scaled;
+    scaled_resolve_current_range_length_scaled_ = length_scaled;
+    return true;
+  }
+
   // Get one or two buffers that can hold the whole range.
   std::array<size_t, 2> possible_buffer_indices_first =
       GetPossibleScaledResolveBufferIndices(start_scaled);
@@ -1174,6 +1580,17 @@ void D3D12TextureCache::TransitionCurrentScaledResolveRange(
 D3D12_GPU_VIRTUAL_ADDRESS
 D3D12TextureCache::GetCurrentScaledResolveRangeGPUAddress() const {
   assert_true(IsDrawResolutionScaled());
+  // Committed path: the current region starts at
+  // scaled_resolve_committed_buffer_base_ in the scaled address space, so the
+  // range's offset in the buffer is measured from there.
+  if (scaled_resolve_committed_current_region_) {
+    return scaled_resolve_committed_current_region_->resource()
+               ->GetGPUVirtualAddress() +
+           (scaled_resolve_current_range_start_scaled_ -
+            scaled_resolve_committed_buffer_base_);
+  }
+  // Tiled path: the buffer index is the gigabyte of the scaled space it starts
+  // at.
   const size_t buffer_index = GetCurrentScaledResolveBufferIndex();
   const ScaledResolveVirtualBuffer* buffer =
       scaled_resolve_2gb_buffers_[buffer_index].get();

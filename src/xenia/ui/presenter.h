@@ -201,6 +201,10 @@ class Presenter {
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
       kFsr,
+      // Snapdragon Game Super Resolution v1 - single-pass edge-directed
+      // upscaling, sharper than bilinear and much cheaper than FSR (D3D12
+      // only; falls back to bilinear if the backend doesn't implement it).
+      kSgsr,
     };
 
     // This value is used as a lerp factor.
@@ -225,6 +229,15 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
+
+    // SGSR edge refinement parameters, from the reference implementation.
+    static constexpr float kSgsrEdgeSharpnessMin = 0.0f;
+    static constexpr float kSgsrEdgeSharpnessMax = 10.0f;
+    static constexpr float kSgsrEdgeSharpnessDefault = 2.0f;
+    // The threshold is in 8-bit luma units (divided by 255 before use).
+    static constexpr float kSgsrEdgeThresholdMin = 0.0f;
+    static constexpr float kSgsrEdgeThresholdMax = 16.0f;
+    static constexpr float kSgsrEdgeThresholdDefault = 8.0f;
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -263,6 +276,20 @@ class Presenter {
           std::max(kFsrSharpnessReductionMin, new_fsr_sharpness_reduction));
     }
 
+    float GetSgsrEdgeSharpness() const { return sgsr_edge_sharpness_; }
+    void SetSgsrEdgeSharpness(float new_sgsr_edge_sharpness) {
+      sgsr_edge_sharpness_ = std::min(
+          kSgsrEdgeSharpnessMax,
+          std::max(kSgsrEdgeSharpnessMin, new_sgsr_edge_sharpness));
+    }
+
+    float GetSgsrEdgeThreshold() const { return sgsr_edge_threshold_; }
+    void SetSgsrEdgeThreshold(float new_sgsr_edge_threshold) {
+      sgsr_edge_threshold_ = std::min(
+          kSgsrEdgeThresholdMax,
+          std::max(kSgsrEdgeThresholdMin, new_sgsr_edge_threshold));
+    }
+
     // Very tiny effect, but highly noticeable, for instance, on the sky in the
     // 4D5307E6 main menu (prominently in Custom Games, especially with FSR -
     // banding around the clouds can be clearly seen without dithering with 8bpc
@@ -279,6 +306,8 @@ class Presenter {
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
+    float sgsr_edge_sharpness_ = kSgsrEdgeSharpnessDefault;
+    float sgsr_edge_threshold_ = kSgsrEdgeThresholdDefault;
     bool dither_ = false;
   };
 
@@ -396,6 +425,9 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
+    // Snapdragon Game Super Resolution v1 - single-pass edge-directed
+    // upscaling (D3D12 only).
+    kSgsr,
 
     kCount,
   };
@@ -422,6 +454,10 @@ class Presenter {
       GuestOutputPaintEffect effect) {
     switch (effect) {
       case GuestOutputPaintEffect::kFsrEasu:
+      // SGSR derives the texture coordinates from the pixel position, which is
+      // only valid with the output rectangle at the origin - always done to an
+      // intermediate framebuffer (followed by 1:1 bilinear).
+      case GuestOutputPaintEffect::kSgsr:
         return false;
       default:
         return true;
@@ -564,6 +600,33 @@ class Presenter {
           float(input_height) / float(output_size.second);
       input_size_inv[0] = 1.0f / float(input_width);
       input_size_inv[1] = 1.0f / float(input_height);
+    }
+  };
+
+  struct SgsrConstants {
+    // No output offset because the SGSR pass is always done to an intermediate
+    // framebuffer (see CanGuestOutputPaintEffectBeFinal).
+    float output_size_inv[2];
+    float input_size[2];
+    float input_size_inv[2];
+    float edge_sharpness;
+    // Pre-divided by 255 (the shader compares against normalized luma).
+    float edge_threshold_normalized;
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index,
+                    const GuestOutputPaintConfig& config) {
+      uint32_t input_width, input_height;
+      flow.GetEffectInputSize(effect_index, input_width, input_height);
+      const std::pair<uint32_t, uint32_t>& output_size =
+          flow.effect_output_sizes[effect_index];
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+      input_size[0] = float(input_width);
+      input_size[1] = float(input_height);
+      input_size_inv[0] = 1.0f / float(input_width);
+      input_size_inv[1] = 1.0f / float(input_height);
+      edge_sharpness = config.GetSgsrEdgeSharpness();
+      edge_threshold_normalized = config.GetSgsrEdgeThreshold() / 255.0f;
     }
   };
 

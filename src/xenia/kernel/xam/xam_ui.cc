@@ -20,6 +20,7 @@
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_guest_notification.h"
+#include "xenia/ui/window.h"
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
 #include "xenia/kernel/xam/ui/game_achievements_ui.h"
@@ -277,6 +278,21 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
     if (first_draw) {
       ImGui::SetKeyboardFocusHere();
     }
+    // On Xbox, keep the system on-screen keyboard up for the dialog's whole
+    // lifetime - opening it explicitly right when the game asks for text
+    // (instead of waiting for ImGui's WantTextInput transition after the user
+    // first tries to type) and retrying transient system-UI refusals every
+    // frame. This is the proven old-UWP-port pattern. The field is re-focused
+    // only while NOTHING is focused - re-focusing while the user navigated to
+    // OK/Cancel would steal gamepad navigation every frame.
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive() && !ImGui::IsAnyItemFocused() &&
+        !ImGui::IsMouseClicked(0)) {
+      ImGui::SetKeyboardFocusHere();
+    }
+#if XE_PLATFORM_WINRT
+    imgui_drawer()->window()->ShowOnScreenKeyboard();
+#endif
     ImGui::PushID("input_text");
     bool input_submitted =
         ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
@@ -293,28 +309,36 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
       ImGui::EndPopup();
     }
     ImGui::PopID();
+    bool closing = false;
     if (input_submitted) {
       text_ = std::string(text_buffer_.data(), text_buffer_.size());
       cancelled_ = false;
-      ImGui::CloseCurrentPopup();
-      Close();
+      closing = true;
     }
     if (ImGui::Button("OK")) {
       text_ = std::string(text_buffer_.data(), text_buffer_.size());
       cancelled_ = false;
-      ImGui::CloseCurrentPopup();
-      Close();
+      closing = true;
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) {
       text_ = "";
       cancelled_ = true;
+      closing = true;
+    }
+    if (closing) {
+#if XE_PLATFORM_WINRT
+      imgui_drawer()->window()->HideOnScreenKeyboard();
+#endif
       ImGui::CloseCurrentPopup();
       Close();
     }
     ImGui::Spacing();
     ImGui::EndPopup();
   } else {
+#if XE_PLATFORM_WINRT
+    imgui_drawer()->window()->HideOnScreenKeyboard();
+#endif
     Close();
   }
 }

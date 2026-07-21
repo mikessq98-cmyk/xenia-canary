@@ -47,6 +47,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImGuiIO& GetIO();
 
+  // The window this drawer renders into - lets dialog code reach
+  // platform-specific window services (e.g. the explicit on-screen keyboard
+  // control on Xbox UWP).
+  Window* window() const { return window_; }
+
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
 
@@ -151,6 +156,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   ImGuiContext* internal_state_ = nullptr;
   hid::InputSystem* input_system_ = nullptr;
+  // Cached bitmask of user slots with a real gamepad, refreshed ~1/second by
+  // UpdateGamepads - probing empty XInput slots every frame is a UI stall.
+  uint32_t gamepad_connected_mask_ = 0;
+  uint32_t gamepad_rescan_countdown_ = 0;
 
   std::function<void(uint8_t)> onGuidePressFunction_;
   // All currently-attached dialogs that get drawn.

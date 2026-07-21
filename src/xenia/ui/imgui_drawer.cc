@@ -661,8 +661,24 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // dialogs/notifications. When the menu is hidden (game running), behave like
   // the desktop build: draw only for dialogs/notifications.
   force_uwp_render = uwp_menu_visible_;
+  // Safety net for the explicit keyboard hold: only dialogs may hold the
+  // on-screen keyboard, so with no dialogs left, release it - a dialog
+  // destroyed through any path (including ClearDialogs on title launch) must
+  // never leak the hold, which would suppress the keyboard everywhere.
+  if (dialogs_.empty() && window_) {
+    window_->HideOnScreenKeyboard();
+  }
 #endif
   if (dialogs_.empty() && notifications_.empty() && !force_uwp_render) {
+#if XE_PLATFORM_WINRT
+    // Nothing will be drawn, so no ImGui frame will run to update this - and a
+    // stale "wants text input" from the frame where a dialog was still open
+    // makes the UWP window re-show the on-screen keyboard over the running
+    // game (and keeps the paint timer awake forever).
+    if (window_) {
+      window_->SetImGuiWantsTextInput(false);
+    }
+#endif
     return;
   }
 
@@ -1049,43 +1065,54 @@ void ImGuiDrawer::UpdateGamepads() {
     return;
   }
 
-  hid::X_INPUT_CAPABILITIES caps = {};
-
-  bool is_gamepad_connected = false;
-
-  for (uint8_t i = 0; i < XUserMaxUserCount; i++) {
-    if (input_system_->GetCapabilities(i, 1, &caps) == X_ERROR_SUCCESS) {
-      // Special case to skip keyboard being set in gamepad mode.
-      if (caps.gamepad.buttons == 0xFFFF &&
-          caps.vibration.left_motor_speed == 0 &&
-          caps.vibration.right_motor_speed == 0) {
-        continue;
-      }
-
-      is_gamepad_connected = true;
-      break;
-    }
-  }
-
   auto& io = GetIO();
 
-  if (!is_gamepad_connected) {
+  // Rescan which user slots actually have a gamepad only about once a second:
+  // this runs every UI frame, and probing empty XInput slots (GetCapabilities /
+  // GetState on a disconnected index) is notoriously slow because it triggers
+  // device enumeration - doing it 4x per frame was a per-frame UI-thread stall.
+  if (gamepad_rescan_countdown_ == 0) {
+    gamepad_rescan_countdown_ = 60;
+    gamepad_connected_mask_ = 0;
+    hid::X_INPUT_CAPABILITIES caps = {};
+    for (uint8_t i = 0; i < XUserMaxUserCount; i++) {
+      if (input_system_->GetCapabilities(i, 1, &caps) == X_ERROR_SUCCESS) {
+        // Special case to skip keyboard being set in gamepad mode.
+        if (caps.gamepad.buttons == 0xFFFF &&
+            caps.vibration.left_motor_speed == 0 &&
+            caps.vibration.right_motor_speed == 0) {
+          continue;
+        }
+        gamepad_connected_mask_ |= uint32_t(1) << i;
+      }
+    }
+  }
+  --gamepad_rescan_countdown_;
+
+  if (!gamepad_connected_mask_) {
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
     return;
   }
 
+  // Feed the first connected pad's state to ImGui EVERY frame, whether or not
+  // any digital button is currently down. The previous code only forwarded the
+  // state while `buttons != 0` (and cleared input otherwise), which meant
+  // analog-stick navigation never worked and button releases could be missed.
   uint8_t controller_to_poke = XUserIndexNone;
   hid::X_INPUT_STATE gamepad_state;
   for (uint8_t i = 0; i < XUserMaxUserCount; i++) {
+    if (!(gamepad_connected_mask_ & (uint32_t(1) << i))) {
+      continue;
+    }
     if (input_system_->GetState(i, 1, &gamepad_state) == X_ERROR_SUCCESS) {
-      if (gamepad_state.gamepad.buttons != 0) {
-        controller_to_poke = i;
-        break;
-      }
+      controller_to_poke = i;
+      break;
     }
   }
   if (controller_to_poke == XUserIndexNone) {
-    io.ClearInputKeys();
+    // The cached slot disappeared (pad unplugged) - rescan next frame.
+    gamepad_rescan_countdown_ = 0;
+    io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
     return;
   }
 

@@ -69,6 +69,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
 
+  void LogHostMemoryStatistics() override;
+
   void InitializeShaderStorage(
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
       std::function<void()> completion_callback = nullptr) override;
@@ -79,12 +81,24 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
+  // Preserves the toxic-shader solver's crash journal when the device is lost
+  // (see PipelineCache::SolverOnDeviceLost). May be called from any thread.
+  void OnHostGpuLossFromAnyThread() override;
+
   void PollCompletedSubmission() override;
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(
         graphics_system_->provider());
   }
+
+  // Whether draws/pipelines using this VS+PS combination should be skipped -
+  // the Xbox-UWP toxic-shader workaround (see cvars::d3d12_skip_shaders).
+  // Checked both when a pipeline is created (so the stored-cache prewarming
+  // never re-creates a driver-hanging pipeline) and per draw. Always returns
+  // false off UWP.
+  bool IsShaderSkipped(uint64_t vertex_shader_hash,
+                       uint64_t pixel_shader_hash) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -770,6 +784,19 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // nullptr in this case) or a non-Xenos graphics or compute pipeline
   // (current_guest_pipeline_ is nullptr in this case).
   void* current_guest_pipeline_;
+
+#if XE_PLATFORM_WINRT
+  // Ring of the most recently bound guest pipelines' [VS, PS] ucode hashes,
+  // recorded on every pipeline change in IssueDraw (GPU thread) and dumped on
+  // device loss: when the device dies EXECUTING a bad pipeline (no pipeline
+  // creation in flight, so the toxic-shader solver's creation journal is
+  // empty - observed in Alan Wake), the tail of this ring names the
+  // execution-side suspects. Reads at loss time are unsynchronized by design
+  // (purely diagnostic).
+  static constexpr uint32_t kExecPipelineRingSize = 64;  // Power of two.
+  std::pair<uint64_t, uint64_t> exec_pipeline_ring_[kExecPipelineRingSize] = {};
+  std::atomic<uint32_t> exec_pipeline_ring_next_{0};
+#endif  // XE_PLATFORM_WINRT
   ID3D12PipelineState* current_external_pipeline_;
 
   // Currently bound graphics root signature.

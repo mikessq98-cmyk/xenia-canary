@@ -92,6 +92,7 @@
     <!-- Capability set matching the proven Xbox Dev Mode emulators (RetroArch
          and Dolphin UWP ship exactly this combination). -->
     <Capability Name="internetClient" />
+    <rescap:Capability Name="hevcPlayback" />
     <!-- For the emulated Xbox 360 network stack (system link / netplay). -->
     <Capability Name="internetClientServer" />
     <Capability Name="privateNetworkClientServer" />

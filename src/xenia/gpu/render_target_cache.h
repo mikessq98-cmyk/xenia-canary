@@ -205,6 +205,27 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(
       uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // Releases host render targets that hold no EDRAM data anymore and that the
+  // GPU finished with at least min_idle_submissions ago, least recently used
+  // first, until bytes_to_free has been freed (or nothing is left to release).
+  // Returns the number of bytes actually freed.
+  // Host render targets are sized to span a whole EDRAM addressing period, so
+  // at a draw resolution scale they are tens of megabytes each and a game that
+  // cycles through surface configurations accumulates gigabytes of them - on a
+  // memory-constrained host that is the difference between running and dying.
+  // The caller must ensure nothing still references the released targets (no
+  // recorded command list in flight, accumulated render targets reset).
+  uint64_t TrimUnusedRenderTargets(uint64_t bytes_to_free,
+                                   uint64_t completed_submission,
+                                   uint64_t min_idle_submissions);
+
+  // Number of host render targets currently cached, for telemetry.
+  size_t GetCachedRenderTargetCount() const { return render_targets_.size(); }
+
+  // Stamps the render targets bound by the last update as used in the given
+  // submission, so trimming can tell live ones from leftovers.
+  void MarkLastUpdateRenderTargetsUsedInSubmission(uint64_t submission);
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
@@ -330,11 +351,24 @@ class RenderTargetCache {
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
 
+    // Host memory the render target occupies, for host implementations that
+    // track it (0 = unknown, which excludes it from memory-pressure trimming).
+    virtual uint64_t GetHostMemoryBytes() const { return 0; }
+
+    // Submission the render target was last bound in - a render target the GPU
+    // has finished with, and that owns no EDRAM data, may be released to free
+    // its host memory (see TrimUnusedRenderTargets).
+    uint64_t last_use_submission() const { return last_use_submission_; }
+    void SetLastUseSubmission(uint64_t submission) {
+      last_use_submission_ = submission;
+    }
+
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
 
    private:
     RenderTargetKey key_;
+    uint64_t last_use_submission_ = 0;
   };
 
   struct Transfer {

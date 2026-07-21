@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -69,6 +70,22 @@ class PipelineCache {
       std::function<void()> completion_callback = nullptr);
   void ShutdownShaderStorage();
 
+#if XE_PLATFORM_WINRT
+  // Marks that the host GPU device has been lost (callable from any thread) so
+  // the toxic-shader solver keeps its crash journal on shutdown even though
+  // the process exits gracefully - covers device loss detected outside
+  // pipeline creation (present/submission), including a creation call that
+  // hung the driver's shader compiler and never returned.
+  void SolverOnDeviceLost();
+  // Quarantines a pipeline identified as an EXECUTION-side hang suspect (the
+  // most recently bound pipeline when the device was removed with
+  // DXGI_ERROR_DEVICE_HUNG) - appends it to the per-game .toxic file so the
+  // next launch skips it. The suspect may be innocent (the hang can lag the
+  // guilty draw); the .toxic file is plain text and can be pruned by hand.
+  void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
+                                        uint64_t pixel_shader_hash);
+#endif  // XE_PLATFORM_WINRT
+
   void EndSubmission();
   bool IsCreatingPipelines();
   // Waits for any pipeline creation needed by the current draw path to finish
@@ -118,6 +135,12 @@ class PipelineCache {
   ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)
         ->description.root_signature;
+  }
+
+  // Total resident translated shader bytecode (DXBC), for telemetry. Atomic
+  // scalar, safe to read from any thread.
+  uint64_t GetTranslatedShaderBytes() const {
+    return translated_shader_bytes_.load(std::memory_order_relaxed);
   }
 
  private:
@@ -323,6 +346,92 @@ class PipelineCache {
   ID3D12PipelineState* CreateD3D12Pipeline(
       const PipelineRuntimeDescription& runtime_description);
 
+#if XE_PLATFORM_WINRT
+  // --- Toxic-shader solver (Xbox UWP only) ------------------------------
+  // Some [VS,PS] pipeline combinations hard-crash the Xbox UWP D3D12 driver
+  // inside CreateGraphicsPipelineState (e.g. GTA IV). This auto-detects and
+  // skips them across runs, so a single crash immunizes every later launch -
+  // no manual cvars::d3d12_skip_shaders editing needed.
+  //
+  // Phase A (detect): each creation is bracketed by an on-disk crash journal
+  //   (<cache>/shaders/<title>.d3d12.inflight). The pair is written before the
+  //   driver call and removed on any normal return, so a hard crash leaves the
+  //   in-flight pair(s) behind.
+  // Phase B (confirm): on the next launch the journal is read. A lone leftover
+  //   pair is unambiguously the culprit -> appended to the per-game skip file
+  //   (<cache>/shaders/<title>.d3d12.toxic). Several leftovers -> "safe mode"
+  //   (all creation serialized) so the next crash narrows down to exactly one.
+  void SolverInitialize(const std::filesystem::path& cache_root,
+                        uint32_t title_id);
+  void SolverShutdown(bool clean_exit);
+  // Confirmed-toxic lookup. Immutable after SolverInitialize (built before any
+  // creation thread runs), so reads are lock-free.
+  bool IsShaderToxic(uint64_t vertex_shader_hash,
+                     uint64_t pixel_shader_hash) const;
+  void SolverJournalBegin(uint64_t vertex_shader_hash,
+                          uint64_t pixel_shader_hash);
+  void SolverJournalEnd(uint64_t vertex_shader_hash,
+                        uint64_t pixel_shader_hash);
+  // Rewrites the whole journal from solver_inflight_. Caller holds the mutex.
+  void SolverRewriteJournalLocked();
+  void SolverAppendToxic(uint64_t vertex_shader_hash,
+                         uint64_t pixel_shader_hash);
+  // On the first observed E_OUTOFMEMORY: rewrites the skip list with only the
+  // entries known at startup (quarantines made earlier in this session were
+  // likely out-of-memory victims, not genuinely toxic pairs).
+  void SolverRetractThisRunToxic();
+
+#if XE_PLATFORM_WINRT
+  // Frees the translated DXBC of all shaders (keeping the guest ucode) when
+  // the title is close to its memory budget; shaders are retranslated on
+  // demand through the normal pending/sync paths. Called from EndSubmission
+  // on the GPU thread; bails out if any pipeline creation or storage
+  // translation is in flight.
+  void ReleaseTranslationsUnderMemoryPressure(uint64_t available_bytes);
+#endif  // XE_PLATFORM_WINRT
+
+  bool solver_enabled_ = false;
+  // Whether to write the per-creation crash journal this session. To avoid the
+  // journal's file I/O (under a lock, on every pipeline creation) becoming
+  // thread contention during normal prewarming, journaling is OFF unless the
+  // previous run did NOT exit cleanly (a leftover ".running" marker) - i.e. we
+  // only pay the cost while actually hunting a driver crash. Known-toxic
+  // skipping (the cheap in-memory lookup) is always active.
+  bool solver_journaling_ = false;
+  // All pipeline creation serialized to one-in-flight to pinpoint the culprit.
+  bool solver_safe_mode_ = false;
+  // Creations performed in safe mode, and the number after which safe mode
+  // gives up on reproducing the previous run's crash (see CreateD3D12Pipeline)
+  // instead of starving the game of pipelines for the whole session.
+  std::atomic<uint32_t> solver_safe_mode_creations_{0};
+  static constexpr uint32_t kSolverSafeModeMaxCreations = 192;
+  std::filesystem::path solver_toxic_path_;
+  std::filesystem::path solver_journal_path_;
+  // Presence at startup means the last run crashed (deleted on clean exit).
+  std::filesystem::path solver_running_path_;
+  std::set<std::pair<uint64_t, uint64_t>> solver_toxic_shaders_;
+  std::mutex solver_journal_mutex_;
+  std::set<std::pair<uint64_t, uint64_t>> solver_inflight_;
+  std::FILE* solver_journal_file_ = nullptr;
+  // Set once the D3D12 device is lost during creation. Tells the in-flight
+  // guards to leave their entries in the journal (so they survive as suspects)
+  // even on a graceful removal where the process doesn't hard-crash.
+  std::atomic<bool> solver_device_lost_{false};
+  // Set once any pipeline creation fails with E_OUTOFMEMORY: from that point
+  // driver shader compiler crashes are treated as out-of-memory victims (the
+  // compiler AVs on its own failed allocations) and are NOT quarantined as
+  // toxic pairs.
+  std::atomic<bool> solver_oom_seen_{false};
+  // Held while a pipeline is created in safe mode (only one at a time).
+  std::mutex solver_serialize_mutex_;
+#endif  // XE_PLATFORM_WINRT
+
+  // Sum of resident translated shader bytecode sizes (incremented on a
+  // successful translation, decremented when released under memory pressure).
+  // Unconditional - the translate path that updates it is compiled on all
+  // platforms.
+  std::atomic<uint64_t> translated_shader_bytes_{0};
+
   D3D12CommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
@@ -388,6 +497,14 @@ class PipelineCache {
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority{0};
   };
+
+  // Marks the pipeline's translations as referenced by a queued or in-flight
+  // creation, so the memory-pressure release can free everything else while
+  // creation is running. Both must be called with creation_request_lock_ held:
+  // acquire when pushing to creation_queue_, release when the creation attempt
+  // ends (successful or not).
+  static void AcquirePipelineTranslationsForCreation(Pipeline* pipeline);
+  static void ReleasePipelineTranslationsFromCreation(Pipeline* pipeline);
 
   // Comparator for priority queue - higher priority first.
   struct PipelineCreationPriorityCompare {
@@ -459,6 +576,16 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
+
+#if XE_PLATFORM_WINRT
+  // Counts how many EndSubmission calls until the next memory-pressure check
+  // (the GlobalMemoryStatusEx query is not worth doing every submission).
+  uint32_t memory_pressure_check_counter_ = 0;
+  // Nonzero while TranslateShadersForStorage is running on the loader
+  // thread(s) - the memory-pressure release must not free binaries out from
+  // under an in-progress storage translation.
+  std::atomic<uint32_t> storage_translations_in_progress_{0};
+#endif  // XE_PLATFORM_WINRT
 };
 inline bool PipelineCache::PipelineDescription::operator==(
     const PipelineDescription& other) const {

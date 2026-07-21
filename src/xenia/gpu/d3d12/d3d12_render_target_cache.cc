@@ -9,10 +9,13 @@
 
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #include "third_party/dxbc/DXBCChecksum.h"
+#include "third_party/fmt/include/fmt/format.h"
 #include "third_party/fmt/include/fmt/xchar.h"
 
 #include "xenia/base/assert.h"
@@ -31,6 +34,25 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+
+#if XE_PLATFORM_WIN32
+// GlobalMemoryStatusEx - the host memory the render target budget follows.
+#include "xenia/base/platform_win.h"
+#endif
+
+DEFINE_int32(
+    d3d12_render_target_cache_max_mb, 0,
+    "Budget, in megabytes, for cached host render targets. Each host render "
+    "target spans a whole EDRAM addressing period, so at a draw resolution "
+    "scale they are tens of megabytes each and a game cycling through surface "
+    "configurations accumulates gigabytes of them - by far the largest host "
+    "allocation on the Xbox UWP target. Over the budget, render targets that "
+    "hold no rendering anymore and that the GPU has finished with are "
+    "released, least recently used first (they are recreated, with a brief "
+    "hitch, if the game comes back to them). 0 (the default) means automatic: "
+    "no fixed budget, but trimming whenever the host is running short of "
+    "memory.",
+    "D3D12");
 
 DEFINE_bool(
     native_stencil_value_output_d3d12_intel, false,
@@ -274,6 +296,7 @@ bool D3D12RenderTargetCache::Initialize() {
     return false;
   }
   edram_buffer_->SetName(L"EDRAM Buffer");
+  edram_buffer_size_ = edram_buffer_size;
   edram_buffer_gpu_address_ = edram_buffer_->GetGPUVirtualAddress();
   edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
@@ -1149,6 +1172,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
 
   ui::d3d12::util::ReleaseAndNull(edram_buffer_descriptor_heap_);
   ui::d3d12::util::ReleaseAndNull(edram_buffer_);
+  edram_buffer_size_ = 0;
 
   if (!from_destructor) {
     ShutdownCommon();
@@ -1166,9 +1190,91 @@ void D3D12RenderTargetCache::CompletedSubmissionUpdated() {
   }
 }
 
+void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  uint64_t resident_bytes =
+      render_target_host_memory_bytes_.load(std::memory_order_relaxed);
+  if (!resident_bytes) {
+    return;
+  }
+  uint64_t bytes_to_free = 0;
+  uint64_t host_memory_left = 0;
+  if (cvars::d3d12_render_target_cache_max_mb > 0) {
+    uint64_t budget_bytes =
+        uint64_t(cvars::d3d12_render_target_cache_max_mb) << 20;
+    if (resident_bytes > budget_bytes) {
+      bytes_to_free = resident_bytes - budget_bytes;
+    }
+  } else {
+#if XE_PLATFORM_WIN32
+    // Automatic: keep host memory available rather than enforcing a fixed
+    // size. The commit limit is what actually fails allocations here - both
+    // the guest's own memory and the driver's shader compilation arenas come
+    // out of it, and running dry kills the emulator, while releasing a render
+    // target only costs a recreation later.
+    MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
+    if (!GlobalMemoryStatusEx(&memory_status)) {
+      return;
+    }
+    host_memory_left = memory_status.ullAvailPageFile;
+    if (host_memory_left < kHostMemoryTrimThreshold) {
+      // Free the deficit plus a margin, so this doesn't run every submission.
+      bytes_to_free = kHostMemoryTrimThreshold - host_memory_left +
+                      kHostMemoryTrimExtra;
+    }
+#else
+    return;
+#endif  // XE_PLATFORM_WIN32
+  }
+  if (!bytes_to_free) {
+    return;
+  }
+  // Space the attempts out. Under structural pressure - when the render
+  // targets the game is actively rendering to already don't fit - trimming
+  // can't get back over the threshold, and running it every submission just
+  // releases and recreates tens of megabytes forever (seen as constant
+  // stuttering).
+  uint64_t current_submission = command_processor_.GetCurrentSubmission();
+  if (current_submission <
+      render_target_trim_last_submission_ + render_target_trim_interval_) {
+    return;
+  }
+  render_target_trim_last_submission_ = current_submission;
+
+  // A new command list is about to be recorded and the accumulated render
+  // targets have been invalidated, so nothing references the released targets
+  // on the host; requiring the GPU to have completed their submission makes
+  // sure nothing references them on the device either.
+  uint64_t freed_bytes = TrimUnusedRenderTargets(
+      bytes_to_free, command_processor_.GetCompletedSubmission(),
+      kRenderTargetIdleSubmissions);
+  if (freed_bytes >= kRenderTargetTrimUselessBytes) {
+    render_target_trim_interval_ = kRenderTargetTrimIntervalSubmissions;
+    XELOGI(
+        "D3D12RenderTargetCache: released {} MB of unused host render targets "
+        "({} MB left resident{})",
+        freed_bytes >> 20,
+        render_target_host_memory_bytes_.load(std::memory_order_relaxed) >> 20,
+        host_memory_left
+            ? fmt::format(", {} MB of host memory was left",
+                          host_memory_left >> 20)
+            : std::string());
+  } else {
+    // Nothing worth releasing - back off so the next attempts are cheap.
+    render_target_trim_interval_ =
+        std::min(render_target_trim_interval_ * 2,
+                 kRenderTargetTrimBackoffSubmissions);
+  }
+}
+
 void D3D12RenderTargetCache::BeginSubmission() {
   // New command list - render targets not bound.
   InvalidateCommandListRenderTargets();
+  // Release render targets the game has moved on from if the host is short on
+  // memory - safe here, before anything is recorded into the new command list.
+  TrimRenderTargetsForHostMemory();
   // ExecuteCommandLists is a full UAV barrier.
   if (edram_buffer_modification_status_ !=
       EdramBufferModificationStatus::kUnmodified) {
@@ -1187,6 +1293,10 @@ bool D3D12RenderTargetCache::Update(
                                  normalized_color_mask, vertex_shader)) {
     return false;
   }
+  // Note what the game is actually rendering to right now, so the rest can be
+  // released if the host runs short of memory.
+  MarkLastUpdateRenderTargetsUsedInSubmission(
+      command_processor_.GetCurrentSubmission());
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
@@ -1973,10 +2083,19 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(
   device->CreateShaderResourceView(resource.Get(), &srv_desc,
                                    descriptor_srv.GetHandle());
 
+  // Account for the resource in the host memory telemetry (the allocation
+  // info, not the naive pixel count - alignment and compression metadata are
+  // part of what the host actually spends).
+  uint64_t host_memory_bytes =
+      device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes;
+  render_target_host_memory_bytes_.fetch_add(host_memory_bytes,
+                                             std::memory_order_relaxed);
+
   return new D3D12RenderTarget(
       key, resource.Get(), std::move(descriptor_draw),
       std::move(descriptor_load_separate), std::move(descriptor_srv),
-      std::move(descriptor_srv_stencil), resource_state);
+      std::move(descriptor_srv_stencil), resource_state, host_memory_bytes,
+      &render_target_host_memory_bytes_);
 }
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(

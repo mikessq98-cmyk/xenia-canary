@@ -49,6 +49,25 @@ ID3D12RootSignature* CreateRootSignature(
   return root_signature;
 }
 
+#if XE_PLATFORM_WINRT
+static DWORD StorePipelineCreationExceptionCode(DWORD code, DWORD* code_out);
+
+// Must contain no objects requiring unwinding for __try to be legal.
+static ID3D12PipelineState* CreateComputePipelineGuarded(
+    ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+    DWORD* exception_code_out) {
+  *exception_code_out = 0;
+  ID3D12PipelineState* pipeline = nullptr;
+  __try {
+    device->CreateComputePipelineState(desc, IID_PPV_ARGS(&pipeline));
+    return pipeline;
+  } __except (StorePipelineCreationExceptionCode(GetExceptionCode(),
+                                                 exception_code_out)) {
+    return nullptr;
+  }
+}
+#endif  // XE_PLATFORM_WINRT
+
 ID3D12PipelineState* CreateComputePipeline(
     ID3D12Device* device, const void* shader, size_t shader_size,
     ID3D12RootSignature* root_signature) {
@@ -60,9 +79,28 @@ ID3D12PipelineState* CreateComputePipeline(
   desc.CachedPSO.pCachedBlob = nullptr;
   desc.CachedPSO.CachedBlobSizeInBytes = 0;
   desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+#if XE_PLATFORM_WINRT
+  // The Xbox UWP driver's shader compiler can crash (access violation) inside
+  // pipeline creation - under memory pressure even on valid shaders. Compute
+  // pipeline creation was the last unguarded path into it (observed as an
+  // unhandled XBSC_XS.dll crash on the GPU thread); contain it like the
+  // graphics one - callers already handle a null return.
+  DWORD creation_exception_code = 0;
+  ID3D12PipelineState* pipeline =
+      CreateComputePipelineGuarded(device, &desc, &creation_exception_code);
+  if (creation_exception_code != 0) {
+    XELOGE(
+        "CreateComputePipeline: the driver's shader compiler CRASHED "
+        "(exception 0x{:08X}) - the crash was contained, the pipeline is "
+        "unavailable",
+        uint32_t(creation_exception_code));
+  }
+  return pipeline;
+#else
   ID3D12PipelineState* pipeline = nullptr;
   device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline));
   return pipeline;
+#endif  // XE_PLATFORM_WINRT
 }
 
 void CreateBufferRawSRV(ID3D12Device* device,
@@ -127,6 +165,24 @@ void CreateBufferTypedUAV(ID3D12Device* device,
   desc.Buffer.CounterOffsetInBytes = 0;
   desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
   device->CreateUnorderedAccessView(buffer, nullptr, &desc, handle);
+}
+
+static DWORD StorePipelineCreationExceptionCode(DWORD code, DWORD* code_out) {
+  *code_out = code;
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+HRESULT CreateGraphicsPipelineStateGuarded(
+    ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid, void** pipeline_out, DWORD* exception_code_out) {
+  // Must contain no objects requiring unwinding for __try to be legal.
+  *exception_code_out = 0;
+  __try {
+    return device->CreateGraphicsPipelineState(desc, riid, pipeline_out);
+  } __except (StorePipelineCreationExceptionCode(GetExceptionCode(),
+                                                 exception_code_out)) {
+    return E_FAIL;
+  }
 }
 
 }  // namespace util

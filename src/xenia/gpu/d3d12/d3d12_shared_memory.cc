@@ -15,6 +15,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -46,9 +47,30 @@ bool D3D12SharedMemory::Initialize() {
   ui::d3d12::util::FillBufferResourceDesc(
       buffer_desc, kBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
-  if (cvars::tiled_shared_memory &&
+  bool tiled_shared_memory_supported =
       provider.GetTiledResourcesTier() !=
-          D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED &&
+      D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+#if XE_PLATFORM_WINRT
+  // The Xbox UWP AMD driver (umd12ddi_arden) reports tiled-resources tier 1
+  // but its tier-1 implementation is broken - UpdateTileMappings-heavy usage
+  // hard-crashes the driver (the same class of crash as with
+  // draw_resolution_scale on tier 1, which is gated to tier 2 in the command
+  // processor). Require tier 2 here as well, so tiled_shared_memory=true is
+  // safe to leave enabled in the config: on a tier-1 console runtime this
+  // automatically falls back to the committed full-size buffer (the known
+  // stable configuration), and if a system update ever exposes tier 2, the
+  // tiled path lights up by itself.
+  if (tiled_shared_memory_supported &&
+      provider.GetTiledResourcesTier() < D3D12_TILED_RESOURCES_TIER_2) {
+    XELOGGPU(
+        "Shared memory: tiled resources tier {} on Xbox UWP is below the "
+        "required tier 2 - using the committed buffer instead of the tiled "
+        "one to avoid driver crashes",
+        uint32_t(provider.GetTiledResourcesTier()));
+    tiled_shared_memory_supported = false;
+  }
+#endif  // XE_PLATFORM_WINRT
+  if (cvars::tiled_shared_memory && tiled_shared_memory_supported &&
       !provider.GetGraphicsAnalysis()) {
     if (FAILED(device->CreateReservedResource(
             &buffer_desc, buffer_state_, nullptr, IID_PPV_ARGS(&buffer_)))) {

@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 
+#include <atomic>
 #include <climits>
 #include <cstring>
 
@@ -467,6 +468,14 @@ void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
   assert_always();
 }
 
+// Stands in for a guest function that couldn't be resolved (the host ran out
+// of memory while translating it, most likely). Follows the guest calling
+// convention trivially: it returns immediately, leaving every register the
+// guest expects to survive a call untouched, so the caller continues as if the
+// call did nothing.
+static void UnresolvedGuestFunctionStub(void* raw_context,
+                                        uint64_t guest_return_address) {}
+
 // This is used by the X64ThunkEmitter's ResolveFunctionThunk.
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
@@ -675,8 +684,28 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto fn = thread_state->processor()->ResolveFunction(
       static_cast<uint32_t>(target_address));
   assert_not_null(fn);
+  if (!fn) {
+    // Resolution can genuinely fail - most importantly when the host has run
+    // out of memory and the function couldn't be translated. Jumping to the
+    // null "machine code" of a missing function is an access violation at 0
+    // that looks like a random crash; returning a stub instead turns the guest
+    // call into a no-op, so the emulator survives (misbehaving in that code
+    // path) and the log says why.
+    static std::atomic<uint32_t> unresolved_log_count{0};
+    uint32_t log_count = unresolved_log_count.fetch_add(1);
+    if (log_count < 8 || (log_count % 1000) == 0) {
+      XELOGE(
+          "Guest function {:08X} could not be resolved - calling it does "
+          "nothing (occurrence {})",
+          uint32_t(target_address), log_count + 1);
+    }
+    return reinterpret_cast<uint64_t>(&UnresolvedGuestFunctionStub);
+  }
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
+  if (!addr) {
+    return reinterpret_cast<uint64_t>(&UnresolvedGuestFunctionStub);
+  }
 
   return addr;
 }

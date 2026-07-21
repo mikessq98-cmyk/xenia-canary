@@ -34,6 +34,56 @@ DEFINE_bool(dxbc_source_map, false,
             "Disassemble Xenos instructions as comments in the resulting DXBC "
             "for debugging.",
             "GPU");
+#if XE_PLATFORM_WINRT
+DEFINE_int32(
+    dxbc_main_loop_guard_iterations, 262144,
+    "In-shader watchdog: cap the number of iterations of the translated "
+    "shader's main dispatcher loop. If the console driver's shader compiler "
+    "(newbe_xs.dll) miscompiles the control flow (mostly with "
+    "dxbc_switch=true), the loop can spin forever on the GPU - the graphics "
+    "engine pegs at 100%, the frame never finishes, and the OS removes the "
+    "device ('Graphics device lost'). With the guard, such a shader exits "
+    "after this many iterations: the draw renders incorrectly, but the GPU "
+    "and the emulator survive. Legitimate shaders use far fewer iterations "
+    "(one per control-flow label transition or guest loop iteration). The "
+    "default must stay low enough that even a full-screen pass at 4K with "
+    "EVERY invocation hitting the cap (8M pixels x cap iterations) finishes "
+    "within the OS GPU-hang watchdog window instead of still triggering a "
+    "device removal. 0 disables the guard.",
+    "GPU");
+#else
+DEFINE_int32(dxbc_main_loop_guard_iterations, 0,
+             "In-shader watchdog: cap the number of iterations of the "
+             "translated shader's main dispatcher loop. 0 disables the guard "
+             "(default off outside Xbox UWP).",
+             "GPU");
+#endif  // XE_PLATFORM_WINRT
+
+#if XE_PLATFORM_WINRT
+DEFINE_bool(
+    dxbc_switch_break_dispatch, true,
+    "Xbox UWP only, effective with dxbc_switch=true: implement label jumps in "
+    "the switch dispatcher as `break` out of the switch (the main loop then "
+    "re-enters it naturally) instead of `continue` from inside the switch. "
+    "The behavior is identical, but the continue-across-switch construct is "
+    "what the console driver's shader compiler appears to miscompile into "
+    "infinitely looping GPU code (device removed with DXGI_ERROR_DEVICE_HUNG "
+    "0x887A0006, a different 'last pipeline' every time). Disable only to "
+    "compare against the upstream continue-based dispatcher.",
+    "GPU");
+#endif  // XE_PLATFORM_WINRT
+
+#if XE_PLATFORM_WINRT
+DEFINE_int32(
+    dxbc_switch_max_labels, 512,
+    "Xbox UWP only, effective with dxbc_switch=true: shaders with more guest "
+    "control-flow labels than this are translated with if-based flow control "
+    "instead of the switch-based dispatcher, because the console's D3D12 "
+    "shader compiler (newbe_xs.dll) crashes compiling a switch with too many "
+    "cases. Lower this if enabling dxbc_switch still crashes on specific "
+    "games; 0 or negative disables the limit (always use switch).",
+    "GPU");
+#endif  // XE_PLATFORM_WINRT
 
 namespace xe {
 namespace gpu {
@@ -190,8 +240,46 @@ uint32_t DxbcShaderTranslator::GetModificationRegisterCount() const {
 
 bool DxbcShaderTranslator::UseSwitchForControlFlow() const {
   // Xenia crashes on Intel HD Graphics 4000 with switch.
-  return cvars::dxbc_switch &&
-         vendor_id_ != ui::GraphicsProvider::GpuVendorID::kIntel;
+  // Note for Xbox Series (UWP): the console GPU is AMD RDNA2, and the upstream
+  // guidance for AMD applies - if-based flow can crash the driver's shader
+  // compiler on deeply branched shaders (observed as DEVICE_REMOVED
+  // 0x887A0020 when creating pipelines, e.g. GTA IV car shaders), so
+  // dxbc_switch=true is the recommended configuration there; keep it
+  // config-controlled.
+  bool use_switch = cvars::dxbc_switch &&
+                    vendor_id_ != ui::GraphicsProvider::GpuVendorID::kIntel;
+#if XE_PLATFORM_WINRT
+  // The Xbox UWP shader compiler (newbe_xs.dll) crashes on the switch-based
+  // dispatcher of very large shaders - the main loop gets one `case` per guest
+  // control-flow label, so a heavily-branched shader produces a switch with
+  // hundreds of cases inside a loop, which the console compiler can't take
+  // while desktop compilers can. Per-shader compromise: use switch (better
+  // codegen and stability on AMD for normal shaders) unless this shader's
+  // label count exceeds the threshold, then fall back to if-based flow just
+  // for it. The choice is per-translation and self-consistent; nothing
+  // persistent depends on it (only the ucode and pipeline descriptions are
+  // stored, DXBC is retranslated every run).
+  if (use_switch && !is_depth_only_pixel_shader_ &&
+      cvars::dxbc_switch_max_labels > 0 &&
+      current_shader().label_addresses().size() >
+          size_t(cvars::dxbc_switch_max_labels)) {
+    use_switch = false;
+  }
+#endif  // XE_PLATFORM_WINRT
+  return use_switch;
+}
+
+bool DxbcShaderTranslator::UseSwitchBreakDispatch() const {
+#if XE_PLATFORM_WINRT
+  return UseSwitchForControlFlow() && cvars::dxbc_switch_break_dispatch;
+#else
+  return false;
+#endif
+}
+
+bool DxbcShaderTranslator::UseMainLoopGuard() const {
+  return cvars::dxbc_main_loop_guard_iterations > 0 &&
+         !is_depth_only_pixel_shader_;
 }
 
 uint32_t DxbcShaderTranslator::PushSystemTemp(uint32_t zero_mask,
@@ -970,6 +1058,10 @@ void DxbcShaderTranslator::StartTranslation() {
     system_temp_loop_count_ = PushSystemTemp(0b1111);
     system_temp_grad_h_lod_ = PushSystemTemp(0b1111);
     system_temp_grad_v_vfetch_address_ = PushSystemTemp(0b1111);
+    if (UseMainLoopGuard()) {
+      // .x = iteration counter (zero-initialized), .y = limit test scratch.
+      system_temp_main_loop_guard_ = PushSystemTemp(0b0011);
+    }
   }
 
   // Write stage-specific prologue.
@@ -986,6 +1078,25 @@ void DxbcShaderTranslator::StartTranslation() {
 
   // Start the main loop (for jumping to labels by setting pc and continuing).
   a_.OpLoop();
+  if (UseMainLoopGuard()) {
+    // In-shader watchdog: bail out of the main loop after too many iterations
+    // so a miscompiled dispatcher (the Xbox UWP shader compiler with switch
+    // flow) renders wrong for one draw instead of hanging the GPU until the
+    // OS removes the device. `continue` from label jumps re-enters through
+    // here, so every label transition and guest loop iteration is counted.
+    dxbc::Dest guard_x_dest(
+        dxbc::Dest::R(system_temp_main_loop_guard_, 0b0001));
+    dxbc::Src guard_x_src(
+        dxbc::Src::R(system_temp_main_loop_guard_, dxbc::Src::kXXXX));
+    a_.OpIAdd(guard_x_dest, guard_x_src, dxbc::Src::LU(1));
+    a_.OpUGE(dxbc::Dest::R(system_temp_main_loop_guard_, 0b0010), guard_x_src,
+             dxbc::Src::LU(
+                 uint32_t(cvars::dxbc_main_loop_guard_iterations)));
+    a_.OpIf(true,
+            dxbc::Src::R(system_temp_main_loop_guard_, dxbc::Src::kYYYY));
+    a_.OpBreak();
+    a_.OpEndIf();
+  }
   // Switch and the first label (pc == 0).
   if (UseSwitchForControlFlow()) {
     a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
@@ -1121,14 +1232,41 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     CloseExecConditionals();
     // Close the last label and the switch.
     if (UseSwitchForControlFlow()) {
+      if (UseSwitchBreakDispatch()) {
+        // If execution falls off the end of the last label without an explicit
+        // end instruction, mark the shader as finished - otherwise the
+        // dispatcher would re-enter the last case forever (pc unchanged).
+        a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010),
+                 dxbc::Src::LU(UINT32_MAX));
+      }
       a_.OpBreak();
       a_.OpEndSwitch();
+      if (UseSwitchBreakDispatch()) {
+        // In break dispatch, control reaches this point after EVERY case (a
+        // label jump breaks out of the switch), so the main loop may only be
+        // left when pc holds the shader-end marker - otherwise fall through
+        // to the end of the loop and re-enter the dispatcher.
+        uint32_t end_test_temp = PushSystemTemp();
+        a_.OpIEq(dxbc::Dest::R(end_test_temp, 0b0001),
+                 dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY),
+                 dxbc::Src::LU(UINT32_MAX));
+        a_.OpIf(true, dxbc::Src::R(end_test_temp, dxbc::Src::kXXXX));
+        a_.OpBreak();
+        a_.OpEndIf();
+        PopSystemTemp();
+        a_.OpEndLoop();
+      } else {
+        // End the main loop (this point is only reached when no case matched,
+        // i.e. after the end instruction wrote the invalid pc and continued).
+        a_.OpBreak();
+        a_.OpEndLoop();
+      }
     } else {
       a_.OpEndIf();
+      // End the main loop.
+      a_.OpBreak();
+      a_.OpEndLoop();
     }
-    // End the main loop.
-    a_.OpBreak();
-    a_.OpEndLoop();
 
     // Release the following system temporary values so epilogue can reuse them:
     // - system_temp_result_.
@@ -1137,7 +1275,8 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     // - system_temp_loop_count_.
     // - system_temp_grad_h_lod_.
     // - system_temp_grad_v_vfetch_address_.
-    PopSystemTemp(6);
+    // - system_temp_main_loop_guard_ (if the watchdog is enabled).
+    PopSystemTemp(UseMainLoopGuard() ? 7 : 6);
   }
 
   uint8_t memexport_eM_written = current_shader().memexport_eM_written();
@@ -1789,7 +1928,16 @@ void DxbcShaderTranslator::CloseInstructionPredication() {
 void DxbcShaderTranslator::JumpToLabel(uint32_t address) {
   a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010),
            dxbc::Src::LU(address));
-  a_.OpContinue();
+  if (UseSwitchBreakDispatch()) {
+    // Exit the dispatcher switch; the main loop's tail falls through back to
+    // its head, which re-enters the switch with the new pc. Inside a case
+    // there are never inner DXBC loops or switches (guest loops also go
+    // through the dispatcher), so `break` always targets the dispatcher
+    // switch itself, from any depth of `if` nesting.
+    a_.OpBreak();
+  } else {
+    a_.OpContinue();
+  }
 }
 
 void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
@@ -1802,11 +1950,14 @@ void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
   CloseExecConditionals();
   if (UseSwitchForControlFlow()) {
     // Fallthrough to the label from the previous one on the next iteration if
-    // no `continue` was done. Can't simply fallthrough because in DXBC, a
-    // non-empty switch case must end with a break.
+    // no jump was done. Can't simply fallthrough because in DXBC, a non-empty
+    // switch case must end with a break.
     JumpToLabel(cf_index);
-    // Close the previous label.
-    a_.OpBreak();
+    if (!UseSwitchBreakDispatch()) {
+      // Close the previous label (in break dispatch, JumpToLabel itself ends
+      // with the case-terminating break).
+      a_.OpBreak();
+    }
     // Go to the next label.
     a_.OpCase(dxbc::Src::LU(cf_index));
   } else {
@@ -1841,8 +1992,14 @@ void DxbcShaderTranslator::ProcessExecInstructionEnd(
       // Write an invalid value to pc.
       a_.OpMov(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b0010),
                dxbc::Src::LU(UINT32_MAX));
-      // Go to the next iteration, where switch cases won't be reached.
-      a_.OpContinue();
+      if (UseSwitchBreakDispatch()) {
+        // Exit the switch; the check after it sees the invalid pc and breaks
+        // out of the main loop.
+        a_.OpBreak();
+      } else {
+        // Go to the next iteration, where switch cases won't be reached.
+        a_.OpContinue();
+      }
     } else {
       a_.OpBreak();
     }

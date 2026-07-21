@@ -150,6 +150,19 @@ constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
                                           size_t length, PageAccess access,
                                           bool commit);
+#if XE_PLATFORM_WINRT
+// Whether the most recent guest CreateFileMappingHandle call created the
+// per-range swap-file sections (winrt_guest_memory_swap_file).
+bool LastFileMappingUsedGuestSwapFile();
+// Whether the guest mapping range starting at the given section/file offset
+// is CURRENTLY view-mapped from its swap file (its pages are all committed at
+// map time, so heap host commit must be skipped for it).
+bool IsGuestMemoryRangeSwapBacked(uint64_t file_offset);
+// Stop using the guest swap files for subsequent CreateFileMappingHandle
+// calls and close the swap sections (after mapping their views failed on this
+// system).
+void DisableGuestMemorySwapFile();
+#endif  // XE_PLATFORM_WINRT
 void CloseFileMappingHandle(FileMappingHandle handle,
                             const std::filesystem::path& path);
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,

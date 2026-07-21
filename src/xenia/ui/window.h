@@ -11,6 +11,7 @@
 #define XENIA_UI_WINDOW_H_
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -318,6 +319,17 @@ class Window {
   void SetImGuiWantsTextInput(bool want) { imgui_wants_text_input_ = want; }
   bool imgui_wants_text_input() const { return imgui_wants_text_input_; }
 
+  // Explicit system on-screen keyboard control for UI code that knows a text
+  // field is being edited (dialogs with text input call Show every frame while
+  // the field should be editable, and Hide when leaving - the reliable pattern
+  // on Xbox, where reacting to ImGui's WantTextInput transitions alone often
+  // hits the system UI at a moment it refuses the request). While an explicit
+  // hold is active, the automatic WantTextInput-driven show/hide is suspended
+  // so it can't immediately hide an explicitly requested keyboard. No-ops on
+  // platforms with a physical keyboard.
+  virtual void ShowOnScreenKeyboard() {}
+  virtual void HideOnScreenKeyboard() {}
+
   // While a game is running the ImGui main menu must not render at all on UWP
   // (it would overdraw every frame on top of the game); dialogs/notifications
   // still work. Set by EmulatorWindow on title launch/close.
@@ -327,8 +339,10 @@ class Window {
   bool uwp_menu_suppressed() const { return uwp_menu_suppressed_; }
 
  private:
-  bool imgui_wants_text_input_ = false;
-  bool uwp_menu_suppressed_ = false;
+  // Read from the UWP paint-driver timer thread as well as the UI thread, so
+  // these are atomic (benign relaxed flags).
+  std::atomic<bool> imgui_wants_text_input_{false};
+  std::atomic<bool> uwp_menu_suppressed_{false};
 
  public:
 #endif  // XE_PLATFORM_WINRT

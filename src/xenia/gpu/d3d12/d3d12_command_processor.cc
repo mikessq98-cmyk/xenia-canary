@@ -8,8 +8,15 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <charconv>
 #include <cstring>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
@@ -42,9 +49,141 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
 
 DECLARE_bool(clear_memory_page_state);
 
+#if XE_PLATFORM_WINRT
+DEFINE_bool(
+    d3d12_quarantine_exec_hang_suspects, false,
+    "Xbox UWP: when the GPU device is removed with DXGI_ERROR_DEVICE_HUNG, "
+    "automatically add the most recently bound guest pipeline to the per-game "
+    "toxic-shader skip list. Only enable for a game where the hang is proven "
+    "to come from ONE specific pipeline; when the hang is systemic (e.g. "
+    "miscompiled switch control flow - see dxbc_switch_break_dispatch), this "
+    "blames a different innocent pipeline on every death.",
+    "D3D12");
+#endif  // XE_PLATFORM_WINRT
+
+#if XE_PLATFORM_WINRT
+DEFINE_string(
+    d3d12_skip_shaders, "",
+    "Xbox UWP only: list of [VS,PS] ucode-hash pairs whose draws should be "
+    "skipped, to work around specific shaders that hang the console GPU driver "
+    "(the hashes are printed by the \"DEVICE REMOVED ... First failing "
+    "pipeline\" log line, as 16-hex-digit values). A draw is skipped only when "
+    "BOTH its vertex and pixel shader match a pair. Use the keyword sol in "
+    "either position as a wildcard that matches any shader. Examples: "
+    "\"[E62CF0D43201E126,EEDAA3696833D2E8]\" skips that exact VS+PS combo; "
+    "\"[sol,EEDAA3696833D2E8]\" skips every draw using that pixel shader "
+    "regardless of vertex shader; multiple pairs may be listed, e.g. "
+    "\"[a,b],[sol,c]\". The affected geometry becomes invisible, but the GPU "
+    "no longer crashes.",
+    "D3D12");
+#endif
+
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+#if XE_PLATFORM_WINRT
+// One [VS, PS] skip rule. std::nullopt means the keyword "sol" was given for
+// that position - a wildcard that matches any shader hash.
+struct ShaderSkipPair {
+  std::optional<uint64_t> vs;
+  std::optional<uint64_t> ps;
+};
+
+// Parses one element of a [VS,PS] pair: a 16-hex-digit hash (optionally 0x-
+// prefixed) or the wildcard keyword "sol". Returns false only if the token is
+// malformed (which discards the whole pair). On success, `out` is set to the
+// value, or left as nullopt for the "sol" wildcard.
+static bool ParseSkipElement(std::string token, std::optional<uint64_t>& out) {
+  size_t b = token.find_first_not_of(" \t");
+  size_t e = token.find_last_not_of(" \t");
+  if (b == std::string::npos) {
+    return false;
+  }
+  token = token.substr(b, e - b + 1);
+  std::string lower = token;
+  for (char& c : lower) {
+    c = char(std::tolower(uint8_t(c)));
+  }
+  if (lower == "sol") {
+    out = std::nullopt;  // Wildcard.
+    return true;
+  }
+  const char* first = token.data();
+  const char* last = token.data() + token.size();
+  if (lower.rfind("0x", 0) == 0) {
+    first += 2;
+  }
+  uint64_t value = 0;
+  auto res = std::from_chars(first, last, value, 16);
+  if (res.ec != std::errc() || res.ptr != last) {
+    return false;
+  }
+  out = value;
+  return true;
+}
+
+// Parses cvars::d3d12_skip_shaders once into [VS,PS] rules and tests a draw
+// against them (skip if both positions match, honoring the sol wildcard).
+static bool EvaluateShaderSkip(uint64_t vertex_shader_hash,
+                               uint64_t pixel_shader_hash) {
+  static const std::vector<ShaderSkipPair> skip_pairs = []() {
+    std::vector<ShaderSkipPair> pairs;
+    const std::string& list = cvars::d3d12_skip_shaders;
+    size_t pos = 0;
+    while (true) {
+      size_t open = list.find('[', pos);
+      if (open == std::string::npos) {
+        break;
+      }
+      size_t close = list.find(']', open + 1);
+      if (close == std::string::npos) {
+        break;
+      }
+      std::string group = list.substr(open + 1, close - open - 1);
+      pos = close + 1;
+      size_t comma = group.find(',');
+      if (comma == std::string::npos) {
+        XELOGW("d3d12_skip_shaders: ignoring malformed entry [{}] (need a "
+               "VS,PS pair)",
+               group);
+        continue;
+      }
+      ShaderSkipPair pair;
+      if (ParseSkipElement(group.substr(0, comma), pair.vs) &&
+          ParseSkipElement(group.substr(comma + 1), pair.ps)) {
+        pairs.push_back(pair);
+      } else {
+        XELOGW("d3d12_skip_shaders: ignoring malformed entry [{}]", group);
+      }
+    }
+    if (!pairs.empty()) {
+      XELOGW("d3d12_skip_shaders: {} skip rule(s) active", pairs.size());
+    }
+    return pairs;
+  }();
+  if (skip_pairs.empty()) {
+    return false;
+  }
+  for (const ShaderSkipPair& pair : skip_pairs) {
+    bool vs_match = !pair.vs.has_value() || pair.vs.value() == vertex_shader_hash;
+    bool ps_match = !pair.ps.has_value() || pair.ps.value() == pixel_shader_hash;
+    if (vs_match && ps_match) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif  // XE_PLATFORM_WINRT
+
+bool D3D12CommandProcessor::IsShaderSkipped(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) const {
+#if XE_PLATFORM_WINRT
+  return EvaluateShaderSkip(vertex_shader_hash, pixel_shader_hash);
+#else
+  return false;
+#endif
+}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -65,6 +204,73 @@ D3D12CommandProcessor::~D3D12CommandProcessor() = default;
 void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   cache_clear_requested_ = true;
+}
+
+void D3D12CommandProcessor::LogHostMemoryStatistics() {
+  // Scalar reads only - this runs on the frame-limiter thread; racy values are
+  // fine for telemetry (see CommandProcessor::LogHostMemoryStatistics).
+  uint64_t textures_mb = 0;
+  uint64_t scaled_resolve_mb = 0;
+  if (texture_cache_) {
+    textures_mb = texture_cache_->GetTexturesTotalHostMemoryUsage() >> 20;
+    scaled_resolve_mb = texture_cache_->GetScaledResolveCommittedBytes() >> 20;
+  }
+  uint64_t shaders_mb = 0;
+  if (pipeline_cache_) {
+    shaders_mb = pipeline_cache_->GetTranslatedShaderBytes() >> 20;
+  }
+  // The shared-memory buffer mirrors guest physical memory for the GPU. With
+  // usable tiled resources only the touched tiles are backed; on the Xbox UWP
+  // tier-1 driver it's fully committed, so report the whole buffer size.
+  uint64_t shared_memory_mb = 0;
+  if (shared_memory_) {
+    uint32_t sparse_used = shared_memory_->host_gpu_memory_sparse_used_bytes();
+    shared_memory_mb = (sparse_used ? uint64_t(sparse_used)
+                                    : uint64_t(SharedMemory::kBufferSize)) >>
+                       20;
+  }
+  // The GPU memory budget/usage is the ceiling committed-resource creation
+  // actually hits on Xbox (E_OUTOFMEMORY when usage nears budget, even with
+  // system physical RAM free) - the key number for the "plenty free yet OOM"
+  // puzzle.
+  // Render targets (plus the EDRAM buffer) grow with the square of the draw
+  // resolution scale - at 2x2 they are one of the biggest single consumers.
+  uint64_t render_targets_bytes =
+      render_target_cache_ ? render_target_cache_->GetHostMemoryUsage() : 0;
+  uint64_t render_targets_mb = render_targets_bytes >> 20;
+  size_t render_target_count =
+      render_target_cache_ ? render_target_cache_->GetCachedRenderTargetCount()
+                           : 0;
+  uint64_t gpu_budget = 0, gpu_usage = 0;
+  bool have_gpu_budget =
+      GetD3D12Provider().QueryVideoMemoryUsage(gpu_budget, gpu_usage);
+  if (have_gpu_budget) {
+    // What the caches above don't explain: the presenter's targets (guest
+    // output, SMAA, the scaling chain and the swap chain), descriptor and
+    // upload/readback pools, the pipeline state objects and the driver's own
+    // allocations. A large number here means the next optimization belongs
+    // outside the caches.
+    uint64_t accounted_bytes = (uint64_t(shared_memory_mb) << 20) +
+                               (uint64_t(textures_mb) << 20) +
+                               (uint64_t(scaled_resolve_mb) << 20) +
+                               render_targets_bytes;
+    uint64_t other_mb =
+        gpu_usage > accounted_bytes ? (gpu_usage - accounted_bytes) >> 20 : 0;
+    XELOGI(
+        "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
+        "resolve {} MB, render targets {} MB ({} cached), shaders(dxbc) {} MB "
+        "| GPU budget {}/{} MB used, {} MB elsewhere (presenter, pools, PSOs, "
+        "driver)",
+        shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
+        render_target_count, shaders_mb, gpu_usage >> 20, gpu_budget >> 20,
+        other_mb);
+  } else {
+    XELOGI(
+        "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
+        "resolve {} MB, render targets {} MB ({} cached), shaders(dxbc) {} MB",
+        shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
+        render_target_count, shaders_mb);
+  }
 }
 
 void D3D12CommandProcessor::InitializeShaderStorage(
@@ -105,6 +311,106 @@ void D3D12CommandProcessor::PollCompletedSubmission() {
   // resolves drained here.
   completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
   PumpQueryResolves();
+}
+
+void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
+#if XE_PLATFORM_WINRT
+  // The device may have been lost outside a pipeline-creation call (present,
+  // submission - or a creation call that HUNG the driver's shader compiler and
+  // never returned). Tell the solver so the shutdown keeps its crash journal.
+  if (pipeline_cache_) {
+    pipeline_cache_->SolverOnDeviceLost();
+  }
+  // Dump the removal reason and the DRED auto-breadcrumbs for EVERY device
+  // loss, not only those detected inside pipeline creation - when the GPU
+  // itself hangs executing a bad pipeline, the loss is first noticed at
+  // present/submission, and without this there was no diagnosis at all in the
+  // log. The breadcrumbs name the dying command list and its last completed
+  // operation.
+  // Dump the most recently bound guest pipelines (newest first): when the
+  // device died executing a bad pipeline, the culprit is at or near the top of
+  // this list. Cross-reference with the DRED breadcrumbs below.
+  {
+    uint32_t next =
+        exec_pipeline_ring_next_.load(std::memory_order_relaxed);
+    uint32_t count = std::min(next, kExecPipelineRingSize);
+    XELOGE(
+        "Device loss diagnosis: last {} bound guest pipelines, most recent "
+        "first (execution-side toxic candidates for d3d12_skip_shaders or "
+        "the .toxic file):",
+        count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const std::pair<uint64_t, uint64_t>& entry =
+          exec_pipeline_ring_[(next - 1 - i) & (kExecPipelineRingSize - 1)];
+      XELOGE("  [{:2}] VS {:016X}, PS {:016X}", i, entry.first, entry.second);
+    }
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (device) {
+    HRESULT reason = device->GetDeviceRemovedReason();
+    XELOGE("Device loss diagnosis: GetDeviceRemovedReason=0x{:08X}",
+           uint32_t(reason));
+    if (reason == DXGI_ERROR_DEVICE_HUNG && pipeline_cache_ &&
+        cvars::d3d12_quarantine_exec_hang_suspects) {
+      // The GPU hung executing work (not a compile-time failure, so the
+      // creation journal has nothing) - auto-quarantine the most recently
+      // bound pipeline, the prime suspect. One suspect per death; converges
+      // like the creation-side solver. OFF by default: when the hang is
+      // systemic (miscompiled control flow affecting many shaders - see
+      // cvars::dxbc_switch_break_dispatch for the actual fix), a different
+      // innocent pipeline gets blamed every death.
+      uint32_t next = exec_pipeline_ring_next_.load(std::memory_order_relaxed);
+      if (next != 0) {
+        const std::pair<uint64_t, uint64_t>& newest =
+            exec_pipeline_ring_[(next - 1) & (kExecPipelineRingSize - 1)];
+        pipeline_cache_->SolverQuarantineExecutionSuspect(newest.first,
+                                                          newest.second);
+      }
+    }
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
+      D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+      if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+        const D3D12_AUTO_BREADCRUMB_NODE* node =
+            breadcrumbs.pHeadAutoBreadcrumbNode;
+        uint32_t node_index = 0;
+        while (node && node_index < 16) {
+          uint32_t executed =
+              node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+          XELOGE(
+              "DRED node {}: cmdlist='{}' queue='{}' completed {}/{} ops; "
+              "last ops:",
+              node_index,
+              node->pCommandListDebugNameA ? node->pCommandListDebugNameA
+                                           : "?",
+              node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA
+                                            : "?",
+              executed, node->BreadcrumbCount);
+          uint32_t begin = executed > 8 ? executed - 8 : 0;
+          uint32_t end = std::min(node->BreadcrumbCount, executed + 2);
+          for (uint32_t i = begin; i < end; ++i) {
+            XELOGE("  op[{}]{} = {}", i, i == executed ? " <== DIED" : "",
+                   uint32_t(node->pCommandHistory[i]));
+          }
+          node = node->pNext;
+          ++node_index;
+        }
+      } else {
+        XELOGW("DRED: GetAutoBreadcrumbsOutput failed");
+      }
+      D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+      if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault))) {
+        XELOGE("DRED: page fault VA=0x{:016X}",
+               uint64_t(page_fault.PageFaultVA));
+      }
+      dred->Release();
+    } else {
+      XELOGW("DRED: ID3D12DeviceRemovedExtendedData unavailable");
+    }
+    GetD3D12Provider().LogD3D12DebugMessages();
+    xe::FlushLog();
+  }
+#endif  // XE_PLATFORM_WINRT
 }
 
 bool D3D12CommandProcessor::PushTransitionBarrier(
@@ -836,11 +1142,71 @@ bool D3D12CommandProcessor::SetupContext() {
       TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x,
                                                  draw_resolution_scale_y);
 
+#if XE_PLATFORM_WINRT
+  // The Xbox UWP D3D12 runtime reports Tiled Resources Tier 1, but its tier-1
+  // reserved-resource implementation crashes the AMD Arden user-mode driver
+  // (umd12ddi_arden.dll) when resolution scaling maps the scaled resolve tiles
+  // (observed as an int3 with an underflowed tile region at
+  // draw_resolution_scale=2). Require tier 2 here so scaling is safely clamped
+  // to 1x instead of taking down the GPU. (On the GDK/D3D12X path tier-1 tiling
+  // works, but the sandboxed UWP path does not.)
+  bool has_tiled_resources =
+      provider.GetTiledResourcesTier() >= D3D12_TILED_RESOURCES_TIER_2;
+  // Committed fallback: without usable tiled resources, the texture cache
+  // backs the scaled resolve space with committed buffers instead of a tiled
+  // reservation (see D3D12TextureCache::UseTiledScaledResolveBuffers).
+  if (!has_tiled_resources) {
+    // Scales above 2x2 used to be impossible here: the scaled resolve memory
+    // was one buffer spanning the whole scaled address space, and beyond 2 GB
+    // that needs one heap aliased into overlapping windows - i.e. the tiled
+    // resources this driver lacks. The committed path now backs only the
+    // address ranges the game actually resolves to, with a separate buffer per
+    // range, so the size of the scaled address space no longer matters.
+    // What still scales is everything else: render targets and scaled textures
+    // grow with the scale area (9x at 3x3 against 4x at 2x2), so 3x3 is for
+    // light or 2D titles, and anything above it can't fit the console's memory
+    // no matter how the resolve space is managed.
+    if (draw_resolution_scale_x > 3 || draw_resolution_scale_y > 3) {
+      uint32_t requested_x = draw_resolution_scale_x;
+      uint32_t requested_y = draw_resolution_scale_y;
+      draw_resolution_scale_x = std::min(draw_resolution_scale_x, uint32_t(3));
+      draw_resolution_scale_y = std::min(draw_resolution_scale_y, uint32_t(3));
+      draw_resolution_scale_not_clamped = false;
+      XELOGW(
+          "Draw resolution scale {}x{} exceeds what this console's memory can "
+          "hold (render targets and scaled textures grow with the scale area) "
+          "- reducing to {}x{}",
+          requested_x, requested_y, draw_resolution_scale_x,
+          draw_resolution_scale_y);
+    }
+    has_tiled_resources = true;
+  }
+#else
   bool has_tiled_resources =
       provider.GetTiledResourcesTier() >= D3D12_TILED_RESOURCES_TIER_1;
+#endif
+  uint32_t va_bits_per_resource = provider.GetVirtualAddressBitsPerResource();
+#if XE_PLATFORM_WINRT
+  if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+    XELOGI(
+        "Draw resolution scaling capability: tiled resources tier {}, {} GPU "
+        "VA bits per resource",
+        uint32_t(provider.GetTiledResourcesTier()), va_bits_per_resource);
+    // The common clamp uses this to reject scales whose whole scaled address
+    // space wouldn't fit in a single resource. That's a tiled-path
+    // requirement: the committed path allocates a separate buffer per touched
+    // range, none of which comes close to the limit (they're capped in the
+    // texture cache), so the size of the address space is irrelevant here.
+    // Reporting 0 skips that clamp; without it a conservative report from the
+    // sandboxed runtime could reduce even 2x2.
+    if (provider.GetTiledResourcesTier() < D3D12_TILED_RESOURCES_TIER_2) {
+      va_bits_per_resource = 0;
+    }
+  }
+#endif  // XE_PLATFORM_WINRT
   if (!TextureCache::ClampDrawResolutionScaleToMaxSupported(
           draw_resolution_scale_x, draw_resolution_scale_y, has_tiled_resources,
-          provider.GetVirtualAddressBitsPerResource())) {
+          va_bits_per_resource)) {
     draw_resolution_scale_not_clamped = false;
   }
   if (!draw_resolution_scale_not_clamped) {
@@ -2501,6 +2867,19 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+namespace {
+// "Failed in backend" on its own says nothing about why a draw was dropped,
+// and these come in storms (tens of thousands in a session) - name the stage
+// that refused it, throttled so the log stays usable.
+void LogDrawFailure(const char* reason, std::atomic<uint32_t>& counter) {
+  uint32_t count = counter.fetch_add(1, std::memory_order_relaxed);
+  if (count < 4 || (count % 4096) == 0) {
+    XELOGW("Draw dropped by the backend: {} (occurrence {})", reason,
+           count + 1);
+  }
+}
+}  // namespace
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
@@ -2566,6 +2945,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   const bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+#if XE_PLATFORM_WINRT
+  // Toxic-shader skip list (the "stub" workaround): some translated shaders
+  // hang the fragile Xbox UWP GPU driver (TDR -> DXGI_ERROR_DEVICE_REMOVED,
+  // observed in GTA IV when car shaders are created). There is no way to know a
+  // shader is toxic before it kills the device, so let the user blacklist the
+  // VS/PS ucode hashes reported by the DEVICE REMOVED log via
+  // d3d12_skip_shaders="hash1,hash2"; matching draws are skipped (that geometry
+  // is invisible, but the GPU survives).
+  if (IsShaderSkipped(vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+                      pixel_shader ? pixel_shader->ucode_data_hash() : 0)) {
+    return true;
+  }
+#endif
+
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2609,6 +3002,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   if (!render_target_cache_->Update(is_rasterization_done,
                                     normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
+    static std::atomic<uint32_t> failure_count{0};
+    LogDrawFailure("render target update (host render targets unavailable)",
+                   failure_count);
     return false;
   }
 
@@ -2644,6 +3040,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle,
           &root_signature)) {
+    static std::atomic<uint32_t> failure_count{0};
+    LogDrawFailure("pipeline configuration (translation or PSO unavailable)",
+                   failure_count);
     return false;
   }
 
@@ -2682,6 +3081,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         reinterpret_cast<void*>(pipeline_handle));
     current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
+#if XE_PLATFORM_WINRT
+    // Record the bind for the device-loss execution-suspect dump.
+    uint32_t ring_slot =
+        exec_pipeline_ring_next_.fetch_add(1, std::memory_order_relaxed) &
+        (kExecPipelineRingSize - 1);
+    exec_pipeline_ring_[ring_slot] = std::make_pair(
+        vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0));
+#endif  // XE_PLATFORM_WINRT
   }
 
   // Get dynamic rasterizer state.
@@ -2737,6 +3145,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature,
                       memexport_used)) {
+    static std::atomic<uint32_t> failure_count{0};
+    LogDrawFailure("binding update (textures, samplers or constants)",
+                   failure_count);
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!

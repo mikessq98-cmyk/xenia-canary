@@ -818,6 +818,22 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
+    // Frees the translated binary (and disassembly) to reclaim memory,
+    // resetting the translation state so the shader can be retranslated from
+    // the retained ucode on demand later. The caller must guarantee that
+    // nothing is concurrently reading the binary (e.g. an in-flight host
+    // pipeline creation).
+    void ReleaseTranslatedBinary() {
+      translated_binary_.clear();
+      translated_binary_.shrink_to_fit();
+      host_disassembly_.clear();
+      host_disassembly_.shrink_to_fit();
+      errors_.clear();
+      errors_.shrink_to_fit();
+      is_valid_ = false;
+      is_translated_ = false;
+    }
+
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.

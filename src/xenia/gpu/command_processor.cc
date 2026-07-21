@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <new>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
@@ -355,7 +357,22 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    // Command processing allocates constantly (bindings, transfers, the
+    // backend's own containers). On a memory-constrained host those
+    // allocations do fail, and an escaping std::bad_alloc kills the emulator
+    // outright. Contain it: drop the host caches, which frees hundreds of
+    // megabytes of render targets and textures at the cost of re-creating them,
+    // and keep going from the next packet.
+    try {
+      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    } catch (const std::bad_alloc&) {
+      read_ptr_index_ = write_ptr_index;
+      XELOGE(
+          "Command processing ran OUT OF MEMORY - dropping the host GPU "
+          "caches and continuing (expect a hitch; lower the memory usage, e.g. "
+          "the resolution scale, if this repeats)");
+      ClearCaches();
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.

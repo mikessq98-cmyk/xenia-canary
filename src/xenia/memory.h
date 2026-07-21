@@ -117,6 +117,19 @@ class BaseHeap {
   // Amount of pages assigned to heap
   uint32_t total_page_count() const { return uint32_t(page_table_.size()); }
 
+  // Number of pages currently marked committed. Walked lock-free (racy) for
+  // telemetry (LogMemoryStatistics) - may be off by a page or two under
+  // concurrent mutation, which is fine.
+  uint32_t committed_page_count() const {
+    uint32_t committed = 0;
+    for (const PageEntry& page : page_table_) {
+      if (page.state & kMemoryAllocationCommit) {
+        ++committed;
+      }
+    }
+    return committed;
+  }
+
   // Sum of unreserved pages in heap
   uint32_t unreserved_page_count() const { return unreserved_page_count_; }
 
@@ -549,6 +562,13 @@ class Memory {
 
   // Dumps a map of all allocated memory to the log.
   void DumpMap();
+
+  // Logs a one-line [MEM] breakdown of process-wide commit/headroom and
+  // guest heap committed memory (virtual vs physical). Cheap - the per-heap
+  // committed-page counts are gathered with a racy (lock-free) walk of the
+  // page tables, which is accurate enough for telemetry. Driven by the caller
+  // on an interval (see cvars::memory_statistics_interval_seconds).
+  void LogMemoryStatistics();
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);

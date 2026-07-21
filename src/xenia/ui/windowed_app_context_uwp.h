@@ -15,6 +15,7 @@
 #if XE_PLATFORM_WINRT
 
 #include <atomic>
+#include <functional>
 #include <memory>
 
 #include <winrt/Windows.UI.Core.h>
@@ -40,6 +41,16 @@ class UWPWindowedAppContext final : public WindowedAppContext {
   const winrt::Windows::UI::Core::CoreDispatcher& dispatcher() const {
     return dispatcher_;
   }
+
+  // Runs a callback on the UI thread AHEAD of the queued normal-priority work.
+  // Everything else - painting included - is drained by one coalesced
+  // normal-priority item, and a paint blocks on vsync, so while frames are
+  // being requested continuously (which is exactly what happens while a text
+  // field is active) a normal-priority request can wait behind a full frame.
+  // System UI operations that must not be stuck behind rendering - showing the
+  // on-screen keyboard - go through here instead.
+  // Returns false if the request couldn't be posted.
+  bool CallInUIThreadAtHighPriority(std::function<void()> fn);
 
  protected:
   void NotifyUILoopOfPendingFunctions() override;

@@ -9,8 +9,11 @@
 
 #include "xenia/gpu/render_target_cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
+#include <vector>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -561,6 +564,107 @@ void RenderTargetCache::ClearCache() {
       }
     }
   }
+}
+
+void RenderTargetCache::MarkLastUpdateRenderTargetsUsedInSubmission(
+    uint64_t submission) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  for (RenderTarget* render_target : last_update_used_render_targets_) {
+    if (render_target) {
+      render_target->SetLastUseSubmission(submission);
+    }
+  }
+  if (are_accumulated_render_targets_valid_) {
+    for (RenderTarget* render_target : last_update_accumulated_render_targets_) {
+      if (render_target) {
+        render_target->SetLastUseSubmission(submission);
+      }
+    }
+  }
+}
+
+uint64_t RenderTargetCache::TrimUnusedRenderTargets(
+    uint64_t bytes_to_free, uint64_t completed_submission,
+    uint64_t min_idle_submissions) {
+  if (render_targets_.empty() || !bytes_to_free) {
+    return 0;
+  }
+  // Render targets that currently own EDRAM data must be kept - releasing one
+  // would drop the guest's rendering, not just a host cache entry.
+  std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher>
+      owning_render_targets;
+  for (const auto& ownership_range_pair : ownership_ranges_) {
+    const OwnershipRange& ownership_range = ownership_range_pair.second;
+    if (!ownership_range.render_target.IsEmpty()) {
+      owning_render_targets.emplace(ownership_range.render_target);
+    }
+    if (!ownership_range.host_depth_render_target_unorm24.IsEmpty()) {
+      owning_render_targets.emplace(
+          ownership_range.host_depth_render_target_unorm24);
+    }
+    if (!ownership_range.host_depth_render_target_float24.IsEmpty()) {
+      owning_render_targets.emplace(
+          ownership_range.host_depth_render_target_float24);
+    }
+  }
+
+  struct TrimCandidate {
+    RenderTargetKey key;
+    uint64_t last_use_submission;
+    uint64_t bytes;
+  };
+  std::vector<TrimCandidate> candidates;
+  for (const auto& render_target_pair : render_targets_) {
+    RenderTarget* render_target = render_target_pair.second;
+    if (!render_target) {
+      continue;
+    }
+    uint64_t bytes = render_target->GetHostMemoryBytes();
+    if (!bytes) {
+      continue;
+    }
+    if (owning_render_targets.find(render_target->key()) !=
+        owning_render_targets.end()) {
+      continue;
+    }
+    // Still possibly referenced by a command list the GPU hasn't finished.
+    if (render_target->last_use_submission() + min_idle_submissions >
+        completed_submission) {
+      continue;
+    }
+    candidates.push_back(
+        {render_target->key(), render_target->last_use_submission(), bytes});
+  }
+  if (candidates.empty()) {
+    return 0;
+  }
+  // Least recently used first.
+  std::sort(candidates.begin(), candidates.end(),
+            [](const TrimCandidate& a, const TrimCandidate& b) {
+              return a.last_use_submission < b.last_use_submission;
+            });
+  uint64_t freed_bytes = 0;
+  for (const TrimCandidate& candidate : candidates) {
+    auto it = render_targets_.find(candidate.key);
+    if (it == render_targets_.end()) {
+      continue;
+    }
+    delete it->second;
+    render_targets_.erase(it);
+    freed_bytes += candidate.bytes;
+    if (freed_bytes >= bytes_to_free) {
+      break;
+    }
+  }
+  if (freed_bytes) {
+    // Pointers to the released targets may be cached from the last update.
+    ResetAccumulatedRenderTargets();
+    std::memset(last_update_used_render_targets_, 0,
+                sizeof(last_update_used_render_targets_));
+  }
+  return freed_bytes;
 }
 
 void RenderTargetCache::BeginFrame() { ResetAccumulatedRenderTargets(); }

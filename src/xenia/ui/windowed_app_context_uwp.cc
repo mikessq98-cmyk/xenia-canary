@@ -9,6 +9,8 @@
 
 #include "xenia/ui/windowed_app_context_uwp.h"
 
+#include <utility>
+
 #if XE_PLATFORM_WINRT
 
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -49,8 +51,13 @@ void UWPWindowedAppContext::NotifyUILoopOfPendingFunctions() {
     return;
   }
   try {
+    // Normal, not Low: since presents were moved off the GPU-emulation thread,
+    // in-game guest frames are painted through this queue - at Low priority
+    // they'd be starved by any burst of input/window events on the UI thread,
+    // showing up as frame-pacing hiccups. Input is still dispatched by
+    // ProcessEvents ahead of Normal-priority work items.
     dispatcher.RunAsync(
-        winrt::Windows::UI::Core::CoreDispatcherPriority::Low,
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
         [this, alive]() {
           if (!alive->load(std::memory_order_acquire)) {
             return;
@@ -66,6 +73,27 @@ void UWPWindowedAppContext::NotifyUILoopOfPendingFunctions() {
   } catch (...) {
     dispatch_queued_.store(false, std::memory_order_release);
   }
+}
+
+bool UWPWindowedAppContext::CallInUIThreadAtHighPriority(
+    std::function<void()> fn) {
+  const auto dispatcher = dispatcher_;
+  const auto alive = alive_;
+  if (!dispatcher || !alive) {
+    return false;
+  }
+  try {
+    dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::High,
+                        [alive, fn = std::move(fn)]() {
+                          if (!alive->load(std::memory_order_acquire)) {
+                            return;
+                          }
+                          fn();
+                        });
+  } catch (...) {
+    return false;
+  }
+  return true;
 }
 
 void UWPWindowedAppContext::PlatformQuitFromUIThread() {

@@ -9,12 +9,15 @@
 
 #include "xenia/apu/xma_decoder.h"
 
+#include <atomic>
+
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_context_fake.h"
 #include "xenia/apu/xma_context_master.h"
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_context_old.h"
 
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -83,6 +86,25 @@ XmaDecoder::~XmaDecoder() = default;
 
 void av_log_callback(void* avcl, int level, const char* fmt, va_list va) {
   if (!cvars::ffmpeg_verbose && level > AV_LOG_WARNING) {
+    return;
+  }
+
+  // Under memory exhaustion ffmpeg emits "get_buffer() failed" for EVERY
+  // frame of EVERY voice - tens of thousands of lines that bloat the log and,
+  // with flush_log, stall the audio thread on disk I/O. Cap the flood: after
+  // a burst, drop further messages for a while.
+  static std::atomic<uint32_t> log_burst_count{0};
+  static std::atomic<uint64_t> log_burst_reset_ms{0};
+  uint64_t now_ms = xe::Clock::QueryHostUptimeMillis();
+  if (now_ms >= log_burst_reset_ms.load(std::memory_order_relaxed)) {
+    log_burst_reset_ms.store(now_ms + 5000, std::memory_order_relaxed);
+    log_burst_count.store(0, std::memory_order_relaxed);
+  }
+  uint32_t burst = log_burst_count.fetch_add(1, std::memory_order_relaxed);
+  if (burst >= 50) {
+    if (burst == 50) {
+      XELOGW("ffmpeg: too many messages, muting them for 5 seconds");
+    }
     return;
   }
 

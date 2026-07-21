@@ -36,6 +36,19 @@ DEFINE_bool(
     "runtime spikes and freezes when playing the game not for the first time.",
     "GPU");
 
+DEFINE_bool(
+    store_shaders_blocking_load, false,
+    "When loading persistently stored shaders on a subsequent run, finish "
+    "compiling all of them BEFORE the game starts loading, instead of "
+    "compiling them in the background in parallel with the game. Makes the "
+    "initial load longer (the emulator sits on a black screen while the "
+    "pipelines build), but removes the in-game stutter and the GPU spike that "
+    "async compilation causes at the start. Recommended on fixed hardware like "
+    "Xbox where the stored cache exactly matches what the game needs.",
+    "GPU");
+
+DECLARE_int32(memory_statistics_interval_seconds);
+
 namespace xe {
 namespace gpu {
 
@@ -135,12 +148,27 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
             constexpr double duration_scalar = 1.0;
 #endif
 
+            uint64_t last_memory_stats_time = Clock::QueryHostTickCount();
             while (frame_limiter_worker_running_) {
               // If there is no title running then there is no need for guest
               // frame limiter thread.
               if (!kernel_state_->is_title_open()) {
                 xe::threading::Sleep(std::chrono::milliseconds(100));
                 continue;
+              }
+
+              // Periodic memory-usage telemetry (see
+              // memory_statistics_interval_seconds). This thread ticks ~every
+              // vblank, giving fine-enough granularity for an N-second log.
+              if (cvars::memory_statistics_interval_seconds > 0 && memory_) {
+                uint64_t now = Clock::QueryHostTickCount();
+                if ((now - last_memory_stats_time) >=
+                    uint64_t(cvars::memory_statistics_interval_seconds) *
+                        Clock::QueryHostTickFrequency()) {
+                  last_memory_stats_time = now;
+                  memory_->LogMemoryStatistics();
+                  command_processor_->LogHostMemoryStatistics();
+                }
               }
 
               register_file()->values[XE_GPU_REG_D1MODE_V_COUNTER] +=
@@ -164,6 +192,18 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 
                   threading::NanoSleep(estimated_nanoseconds);
                 }
+#if XE_PLATFORM_WINRT
+                else {
+                  // Xbox: without this the loop busy-spins for the last ~10%
+                  // of every frame (the sleep above only covers 90% of the
+                  // vblank period), incrementing V_COUNTER thousands of times
+                  // per frame and burning a core the console doesn't have to
+                  // spare. A short sleep keeps a couple of wakeups per frame,
+                  // which is plenty of V_COUNTER granularity for guest code
+                  // polling it.
+                  threading::NanoSleep(500000);  // 0.5 ms
+                }
+#endif  // XE_PLATFORM_WINRT
               }
 
               if (!cvars::vsync) {
@@ -253,6 +293,12 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread(
   // reset).
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
+  }
+
+  // Let the backend preserve crash-diagnosis state (e.g. the toxic-shader
+  // solver's journal on Xbox UWP) before the process is torn down.
+  if (command_processor_) {
+    command_processor_->OnHostGpuLossFromAnyThread();
   }
 
   config::SaveConfig();

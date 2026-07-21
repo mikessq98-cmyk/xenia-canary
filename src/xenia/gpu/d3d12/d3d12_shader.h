@@ -39,8 +39,35 @@ class D3D12Shader : public DxbcShader {
       return !translation_claimed_.test_and_set(std::memory_order_acq_rel);
     }
 
+    // Memory-pressure path: frees the translated DXBC (retranslated from the
+    // ucode on demand later) and reopens the translation claim. The caller
+    // must guarantee no pipeline creation is concurrently reading the binary.
+    void ReleaseTranslationForMemoryPressure() {
+      ReleaseTranslatedBinary();
+      translation_claimed_.clear(std::memory_order_release);
+    }
+
+    // Number of queued or in-flight pipeline creations referencing this
+    // translation's binary. Taken when a pipeline is pushed to the creation
+    // queue and dropped when its creation attempt ends - both under the
+    // pipeline cache's creation_request_lock_, so a holder of that lock sees a
+    // stable value and can free every translation that is not referenced.
+    // Without this the memory-pressure release had to bail out whenever any
+    // creation was in flight, i.e. exactly during a compilation storm, which
+    // is when the memory is actually needed.
+    void AcquireForCreation() {
+      creation_refs_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void ReleaseFromCreation() {
+      creation_refs_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    bool is_referenced_by_creation() const {
+      return creation_refs_.load(std::memory_order_relaxed) != 0;
+    }
+
    private:
     std::atomic_flag translation_claimed_ = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> creation_refs_{0};
   };
 
   D3D12Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,

@@ -900,12 +900,38 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kSgsr) {
+    // Snapdragon Game Super Resolution - a single edge-directed upscaling pass
+    // straight to the output size (clamped to the maximum render target size -
+    // SGSR is always an intermediate pass, the bilinear pass appended below
+    // brings it to the back buffer, 1:1 in the common case). At 1:1 or when
+    // downsampling SGSR degenerates into a copy, so it's only used when
+    // upscaling along at least one axis.
+    std::pair<uint32_t, uint32_t> sgsr_input_size;
+    if (flow.effect_count) {
+      sgsr_input_size = flow.effect_output_sizes[flow.effect_count - 1];
+    } else {
+      sgsr_input_size.first = properties.frontbuffer_width;
+      sgsr_input_size.second = properties.frontbuffer_height;
+    }
+    if (sgsr_input_size.first < output_width_clamped ||
+        sgsr_input_size.second < output_height_clamped) {
+      assert_true(flow.effect_count < flow.effects.size());
+      flow.effect_output_sizes[flow.effect_count] =
+          std::make_pair(output_width_clamped, output_height_clamped);
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kSgsr;
+    }
+  }
+
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1]
                         : nullptr;
   if (!last_pre_bilinear_effect_size ||
       last_pre_bilinear_effect_size->first != output_width ||
-      last_pre_bilinear_effect_size->second != output_height) {
+      last_pre_bilinear_effect_size->second != output_height ||
+      // SGSR can't be the final effect (its texture coordinates are derived
+      // from the pixel position) - complete with a 1:1 bilinear pass.
+      flow.effects[flow.effect_count - 1] == GuestOutputPaintEffect::kSgsr) {
     // If not using FidelityFX, or it has reached its upscaling capabilities,
     // but more is needed, stretch via bilinear filtering.
     // Clamp the output size of the last effect to the maximum render target

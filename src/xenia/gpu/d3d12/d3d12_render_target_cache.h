@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -73,6 +74,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   }
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
+
+  // Host memory held by the render target cache: the EDRAM buffer (10 MB times
+  // the draw resolution scale area) plus every live host render target. For the
+  // [MEM] telemetry - render targets scale with the resolution scale and are a
+  // prime suspect when the host runs out of memory at 2x2.
+  uint64_t GetHostMemoryUsage() const {
+    return edram_buffer_size_ +
+           render_target_host_memory_bytes_.load(std::memory_order_relaxed);
+  }
 
   void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteEdramRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
@@ -179,7 +189,39 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   //  interaction with depth / stencil testing, host depth will need to be
   //  copied to a different buffer - the same range may have ROV-owned color and
   //  host float32 depth at the same time).
+  // Releases cached host render targets the game has moved on from when the
+  // host is running short of memory (or over d3d12_render_target_cache_max_mb).
+  // Only safe at a submission boundary - see the call site.
+  void TrimRenderTargetsForHostMemory();
+  // Host memory below which render targets start being released in automatic
+  // mode, and how much beyond the deficit to free.
+  // A game whose live render targets alone keep the host under the threshold
+  // can never get back above it, so these are deliberately close to the edge:
+  // trimming that can't win should be rare and small, not a permanent churn of
+  // releasing and recreating tens of megabytes every submission.
+  static constexpr uint64_t kHostMemoryTrimThreshold = 640ULL << 20;
+  static constexpr uint64_t kHostMemoryTrimExtra = 64ULL << 20;
+  // Submissions a render target must have gone unused before it may be
+  // released (it is recreated if the game comes back to it, so this only needs
+  // to be long enough to not thrash on alternating frames).
+  static constexpr uint64_t kRenderTargetIdleSubmissions = 60;
+  // Minimum spacing between trims, and the spacing after a trim that freed
+  // almost nothing - when the pressure is structural (the live render targets
+  // themselves don't fit), retrying every submission only costs recreations.
+  static constexpr uint64_t kRenderTargetTrimIntervalSubmissions = 64;
+  static constexpr uint64_t kRenderTargetTrimBackoffSubmissions = 600;
+  static constexpr uint64_t kRenderTargetTrimUselessBytes = 32ULL << 20;
+  // Submission of the last trim attempt, and the interval to the next one.
+  uint64_t render_target_trim_last_submission_ = 0;
+  uint64_t render_target_trim_interval_ =
+      kRenderTargetTrimIntervalSubmissions;
+
   ID3D12Resource* edram_buffer_ = nullptr;
+  // Size of edram_buffer_, for the host memory telemetry.
+  uint64_t edram_buffer_size_ = 0;
+  // Total host memory of the live D3D12RenderTarget resources (maintained by
+  // them, as they're owned by the base class and deleted through it).
+  std::atomic<uint64_t> render_target_host_memory_bytes_{0};
   D3D12_GPU_VIRTUAL_ADDRESS edram_buffer_gpu_address_ = 0;
   D3D12_RESOURCE_STATES edram_buffer_state_;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
@@ -239,14 +281,26 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
             descriptor_load_separate,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv,
         ui::d3d12::D3D12CpuDescriptorPool::Descriptor&& descriptor_srv_stencil,
-        D3D12_RESOURCE_STATES resource_state)
+        D3D12_RESOURCE_STATES resource_state, uint64_t host_memory_bytes = 0,
+        std::atomic<uint64_t>* host_memory_counter = nullptr)
         : RenderTarget(key),
           resource_(resource),
           descriptor_draw_(std::move(descriptor_draw)),
           descriptor_load_separate_(std::move(descriptor_load_separate)),
           descriptor_srv_(std::move(descriptor_srv)),
           descriptor_srv_stencil_(std::move(descriptor_srv_stencil)),
-          resource_state_(resource_state) {}
+          resource_state_(resource_state),
+          host_memory_bytes_(host_memory_bytes),
+          host_memory_counter_(host_memory_counter) {}
+
+    ~D3D12RenderTarget() override {
+      if (host_memory_counter_) {
+        host_memory_counter_->fetch_sub(host_memory_bytes_,
+                                       std::memory_order_relaxed);
+      }
+    }
+
+    uint64_t GetHostMemoryBytes() const override { return host_memory_bytes_; }
 
     ID3D12Resource* resource() const { return resource_.Get(); }
     const ui::d3d12::D3D12CpuDescriptorPool::Descriptor& descriptor_draw()
@@ -300,6 +354,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv_stencil_;
     D3D12_RESOURCE_STATES resource_state_;
+    // Host memory the resource occupies, and the cache-owned total it is
+    // included in (dropped from it when this render target is destroyed) - at
+    // a draw resolution scale render targets are one of the largest host
+    // allocations, so they need to show up in the [MEM] breakdown.
+    uint64_t host_memory_bytes_ = 0;
+    std::atomic<uint64_t>* host_memory_counter_ = nullptr;
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
     uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;

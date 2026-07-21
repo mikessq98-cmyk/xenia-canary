@@ -94,7 +94,7 @@ DEFINE_string(
     postprocess_scaling_and_sharpening, "",
     "Post-processing effect to use for resampling and/or sharpening of the "
     "final display output.\n"
-    "Use: [bilinear, cas, fsr]\n"
+    "Use: [bilinear, cas, fsr, sgsr]\n"
     " bilinear (or any value not listed here):\n"
     "  Original image at 1:1, simple bilinear stretching for resampling.\n"
     " cas:\n"
@@ -105,7 +105,25 @@ DEFINE_string(
     "  Use AMD FidelityFX Super Resolution 1.0 (FSR) for highest-quality "
     "upscaling, or AMD FidelityFX Contrast Adaptive Sharpening for sharpening "
     "while not scaling or downsampling.\n"
-    "  For scaling by factors of more than 2x2, multiple FSR passes are done.",
+    "  For scaling by factors of more than 2x2, multiple FSR passes are done.\n"
+    " sgsr:\n"
+    "  Use Snapdragon Game Super Resolution v1 - single-pass edge-directed "
+    "upscaling, sharper than bilinear and cheaper than FSR (Direct3D 12 "
+    "only; see postprocess_sgsr_edge_sharpness and "
+    "postprocess_sgsr_edge_threshold).",
+    "Display");
+DEFINE_double(
+    postprocess_sgsr_edge_sharpness,
+    xe::ui::Presenter::GuestOutputPaintConfig::kSgsrEdgeSharpnessDefault,
+    "Edge refinement strength for Snapdragon Game Super Resolution (SGSR), "
+    "from 0 to 10. Higher is sharper; 2 is the reference default.",
+    "Display");
+DEFINE_double(
+    postprocess_sgsr_edge_threshold,
+    xe::ui::Presenter::GuestOutputPaintConfig::kSgsrEdgeThresholdDefault,
+    "Luma difference (in 8-bit units, 0-16) that Snapdragon Game Super "
+    "Resolution (SGSR) treats as an edge to refine. Lower refines more "
+    "pixels; 8 is the reference default.",
     "Display");
 DEFINE_double(
     postprocess_ffx_cas_additional_sharpness,
@@ -989,6 +1007,8 @@ const char* EmulatorWindow::GetCvarValueForGuestOutputPaintEffect(
       return "cas";
     case ui::Presenter::GuestOutputPaintConfig::Effect::kFsr:
       return "fsr";
+    case ui::Presenter::GuestOutputPaintConfig::Effect::kSgsr:
+      return "sgsr";
     default:
       return "";
   }
@@ -1005,6 +1025,10 @@ EmulatorWindow::GetGuestOutputPaintEffectForCvarValue(
                         ui::Presenter::GuestOutputPaintConfig::Effect::kFsr)) {
     return ui::Presenter::GuestOutputPaintConfig::Effect::kFsr;
   }
+  if (cvar_value == GetCvarValueForGuestOutputPaintEffect(
+                        ui::Presenter::GuestOutputPaintConfig::Effect::kSgsr)) {
+    return ui::Presenter::GuestOutputPaintConfig::Effect::kSgsr;
+  }
   return ui::Presenter::GuestOutputPaintConfig::Effect::kBilinear;
 }
 
@@ -1020,6 +1044,10 @@ EmulatorWindow::GetGuestOutputPaintConfigForCvars() {
       cvars::postprocess_ffx_fsr_max_upsampling_passes);
   paint_config.SetFsrSharpnessReduction(
       float(cvars::postprocess_ffx_fsr_sharpness_reduction));
+  paint_config.SetSgsrEdgeSharpness(
+      float(cvars::postprocess_sgsr_edge_sharpness));
+  paint_config.SetSgsrEdgeThreshold(
+      float(cvars::postprocess_sgsr_edge_threshold));
   paint_config.SetDither(cvars::postprocess_dither);
   return paint_config;
 }

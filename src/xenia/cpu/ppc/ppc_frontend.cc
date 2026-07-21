@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/ppc/ppc_frontend.h"
 
+#include <new>
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mutex.h"
@@ -121,9 +123,31 @@ bool PPCFrontend::DeclareFunction(GuestFunction* function) {
 }
 
 bool PPCFrontend::DefineFunction(GuestFunction* function,
-                                 uint32_t debug_info_flags) {
+                                 uint32_t debug_info_flags,
+                                 bool* out_of_memory_out) {
+  if (out_of_memory_out) {
+    *out_of_memory_out = false;
+  }
   auto translator = translator_pool_.Allocate(this);
-  bool result = translator->Translate(function, debug_info_flags);
+  bool result;
+  // Translation allocates heavily (the HIR arenas, the compiler passes, the
+  // emitted code). On a memory-constrained host those allocations do fail, and
+  // an escaping std::bad_alloc terminates the process. Contain it here: the
+  // function is left undefined, which the caller already handles (the guest
+  // call fails and is logged) instead of taking the emulator down.
+  try {
+    result = translator->Translate(function, debug_info_flags);
+  } catch (const std::bad_alloc&) {
+    XELOGE(
+        "PPC translation of {:08X} ran OUT OF MEMORY - the function is left "
+        "undefined (host memory is exhausted; lower the memory usage, e.g. "
+        "the resolution scale)",
+        function->address());
+    if (out_of_memory_out) {
+      *out_of_memory_out = true;
+    }
+    result = false;
+  }
   translator->Reset();
   translator_pool_.Release(translator);
   return result;

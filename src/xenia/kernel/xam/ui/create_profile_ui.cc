@@ -8,7 +8,10 @@
  */
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
+#include "xenia/base/platform.h"
 #include "xenia/emulator.h"
+#include "xenia/ui/imgui_drawer.h"
+#include "xenia/ui/window.h"
 
 namespace xe {
 namespace kernel {
@@ -29,11 +32,28 @@ void CreateProfileUI::OnDraw(ImGuiIO& io) {
                               ImGuiWindowFlags_NoCollapse |
                                   ImGuiWindowFlags_AlwaysAutoResize |
                                   ImGuiWindowFlags_HorizontalScrollbar)) {
+#if XE_PLATFORM_WINRT
+    // The popup can go away through this path too - never leak the explicit
+    // keyboard hold (it would suppress the keyboard everywhere afterwards).
+    imgui_drawer()->window()->HideOnScreenKeyboard();
+#endif
     Close();
     return;
   }
 
-  if (ImGui::IsWindowAppearing()) {
+#if XE_PLATFORM_WINRT
+  // Keep the system on-screen keyboard up for the whole life of the dialog -
+  // calling it every frame retries transient system-UI refusals (the proven
+  // old-UWP-port pattern). Deliberately NOT tied to the focus handling below.
+  imgui_drawer()->window()->ShowOnScreenKeyboard();
+#endif
+  // Focus the gamertag field only while NOTHING is focused (dialog just
+  // opened, or focus was lost entirely). Re-focusing while the user has
+  // navigated to another item would steal gamepad navigation every frame,
+  // locking the cursor on the field.
+  if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+      !ImGui::IsAnyItemActive() && !ImGui::IsAnyItemFocused() &&
+      !ImGui::IsMouseClicked(0)) {
     ImGui::SetKeyboardFocusHere();
   }
 
@@ -63,6 +83,9 @@ void CreateProfileUI::OnDraw(ImGuiIO& io) {
   }
 
   if (!dialog_open) {
+#if XE_PLATFORM_WINRT
+    imgui_drawer()->window()->HideOnScreenKeyboard();
+#endif
     ImGui::CloseCurrentPopup();
     Close();
     ImGui::EndPopup();

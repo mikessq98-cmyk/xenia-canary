@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_D3D12_D3D12_TEXTURE_CACHE_H_
 #define XENIA_GPU_D3D12_D3D12_TEXTURE_CACHE_H_
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <memory>
@@ -518,6 +519,14 @@ class D3D12TextureCache final : public TextureCache {
        kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
   };
 
+  // Bytes actually committed for draw-resolution-scaling resolve buffers - on
+  // the committed (non-tiled, Xbox UWP) path, the sum of the on-demand
+  // regions; 0 when scaling is off or nothing has been resolved yet. A scalar,
+  // safe to read racily for telemetry.
+  uint64_t GetScaledResolveCommittedBytes() const {
+    return scaled_resolve_committed_bytes_;
+  }
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -743,6 +752,32 @@ class D3D12TextureCache final : public TextureCache {
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(
       uint32_t descriptor_index) const;
 
+  // Whether the scaled resolve buffers are tiled (reserved resources with
+  // 16 MB heaps committed on demand). When the device has no USABLE tiled
+  // resources (the Xbox UWP driver reports tier 1 but crashes on tier-1
+  // UpdateTileMappings), the buffers are created as fully committed instead -
+  // that is only possible while the whole scaled address space fits in one
+  // 2 GB window (scale area <= 4, e.g. 2x2), because bigger spaces need one
+  // heap aliased into several overlapping windows, which committed memory
+  // can't do.
+  bool UseTiledScaledResolveBuffers() const;
+
+  // Committed (non-tiled) path: ensures one region covers
+  // [first_scaled, last_scaled], creating or growing a region as needed.
+  // Returns false only if the memory for it can't be obtained (the resolve or
+  // texture load is then skipped, as it was before with an uncommitted range).
+  bool EnsureScaledResolveRegionCommitted(uint64_t first_scaled,
+                                          uint64_t last_scaled);
+  // Index of the region wholly containing the range, or SIZE_MAX.
+  size_t FindScaledResolveRegion(uint64_t first_scaled,
+                                 uint64_t last_scaled) const;
+  // Whether committing bytes_needed more bytes of scaled resolve memory is
+  // within the host's means (and the d3d12_scaled_resolve_max_mb cap, if set),
+  // releasing regions the game has stopped using if that's what it takes.
+  bool MakeRoomForScaledResolveRegion(uint64_t bytes_needed);
+  // Frees the buffers of regions whose copies the GPU has finished with.
+  void ReleaseCompletedRetiredScaledResolveBuffers();
+
   size_t GetScaledResolveBufferCount() const {
     assert_true(IsDrawResolutionScaled());
     // Make sure any range up to 1 GB is accessible through 1 or 2 buffers.
@@ -761,7 +796,9 @@ class D3D12TextureCache final : public TextureCache {
     uint64_t address_space_size =
         uint64_t(SharedMemory::kBufferSize) *
         (draw_resolution_scale_x() * draw_resolution_scale_y());
-    return size_t((address_space_size - 1) >> 30);
+    // At least one buffer - with scale area 2 the whole space is 1 GB and
+    // (size - 1) >> 30 would be 0 even though buffer 0 exists and is used.
+    return std::max<size_t>(size_t(1), size_t((address_space_size - 1) >> 30));
   }
   // Returns indices of two scaled resolve virtual buffers that the location in
   // memory may be accessible through. May be the same if it's a location near
@@ -786,6 +823,10 @@ class D3D12TextureCache final : public TextureCache {
         [scaled_resolve_current_range_start_scaled_ >> 30];
   }
   ScaledResolveVirtualBuffer& GetCurrentScaledResolveBuffer() {
+    // The committed path tracks the current region's buffer directly.
+    if (scaled_resolve_committed_current_region_) {
+      return *scaled_resolve_committed_current_region_;
+    }
     ScaledResolveVirtualBuffer* scaled_resolve_buffer =
         scaled_resolve_2gb_buffers_[GetCurrentScaledResolveBufferIndex()].get();
     assert_not_null(scaled_resolve_buffer);
@@ -856,6 +897,75 @@ class D3D12TextureCache final : public TextureCache {
               1) /
                  (UINT32_C(1) << 30)>
       scaled_resolve_2gb_buffers_;
+  // Base, in the scaled address space, of the buffer the last successful
+  // MakeScaledResolveRangeCurrent selected - range GPU addresses are offsets
+  // from it. In the tiled path the base is the buffer's gigabyte instead.
+  uint64_t scaled_resolve_committed_buffer_base_ = 0;
+  // Total committed bytes across the scaled resolve regions. Telemetry.
+  uint64_t scaled_resolve_committed_bytes_ = 0;
+
+  // Committed (non-tiled, Xbox UWP) path: instead of one buffer spanning
+  // everything the game touches, or a grid of fixed-size chunks (both of which
+  // commit far more than the game uses - a grid chunk is committed whole for a
+  // single small surface in it), the scaled address space is backed by
+  // dynamically sized, disjoint regions, each covering exactly the addresses
+  // resolves and texture loads have asked for, rounded to
+  // kScaledResolveRegionAlignment. A request inside a region is free; a
+  // request next to one grows that region (its contents are copied to the new,
+  // larger buffer on the GPU, and the old buffer is retired until the copy has
+  // been executed); a request far from everything starts a new region. So the
+  // committed total tracks the game's real footprint, and - unlike the chunk
+  // grid - no request is ever rejected for straddling a boundary.
+  struct ScaledResolveRegion {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    // Submission in which the region was last made current, for releasing
+    // regions the game has stopped using when memory runs short.
+    uint64_t last_use_submission = 0;
+    std::unique_ptr<ScaledResolveVirtualBuffer> buffer;
+  };
+  // Disjoint, sorted by base.
+  std::vector<ScaledResolveRegion> scaled_resolve_regions_;
+  // Buffers replaced by a grown region, kept alive until the submission that
+  // copied out of them has been completed by the GPU.
+  struct RetiredScaledResolveBuffer {
+    uint64_t submission = 0;
+    std::unique_ptr<ScaledResolveVirtualBuffer> buffer;
+  };
+  std::vector<RetiredScaledResolveBuffer> scaled_resolve_retired_buffers_;
+  // The region selected by the last MakeScaledResolveRangeCurrent (committed
+  // path only); null in the tiled path.
+  ScaledResolveVirtualBuffer* scaled_resolve_committed_current_region_ =
+      nullptr;
+  // Alignment of region bounds. Big enough that growing by a few pixels
+  // doesn't recreate the buffer constantly, small enough not to waste memory
+  // (one 2x-scaled 1280x720x32bpp surface is ~14 MB).
+  static constexpr uint64_t kScaledResolveRegionAlignment = 4ULL << 20;
+  // A request within this distance of an existing region grows that region
+  // (bridging the gap) instead of starting a new one - games cluster their
+  // surfaces, and a few small regions are cheaper to manage than many tiny
+  // ones. Larger values commit more of the gaps.
+  static constexpr uint64_t kScaledResolveRegionMergeGap = 16ULL << 20;
+  // Upper bound on a single region, so merging can't build a resource larger
+  // than a buffer may be (and so one runaway cluster can't commit the whole
+  // scaled address space, which at 3x3 is 4.5 GB). Requests are individual
+  // surfaces, orders of magnitude smaller than this - only merging could ever
+  // approach it, and it simply stops merging there.
+  static constexpr uint64_t kScaledResolveMaxRegionSize = 1ULL << 31;
+  // Host memory kept free for everything else (the driver's compilation
+  // arenas, textures, render targets) when deciding whether another scaled
+  // resolve region may be committed. Regions are individual surfaces - tens of
+  // megabytes - so this only has to cover a compilation burst; a large reserve
+  // refuses them while the host still has hundreds of megabytes free, and a
+  // refused region means a resolve or texture load is skipped, which shows up
+  // as missing render-to-texture effects.
+  static constexpr uint64_t kScaledResolveHostMemoryReserve = 384ULL << 20;
+  // Submissions a region may go unused before it may be released to make room
+  // for another one (~a few seconds of gameplay).
+  static constexpr uint64_t kScaledResolveRegionIdleSubmissions = 600;
+  // Count of committed-path requests refused because no memory could be freed
+  // for them. Telemetry / log throttling.
+  uint32_t scaled_resolve_budget_skips_ = 0;
   // Not very big heaps (16 MB) because they are needed pretty sparsely. One
   // 2x-scaled 1280x720x32bpp texture is slighly bigger than 14 MB.
   static constexpr uint32_t kScaledResolveHeapSizeLog2 = 24;

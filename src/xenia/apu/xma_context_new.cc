@@ -8,6 +8,9 @@
 */
 
 #include "xenia/apu/xma_context_new.h"
+
+#include <atomic>
+
 #include "xenia/apu/xma_helpers.h"
 
 #include "xenia/base/logging.h"
@@ -934,10 +937,20 @@ bool XmaContextNew::DecodePacket(AVCodecContext* av_context,
                                  const AVPacket* av_packet, AVFrame* av_frame) {
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
-    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-    av_strerror(ret, errbuf, sizeof(errbuf));
-    XELOGE("XmaContext {}: Error sending packet for decoding: {} ({})", id(),
-           errbuf, ret);
+    // Capped: under memory exhaustion this fails for every packet of every
+    // voice, thousands of times per minute - the log itself must not become
+    // an extra source of stalls.
+    static std::atomic<uint32_t> send_errors_logged{0};
+    uint32_t occurrence =
+        send_errors_logged.fetch_add(1, std::memory_order_relaxed);
+    if (occurrence < 32 || !(occurrence & 1023)) {
+      char errbuf[AV_ERROR_MAX_STRING_SIZE];
+      av_strerror(ret, errbuf, sizeof(errbuf));
+      XELOGE(
+          "XmaContext {}: Error sending packet for decoding: {} ({}) "
+          "(occurrence {})",
+          id(), errbuf, ret, occurrence + 1);
+    }
     return false;
   }
   ret = avcodec_receive_frame(av_context, av_frame);

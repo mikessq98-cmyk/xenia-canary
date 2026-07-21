@@ -10,8 +10,10 @@
 #include "xenia/base/arena.h"
 
 #include <cstring>
+#include <new>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 
 namespace xe {
@@ -129,6 +131,17 @@ void Arena::CloneContents(void* buffer, size_t buffer_length) {
 Arena::Chunk::Chunk(size_t chunk_size)
     : next(nullptr), capacity(chunk_size), buffer(0), offset(0) {
   buffer = reinterpret_cast<uint8_t*>(malloc(capacity));
+  if (!buffer) {
+    // Out of host memory. Without this the arena hands out pointers relative to
+    // a null buffer and the caller access-violates writing to it - which is
+    // exactly how the emulator died on the memory-constrained Xbox target
+    // (an AV deep in the PPC HIR builder, with no hint that the real cause was
+    // memory exhaustion). Report it as what it is; the guest function
+    // definition path contains it and fails the function cleanly.
+    XELOGE("Arena: failed to allocate a {} MB chunk - out of host memory",
+           capacity >> 20);
+    throw std::bad_alloc();
+  }
   assert_true((reinterpret_cast<size_t>(buffer) & size_t(15)) == 0,
               "16 byte alignment required");
 }

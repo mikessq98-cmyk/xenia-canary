@@ -11,7 +11,9 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "xenia/base/assert.h"
@@ -32,9 +34,68 @@ DEFINE_bool(
     "cases.",
     "D3D12");
 
+DEFINE_string(
+    postprocess_smaa, "",
+    "SMAA (Enhanced Subpixel Morphological Anti-Aliasing) 1x applied to the "
+    "game output at its native resolution, BEFORE any scaling "
+    "(postprocess_scaling_and_sharpening) - preserving edge shapes better "
+    "than FXAA with less blurring. Direct3D 12 only. Can be changed while "
+    "running.\n"
+    "Use: [none, low, medium, high, ultra]\n"
+    " none (or empty, or any value not listed here):\n"
+    "  SMAA disabled.\n"
+    " low / medium / high / ultra:\n"
+    "  SMAA quality preset (roughly 60% / 80% / 95% / 99% of the maximum "
+    "achievable quality; higher presets search longer edges and handle "
+    "diagonals and corners).",
+    "Display");
+
+DEFINE_string(
+    postprocess_smaa_edge_detection, "luma",
+    "Edge detection metric for SMAA (postprocess_smaa). Direct3D 12 only. "
+    "Can be changed while running.\n"
+    "Use: [luma, color, both]\n"
+    " luma (or any other value):\n"
+    "  Luminance-based - the SMAA default; cheapest, but transitions between "
+    "differently colored surfaces of similar brightness may be missed.\n"
+    " color / both:\n"
+    "  Max per-channel color delta - detects a strict SUPERSET of the luma "
+    "edges (mathematically, the max channel delta is always >= the "
+    "luma-weighted delta), so this IS luma + color combined; catches "
+    "chromatic aliasing the luma metric misses, slightly costlier.",
+    "Display");
+
+DEFINE_string(
+    postprocess_sgsr_base, "catrom",
+    "Base image reconstruction filter for SGSR "
+    "(postprocess_scaling_and_sharpening = sgsr). SGSR itself only refines "
+    "luminance on detected edges on top of this base, so the base filter "
+    "defines the sharpness of flat areas and of all color information. "
+    "Direct3D 12 only. Takes effect on the next emulator start.\n"
+    "Use: [catrom, bilinear]\n"
+    " catrom:\n"
+    "  Catmull-Rom bicubic - noticeably sharper than bilinear, slightly "
+    "costlier (9 texture samples instead of 1 for the base).\n"
+    " bilinear (or any other value):\n"
+    "  Plain bilinear - the original SGSR behavior.",
+    "Display");
+
 namespace xe {
 namespace ui {
 namespace d3d12 {
+
+// Whether the swap-chain Present forces vertical sync (SyncInterval != 0), which
+// makes the host window system block on the CPU when presenting. This MUST match
+// the SyncInterval actually passed to IDXGISwapChain::Present in
+// PaintAndPresentImpl: on Xbox UWP it's Present(1, 0) (vsync), everywhere else
+// Present(0, ...) (no vsync). Reported to the Presenter as is_vsync_implicit so
+// it keeps the blocking present off the guest-output (GPU-emulation) thread
+// instead of stalling emulation on every vblank.
+#if XE_PLATFORM_WINRT
+static constexpr bool kPresentForcesVsync = true;
+#else
+static constexpr bool kPresentForcesVsync = false;
+#endif
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -47,8 +108,39 @@ namespace shaders {
 #include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_easu_ps.h"
 #include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_sgsr_catrom_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_sgsr_ps.h"
 #include "xenia/ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_high_flat_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_high_nodiag_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_high_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_high_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_low_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_low_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_medium_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_medium_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_ultra_flat_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_ultra_nodiag_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_ultra_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_blend_weight_ultra_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_color_high_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_color_low_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_color_medium_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_color_ultra_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_luma_high_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_luma_low_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_luma_medium_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_luma_ultra_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_edge_luma_vs.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_neighborhood_blend_ps.h"
+#include "xenia/ui/shaders/bytecode/d3d12_5_1/smaa_neighborhood_blend_vs.h"
 }  // namespace shaders
+
+// SMAA lookup texture data (third_party/SMAA v2.8).
+namespace smaa_textures {
+#include "third_party/SMAA/Textures/AreaTex.h"
+#include "third_party/SMAA/Textures/SearchTex.h"
+}  // namespace smaa_textures
 
 D3D12Presenter::~D3D12Presenter() {
   // Await completion of the usage of everything before destroying anything,
@@ -244,7 +336,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     if (was_paintable &&
         paint_context_.swap_chain_width == new_swap_chain_width &&
         paint_context_.swap_chain_height == new_swap_chain_height) {
-      is_vsync_implicit_out = false;
+      is_vsync_implicit_out = kPresentForcesVsync;
       return SurfacePaintConnectResult::kSuccessUnchanged;
     }
     paint_context_.AwaitSwapChainUsageCompletion();
@@ -412,7 +504,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
             rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
   }
 
-  is_vsync_implicit_out = false;
+  is_vsync_implicit_out = kPresentForcesVsync;
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -571,6 +663,29 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
                 guest_output_flow.effects[i])]) {
           guest_output_flow.effect_count = 0;
           break;
+        }
+      }
+      // If the configured effect can't be painted (for instance, its pipeline
+      // couldn't be created because the driver's shader compiler crashed on
+      // it), fall back to plain bilinear scaling instead of not displaying the
+      // guest output at all.
+      if (!guest_output_flow.effect_count &&
+          guest_output_paint_config.GetEffect() !=
+              GuestOutputPaintConfig::Effect::kBilinear) {
+        GuestOutputPaintConfig bilinear_fallback_config =
+            guest_output_paint_config;
+        bilinear_fallback_config.SetEffect(
+            GuestOutputPaintConfig::Effect::kBilinear);
+        guest_output_flow = GetGuestOutputPaintFlow(
+            guest_output_properties, paint_context_.swap_chain_width,
+            paint_context_.swap_chain_height,
+            D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+            D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, bilinear_fallback_config);
+        if (guest_output_flow.effect_count &&
+            !guest_output_paint_final_pipelines_[size_t(
+                guest_output_flow
+                    .effects[guest_output_flow.effect_count - 1])]) {
+          guest_output_flow.effect_count = 0;
         }
       }
     }
@@ -765,6 +880,21 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         command_list->SetDescriptorHeaps(1, &view_heap);
       }
 
+      // SMAA 1x pre-pass at the guest output resolution, before any scaling -
+      // if it ran, the scaling chain reads the anti-aliased image instead of
+      // the raw guest output.
+      bool smaa_applied = false;
+      if (guest_output_flow.effect_count) {
+        size_t smaa_quality = GetSmaaQualityFromCvar();
+        if (smaa_quality != SIZE_MAX) {
+          smaa_applied = PaintSmaaPasses(
+              command_list, guest_output_resource.Get(),
+              guest_output_flow.properties.frontbuffer_width,
+              guest_output_flow.properties.frontbuffer_height, smaa_quality,
+              current_paint_submission);
+        }
+      }
+
       // This effect loop must not be aborted so the states of the resources
       // involved are consistent.
       D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
@@ -773,6 +903,25 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
         bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
 
         GuestOutputPaintEffect effect = guest_output_flow.effects[i];
+
+        if (effect == GuestOutputPaintEffect::kSgsr) {
+          // One-time activity marker for diagnosing the configuration.
+          static bool sgsr_logged = false;
+          if (!sgsr_logged) {
+            sgsr_logged = true;
+            uint32_t sgsr_input_width, sgsr_input_height;
+            guest_output_flow.GetEffectInputSize(i, sgsr_input_width,
+                                                 sgsr_input_height);
+            XELOGI(
+                "D3D12Presenter: SGSR upscaling active, {}x{} -> {}x{}, {} "
+                "base",
+                sgsr_input_width, sgsr_input_height,
+                guest_output_flow.effect_output_sizes[i].first,
+                guest_output_flow.effect_output_sizes[i].second,
+                cvars::postprocess_sgsr_base == "catrom" ? "Catmull-Rom"
+                                                         : "bilinear");
+          }
+        }
 
         ID3D12Resource* effect_dest_resource;
         int32_t effect_rect_x, effect_rect_y;
@@ -868,8 +1017,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
 
         UINT effect_src_view_index = UINT(
             i ? (PaintContext::kViewIndexGuestOutputIntermediate0Srv + (i - 1))
-              : (PaintContext::kViewIndexGuestOutput0Srv +
-                 guest_output_resource_paint_ref_index));
+              : (smaa_applied
+                     ? UINT(PaintContext::kViewIndexSmaaOutput)
+                     : UINT(PaintContext::kViewIndexGuestOutput0Srv +
+                            guest_output_resource_paint_ref_index)));
         command_list->SetGraphicsRootDescriptorTable(
             UINT(GuestOutputPaintRootParameter::kSource),
             provider_.OffsetViewDescriptor(view_heap_gpu_start,
@@ -900,6 +1051,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
           CasResampleConstants cas_resample;
           FsrEasuConstants fsr_easu;
           FsrRcasConstants fsr_rcas;
+          SgsrConstants sgsr;
         } effect_constants;
         switch (guest_output_paint_root_signature_index) {
           case kGuestOutputPaintRootSignatureIndexBilinear: {
@@ -924,6 +1076,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
             effect_constants_size = sizeof(effect_constants.fsr_rcas);
             effect_constants.fsr_rcas.Initialize(guest_output_flow, i,
                                                  guest_output_paint_config);
+          } break;
+          case kGuestOutputPaintRootSignatureIndexSgsr: {
+            effect_constants_size = sizeof(effect_constants.sgsr);
+            effect_constants.sgsr.Initialize(guest_output_flow, i,
+                                             guest_output_paint_config);
           } break;
           default:
             break;
@@ -1278,6 +1435,24 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
           [kGuestOutputPaintRootSignatureIndexFsrEasu]
               .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
+  // SGSR (needs the sampler - bilinear for the base color, and Gather ignores
+  // the filter).
+  guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
+      sizeof(SgsrConstants) / sizeof(uint32_t);
+  {
+    ID3D12RootSignature* guest_output_paint_root_signature =
+        util::CreateRootSignature(provider_,
+                                  guest_output_paint_root_signature_desc);
+    if (!guest_output_paint_root_signature) {
+      XELOGE(
+          "D3D12Presenter: Failed to create the guest output Snapdragon Game "
+          "Super Resolution presentation root signature");
+      return false;
+    }
+    *(guest_output_paint_root_signatures_
+          [kGuestOutputPaintRootSignatureIndexSgsr]
+              .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
+  }
   // RCAS and CAS don't need the sampler.
   guest_output_paint_root_signature_desc.NumStaticSamplers = 0;
   // RCAS.
@@ -1408,6 +1583,19 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         break;
+      case GuestOutputPaintEffect::kSgsr:
+        if (cvars::postprocess_sgsr_base == "catrom") {
+          guest_output_paint_pipeline_desc.PS.pShaderBytecode =
+              shaders::guest_output_sgsr_catrom_ps;
+          guest_output_paint_pipeline_desc.PS.BytecodeLength =
+              sizeof(shaders::guest_output_sgsr_catrom_ps);
+        } else {
+          guest_output_paint_pipeline_desc.PS.pShaderBytecode =
+              shaders::guest_output_sgsr_ps;
+          guest_output_paint_pipeline_desc.PS.BytecodeLength =
+              sizeof(shaders::guest_output_sgsr_ps);
+        }
+        break;
       default:
         // Not supported by this implementation.
         continue;
@@ -1416,12 +1604,28 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_root_signatures_
             [GetGuestOutputPaintRootSignatureIndex(guest_output_paint_effect)]
                 .Get();
+    // The creation is guarded against driver shader compiler crashes (the
+    // Xbox UWP compiler dies with an access violation on some valid shaders) -
+    // a crashed compilation only makes the effect unavailable.
+    DWORD pipeline_creation_exception = 0;
     if (CanGuestOutputPaintEffectBeIntermediate(guest_output_paint_effect)) {
       guest_output_paint_pipeline_desc.RTVFormats[0] =
           kGuestOutputIntermediateFormat;
-      if (FAILED(device->CreateGraphicsPipelineState(
-              &guest_output_paint_pipeline_desc,
-              IID_PPV_ARGS(&guest_output_paint_intermediate_pipelines_[i])))) {
+      if (FAILED(util::CreateGraphicsPipelineStateGuarded(
+              device, &guest_output_paint_pipeline_desc,
+              IID_PPV_ARGS(&guest_output_paint_intermediate_pipelines_[i]),
+              &pipeline_creation_exception))) {
+        if (pipeline_creation_exception) {
+          XELOGE(
+              "D3D12Presenter: The driver's shader compiler CRASHED "
+              "(exception 0x{:08X}) creating the guest output painting "
+              "pipeline for effect {} (intermediate) - the effect will be "
+              "unavailable",
+              uint32_t(pipeline_creation_exception), i);
+          guest_output_paint_intermediate_pipelines_[i].Reset();
+          guest_output_paint_final_pipelines_[i].Reset();
+          continue;
+        }
         XELOGE(
             "D3D12Presenter: Failed to create the guest output painting "
             "pipeline for effect {} writing to an intermediate texture",
@@ -1431,9 +1635,21 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     }
     if (CanGuestOutputPaintEffectBeFinal(guest_output_paint_effect)) {
       guest_output_paint_pipeline_desc.RTVFormats[0] = kSwapChainFormat;
-      if (FAILED(device->CreateGraphicsPipelineState(
-              &guest_output_paint_pipeline_desc,
-              IID_PPV_ARGS(&guest_output_paint_final_pipelines_[i])))) {
+      if (FAILED(util::CreateGraphicsPipelineStateGuarded(
+              device, &guest_output_paint_pipeline_desc,
+              IID_PPV_ARGS(&guest_output_paint_final_pipelines_[i]),
+              &pipeline_creation_exception))) {
+        if (pipeline_creation_exception) {
+          XELOGE(
+              "D3D12Presenter: The driver's shader compiler CRASHED "
+              "(exception 0x{:08X}) creating the guest output painting "
+              "pipeline for effect {} (final) - the effect will be "
+              "unavailable",
+              uint32_t(pipeline_creation_exception), i);
+          guest_output_paint_intermediate_pipelines_[i].Reset();
+          guest_output_paint_final_pipelines_[i].Reset();
+          continue;
+        }
         XELOGE(
             "D3D12Presenter: Failed to create the guest output painting "
             "pipeline for effect {} writing to a swap chain buffer",
@@ -1522,7 +1738,811 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     return false;
   }
 
+  // SMAA is optional - a failure only disables it (logged inside).
+  InitializeSmaaStaticObjects();
+
   return InitializeCommonSurfaceIndependent();
+}
+
+size_t D3D12Presenter::GetSmaaQualityFromCvar() {
+  const std::string& value = cvars::postprocess_smaa;
+  if (value == "low") {
+    return kSmaaQualityLow;
+  }
+  if (value == "medium") {
+    return kSmaaQualityMedium;
+  }
+  if (value == "high") {
+    return kSmaaQualityHigh;
+  }
+  if (value == "ultra") {
+    return kSmaaQualityUltra;
+  }
+  return SIZE_MAX;
+}
+
+bool D3D12Presenter::InitializeSmaaStaticObjects() {
+  ID3D12Device* device = provider_.GetDevice();
+
+  // Root signatures: b0 root constants (float4 RT metrics, both stages), SRV
+  // table t0.. (pixel), static samplers s0 = linear clamp, s1 = point clamp.
+  D3D12_ROOT_PARAMETER smaa_root_parameters[2];
+  smaa_root_parameters[0].ParameterType =
+      D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  smaa_root_parameters[0].Constants.ShaderRegister = 0;
+  smaa_root_parameters[0].Constants.RegisterSpace = 0;
+  smaa_root_parameters[0].Constants.Num32BitValues = 4;
+  smaa_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_DESCRIPTOR_RANGE smaa_srv_range;
+  smaa_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  smaa_srv_range.BaseShaderRegister = 0;
+  smaa_srv_range.RegisterSpace = 0;
+  smaa_srv_range.OffsetInDescriptorsFromTableStart = 0;
+  smaa_root_parameters[1].ParameterType =
+      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  smaa_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+  smaa_root_parameters[1].DescriptorTable.pDescriptorRanges = &smaa_srv_range;
+  smaa_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_STATIC_SAMPLER_DESC smaa_samplers[2] = {};
+  smaa_samplers[0].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+  smaa_samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  smaa_samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  smaa_samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  smaa_samplers[0].MaxAnisotropy = 1;
+  smaa_samplers[0].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+  smaa_samplers[0].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+  smaa_samplers[0].MinLOD = 0.0f;
+  smaa_samplers[0].MaxLOD = 0.0f;
+  smaa_samplers[0].ShaderRegister = 0;
+  smaa_samplers[0].RegisterSpace = 0;
+  smaa_samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  smaa_samplers[1] = smaa_samplers[0];
+  smaa_samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  smaa_samplers[1].ShaderRegister = 1;
+  D3D12_ROOT_SIGNATURE_DESC smaa_root_signature_desc;
+  smaa_root_signature_desc.NumParameters = UINT(xe::countof(smaa_root_parameters));
+  smaa_root_signature_desc.pParameters = smaa_root_parameters;
+  smaa_root_signature_desc.NumStaticSamplers = UINT(xe::countof(smaa_samplers));
+  smaa_root_signature_desc.pStaticSamplers = smaa_samplers;
+  smaa_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  smaa_srv_range.NumDescriptors = 2;
+  {
+    ID3D12RootSignature* smaa_root_signature =
+        util::CreateRootSignature(provider_, smaa_root_signature_desc);
+    if (!smaa_root_signature) {
+      XELOGE(
+          "D3D12Presenter: Failed to create the SMAA 2-SRV root signature - "
+          "SMAA will be unavailable");
+      return false;
+    }
+    *(smaa_root_signature_2_srvs_.ReleaseAndGetAddressOf()) =
+        smaa_root_signature;
+  }
+  smaa_srv_range.NumDescriptors = 3;
+  {
+    ID3D12RootSignature* smaa_root_signature =
+        util::CreateRootSignature(provider_, smaa_root_signature_desc);
+    if (!smaa_root_signature) {
+      XELOGE(
+          "D3D12Presenter: Failed to create the SMAA 3-SRV root signature - "
+          "SMAA will be unavailable");
+      smaa_root_signature_2_srvs_.Reset();
+      return false;
+    }
+    *(smaa_root_signature_3_srvs_.ReleaseAndGetAddressOf()) =
+        smaa_root_signature;
+  }
+
+  // Pipelines for each quality preset and pass.
+  struct SmaaPassShaders {
+    const void* vs;
+    size_t vs_size;
+    const void* ps;
+    size_t ps_size;
+    // Progressively simpler pixel shaders to retry with if the driver's
+    // shader compiler crashes on the full one (seen on the Xbox UWP driver
+    // with the high/ultra blend weight shaders). ps_flat is the same shader
+    // fully predicated ([flatten] everywhere - no branches around the
+    // unrolled searches, same quality); ps_nodiag drops the diagonal pattern
+    // detection entirely (which the working low/medium presets lack anyway).
+    const void* ps_flat = nullptr;
+    size_t ps_flat_size = 0;
+    const void* ps_nodiag = nullptr;
+    size_t ps_nodiag_size = 0;
+  };
+  // [quality][pass].
+  const SmaaPassShaders smaa_pass_shaders[kSmaaQualityCount][kSmaaPassCount] = {
+      {{shaders::smaa_edge_luma_vs, sizeof(shaders::smaa_edge_luma_vs),
+        shaders::smaa_edge_luma_low_ps, sizeof(shaders::smaa_edge_luma_low_ps)},
+       {shaders::smaa_blend_weight_low_vs,
+        sizeof(shaders::smaa_blend_weight_low_vs),
+        shaders::smaa_blend_weight_low_ps,
+        sizeof(shaders::smaa_blend_weight_low_ps)},
+       {shaders::smaa_neighborhood_blend_vs,
+        sizeof(shaders::smaa_neighborhood_blend_vs),
+        shaders::smaa_neighborhood_blend_ps,
+        sizeof(shaders::smaa_neighborhood_blend_ps)}},
+      {{shaders::smaa_edge_luma_vs, sizeof(shaders::smaa_edge_luma_vs),
+        shaders::smaa_edge_luma_medium_ps,
+        sizeof(shaders::smaa_edge_luma_medium_ps)},
+       {shaders::smaa_blend_weight_medium_vs,
+        sizeof(shaders::smaa_blend_weight_medium_vs),
+        shaders::smaa_blend_weight_medium_ps,
+        sizeof(shaders::smaa_blend_weight_medium_ps)},
+       {shaders::smaa_neighborhood_blend_vs,
+        sizeof(shaders::smaa_neighborhood_blend_vs),
+        shaders::smaa_neighborhood_blend_ps,
+        sizeof(shaders::smaa_neighborhood_blend_ps)}},
+      {{shaders::smaa_edge_luma_vs, sizeof(shaders::smaa_edge_luma_vs),
+        shaders::smaa_edge_luma_high_ps,
+        sizeof(shaders::smaa_edge_luma_high_ps)},
+       {shaders::smaa_blend_weight_high_vs,
+        sizeof(shaders::smaa_blend_weight_high_vs),
+        shaders::smaa_blend_weight_high_ps,
+        sizeof(shaders::smaa_blend_weight_high_ps),
+        shaders::smaa_blend_weight_high_flat_ps,
+        sizeof(shaders::smaa_blend_weight_high_flat_ps),
+        shaders::smaa_blend_weight_high_nodiag_ps,
+        sizeof(shaders::smaa_blend_weight_high_nodiag_ps)},
+       {shaders::smaa_neighborhood_blend_vs,
+        sizeof(shaders::smaa_neighborhood_blend_vs),
+        shaders::smaa_neighborhood_blend_ps,
+        sizeof(shaders::smaa_neighborhood_blend_ps)}},
+      {{shaders::smaa_edge_luma_vs, sizeof(shaders::smaa_edge_luma_vs),
+        shaders::smaa_edge_luma_ultra_ps,
+        sizeof(shaders::smaa_edge_luma_ultra_ps)},
+       {shaders::smaa_blend_weight_ultra_vs,
+        sizeof(shaders::smaa_blend_weight_ultra_vs),
+        shaders::smaa_blend_weight_ultra_ps,
+        sizeof(shaders::smaa_blend_weight_ultra_ps),
+        shaders::smaa_blend_weight_ultra_flat_ps,
+        sizeof(shaders::smaa_blend_weight_ultra_flat_ps),
+        shaders::smaa_blend_weight_ultra_nodiag_ps,
+        sizeof(shaders::smaa_blend_weight_ultra_nodiag_ps)},
+       {shaders::smaa_neighborhood_blend_vs,
+        sizeof(shaders::smaa_neighborhood_blend_vs),
+        shaders::smaa_neighborhood_blend_ps,
+        sizeof(shaders::smaa_neighborhood_blend_ps)}},
+  };
+  const DXGI_FORMAT smaa_pass_formats[kSmaaPassCount] = {
+      DXGI_FORMAT_R8G8_UNORM,      // Edges.
+      DXGI_FORMAT_R8G8B8A8_UNORM,  // Blend weights.
+      kGuestOutputFormat,          // Anti-aliased output.
+  };
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC smaa_pipeline_desc = {};
+  smaa_pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  smaa_pipeline_desc.SampleMask = UINT_MAX;
+  smaa_pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  smaa_pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  smaa_pipeline_desc.RasterizerState.DepthClipEnable = true;
+  smaa_pipeline_desc.PrimitiveTopologyType =
+      D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  smaa_pipeline_desc.NumRenderTargets = 1;
+  smaa_pipeline_desc.SampleDesc.Count = 1;
+  // A driver shader compiler crash on one quality preset must only make that
+  // preset unavailable, with the runtime falling back to the closest preset
+  // that did compile - not disable SMAA entirely (on the Xbox UWP driver the
+  // biggest unrolled blend weight shaders may still be rejected while
+  // low/medium compile fine).
+  size_t smaa_qualities_available = 0;
+  for (size_t quality = 0; quality < kSmaaQualityCount; ++quality) {
+    bool quality_available = true;
+    for (size_t pass = 0; pass < kSmaaPassCount; ++pass) {
+      const SmaaPassShaders& pass_shaders = smaa_pass_shaders[quality][pass];
+      smaa_pipeline_desc.pRootSignature =
+          (pass == kSmaaPassWeights ? smaa_root_signature_3_srvs_
+                                    : smaa_root_signature_2_srvs_)
+              .Get();
+      smaa_pipeline_desc.VS.pShaderBytecode = pass_shaders.vs;
+      smaa_pipeline_desc.VS.BytecodeLength = pass_shaders.vs_size;
+      smaa_pipeline_desc.RTVFormats[0] = smaa_pass_formats[pass];
+      // Ladder of PS variants, most capable first. Guarded: the Xbox UWP
+      // driver's shader compiler may crash on shaders that are valid
+      // elsewhere - that must only degrade or disable SMAA, not kill the
+      // emulator at startup. Each step is logged so a report shows exactly
+      // which shader construct the driver rejects.
+      const struct {
+        const void* ps;
+        size_t ps_size;
+        const char* name;
+      } ps_variants[] = {
+          {pass_shaders.ps, pass_shaders.ps_size, "full"},
+          {pass_shaders.ps_flat, pass_shaders.ps_flat_size,
+           "branch-free (flattened)"},
+          {pass_shaders.ps_nodiag, pass_shaders.ps_nodiag_size,
+           "no diagonal detection"},
+      };
+      HRESULT smaa_pipeline_hr = E_FAIL;
+      for (const auto& ps_variant : ps_variants) {
+        if (!ps_variant.ps) {
+          continue;
+        }
+#if XE_PLATFORM_WINRT
+        // Established on the Xbox UWP driver (newbe_xs.dll): the "full"
+        // variant with [branch] regions around the unrolled diagonal searches
+        // ALWAYS crashes its shader compiler, and the branch-free variant is
+        // the known-good replacement - go straight to it instead of
+        // provoking a contained-but-real access violation in the driver on
+        // every launch.
+        if (ps_variant.ps == pass_shaders.ps && pass_shaders.ps_flat) {
+          continue;
+        }
+#endif  // XE_PLATFORM_WINRT
+        smaa_pipeline_desc.PS.pShaderBytecode = ps_variant.ps;
+        smaa_pipeline_desc.PS.BytecodeLength = ps_variant.ps_size;
+        DWORD smaa_pipeline_exception = 0;
+        smaa_pipeline_hr = util::CreateGraphicsPipelineStateGuarded(
+            device, &smaa_pipeline_desc,
+            IID_PPV_ARGS(
+                smaa_pipelines_[quality][pass].ReleaseAndGetAddressOf()),
+            &smaa_pipeline_exception);
+        if (SUCCEEDED(smaa_pipeline_hr)) {
+          if (ps_variant.ps != pass_shaders.ps) {
+            XELOGI(
+                "D3D12Presenter: SMAA pipeline (quality {}, pass {}) created "
+                "with the \"{}\" shader variant",
+                quality, pass, ps_variant.name);
+          }
+          break;
+        }
+        if (smaa_pipeline_exception) {
+          XELOGW(
+              "D3D12Presenter: The driver's shader compiler CRASHED "
+              "(exception 0x{:08X}) on the \"{}\" SMAA shader variant "
+              "(quality {}, pass {})",
+              uint32_t(smaa_pipeline_exception), ps_variant.name, quality,
+              pass);
+        } else {
+          XELOGW(
+              "D3D12Presenter: Failed to create the SMAA pipeline with the "
+              "\"{}\" shader variant (quality {}, pass {})",
+              ps_variant.name, quality, pass);
+        }
+      }
+      if (FAILED(smaa_pipeline_hr)) {
+        XELOGE(
+            "D3D12Presenter: No SMAA shader variant works for quality {}, "
+            "pass {} - this quality preset will be unavailable",
+            quality, pass);
+        quality_available = false;
+        break;
+      }
+    }
+    if (quality_available) {
+      ++smaa_qualities_available;
+    } else {
+      for (auto& pipeline : smaa_pipelines_[quality]) {
+        pipeline.Reset();
+      }
+    }
+  }
+  if (!smaa_qualities_available) {
+    XELOGE(
+        "D3D12Presenter: No SMAA quality preset could be created - SMAA will "
+        "be unavailable");
+    smaa_root_signature_2_srvs_.Reset();
+    smaa_root_signature_3_srvs_.Reset();
+    return false;
+  }
+
+  // Optional color (max per-channel delta) edge detection variants - a
+  // superset of the luma edges, selected via
+  // cvars::postprocess_smaa_edge_detection. A creation failure only keeps the
+  // luma edge pass for that quality.
+  {
+    const struct {
+      const void* ps;
+      size_t ps_size;
+    } smaa_edge_color_shaders[kSmaaQualityCount] = {
+        {shaders::smaa_edge_color_low_ps,
+         sizeof(shaders::smaa_edge_color_low_ps)},
+        {shaders::smaa_edge_color_medium_ps,
+         sizeof(shaders::smaa_edge_color_medium_ps)},
+        {shaders::smaa_edge_color_high_ps,
+         sizeof(shaders::smaa_edge_color_high_ps)},
+        {shaders::smaa_edge_color_ultra_ps,
+         sizeof(shaders::smaa_edge_color_ultra_ps)},
+    };
+    smaa_pipeline_desc.pRootSignature = smaa_root_signature_2_srvs_.Get();
+    smaa_pipeline_desc.VS.pShaderBytecode = shaders::smaa_edge_luma_vs;
+    smaa_pipeline_desc.VS.BytecodeLength = sizeof(shaders::smaa_edge_luma_vs);
+    smaa_pipeline_desc.RTVFormats[0] = smaa_pass_formats[kSmaaPassEdges];
+    for (size_t quality = 0; quality < kSmaaQualityCount; ++quality) {
+      if (!smaa_pipelines_[quality][kSmaaPassEdges]) {
+        // The whole quality preset is unavailable.
+        continue;
+      }
+      smaa_pipeline_desc.PS.pShaderBytecode =
+          smaa_edge_color_shaders[quality].ps;
+      smaa_pipeline_desc.PS.BytecodeLength =
+          smaa_edge_color_shaders[quality].ps_size;
+      DWORD smaa_pipeline_exception = 0;
+      if (FAILED(util::CreateGraphicsPipelineStateGuarded(
+              device, &smaa_pipeline_desc,
+              IID_PPV_ARGS(
+                  smaa_edge_color_pipelines_[quality].ReleaseAndGetAddressOf()),
+              &smaa_pipeline_exception))) {
+        XELOGW(
+            "D3D12Presenter: Failed to create the SMAA color edge detection "
+            "pipeline (quality {}){} - luma edge detection will be used for "
+            "this preset",
+            quality,
+            smaa_pipeline_exception ? " because the driver's shader compiler "
+                                      "crashed"
+                                    : "");
+        smaa_edge_color_pipelines_[quality].Reset();
+      }
+    }
+  }
+
+  // The lookup textures (uploaded on first use, on the paint command list).
+  D3D12_RESOURCE_DESC smaa_lut_desc = {};
+  smaa_lut_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  smaa_lut_desc.DepthOrArraySize = 1;
+  smaa_lut_desc.MipLevels = 1;
+  smaa_lut_desc.SampleDesc.Count = 1;
+  smaa_lut_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  smaa_lut_desc.Width = AREATEX_WIDTH;
+  smaa_lut_desc.Height = AREATEX_HEIGHT;
+  smaa_lut_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+  if (FAILED(device->CreateCommittedResource(
+          &util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &smaa_lut_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(smaa_area_texture_.ReleaseAndGetAddressOf())))) {
+    XELOGE(
+        "D3D12Presenter: Failed to create the SMAA area lookup texture - SMAA "
+        "will be unavailable");
+    return false;
+  }
+  smaa_lut_desc.Width = SEARCHTEX_WIDTH;
+  smaa_lut_desc.Height = SEARCHTEX_HEIGHT;
+  smaa_lut_desc.Format = DXGI_FORMAT_R8_UNORM;
+  if (FAILED(device->CreateCommittedResource(
+          &util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &smaa_lut_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(smaa_search_texture_.ReleaseAndGetAddressOf())))) {
+    XELOGE(
+        "D3D12Presenter: Failed to create the SMAA search lookup texture - "
+        "SMAA will be unavailable");
+    smaa_area_texture_.Reset();
+    return false;
+  }
+
+  // The upload buffer with both lookup textures, already filled - rows placed
+  // at D3D12_TEXTURE_DATA_PITCH_ALIGNMENT.
+  constexpr uint32_t kAreaRowPitch =
+      (AREATEX_PITCH + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+      ~uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  constexpr uint32_t kAreaUploadSize = kAreaRowPitch * AREATEX_HEIGHT;
+  constexpr uint32_t kSearchUploadOffset =
+      (kAreaUploadSize + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+      ~uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+  constexpr uint32_t kSearchRowPitch =
+      (SEARCHTEX_PITCH + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+      ~uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  constexpr uint32_t kSmaaLutUploadBufferSize =
+      kSearchUploadOffset + kSearchRowPitch * SEARCHTEX_HEIGHT;
+  D3D12_RESOURCE_DESC smaa_lut_upload_buffer_desc;
+  util::FillBufferResourceDesc(smaa_lut_upload_buffer_desc,
+                               kSmaaLutUploadBufferSize,
+                               D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(
+          &util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE,
+          &smaa_lut_upload_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+          nullptr,
+          IID_PPV_ARGS(smaa_lut_upload_buffer_.ReleaseAndGetAddressOf())))) {
+    XELOGE(
+        "D3D12Presenter: Failed to create the SMAA lookup upload buffer - "
+        "SMAA will be unavailable");
+    smaa_area_texture_.Reset();
+    smaa_search_texture_.Reset();
+    return false;
+  }
+  {
+    void* smaa_lut_upload_mapping;
+    D3D12_RANGE smaa_lut_upload_read_range = {};
+    if (FAILED(smaa_lut_upload_buffer_->Map(0, &smaa_lut_upload_read_range,
+                                            &smaa_lut_upload_mapping))) {
+      XELOGE(
+          "D3D12Presenter: Failed to map the SMAA lookup upload buffer - SMAA "
+          "will be unavailable");
+      smaa_area_texture_.Reset();
+      smaa_search_texture_.Reset();
+      smaa_lut_upload_buffer_.Reset();
+      return false;
+    }
+    uint8_t* upload_bytes = static_cast<uint8_t*>(smaa_lut_upload_mapping);
+    for (uint32_t y = 0; y < AREATEX_HEIGHT; ++y) {
+      std::memcpy(upload_bytes + size_t(kAreaRowPitch) * y,
+                  smaa_textures::areaTexBytes + size_t(AREATEX_PITCH) * y,
+                  AREATEX_PITCH);
+    }
+    for (uint32_t y = 0; y < SEARCHTEX_HEIGHT; ++y) {
+      std::memcpy(
+          upload_bytes + kSearchUploadOffset + size_t(kSearchRowPitch) * y,
+          smaa_textures::searchTexBytes + size_t(SEARCHTEX_PITCH) * y,
+          SEARCHTEX_PITCH);
+    }
+    smaa_lut_upload_buffer_->Unmap(0, nullptr);
+  }
+  smaa_luts_uploaded_ = false;
+
+  return true;
+}
+
+bool D3D12Presenter::PaintSmaaPasses(ID3D12GraphicsCommandList* command_list,
+                                     ID3D12Resource* guest_output_resource,
+                                     uint32_t frontbuffer_width,
+                                     uint32_t frontbuffer_height,
+                                     size_t quality,
+                                     uint64_t current_paint_submission) {
+  if (!smaa_root_signature_2_srvs_ || !smaa_area_texture_) {
+    return false;
+  }
+  // The requested preset may have been unavailable at initialization (driver
+  // shader compiler crash) - substitute the closest one that did compile,
+  // preferring lower (cheaper, known-simpler shaders).
+  if (!smaa_pipelines_[quality][0]) {
+    size_t substitute = SIZE_MAX;
+    for (size_t below = quality; below != SIZE_MAX; --below) {
+      if (smaa_pipelines_[below][0]) {
+        substitute = below;
+        break;
+      }
+    }
+    if (substitute == SIZE_MAX) {
+      for (size_t above = quality + 1; above < kSmaaQualityCount; ++above) {
+        if (smaa_pipelines_[above][0]) {
+          substitute = above;
+          break;
+        }
+      }
+    }
+    if (substitute == SIZE_MAX) {
+      return false;
+    }
+    static bool smaa_substitute_logged = false;
+    if (!smaa_substitute_logged) {
+      smaa_substitute_logged = true;
+      XELOGW(
+          "D3D12Presenter: SMAA quality preset {} is unavailable on this "
+          "driver, using preset {} instead",
+          quality, substitute);
+    }
+    quality = substitute;
+  }
+  ID3D12Device* device = provider_.GetDevice();
+
+  // (Re)create the working textures for the current guest output size.
+  {
+    std::pair<uint32_t, uint32_t> smaa_current_size(0, 0);
+    if (paint_context_.smaa_output_texture) {
+      D3D12_RESOURCE_DESC smaa_output_desc =
+          paint_context_.smaa_output_texture->GetDesc();
+      smaa_current_size.first = uint32_t(smaa_output_desc.Width);
+      smaa_current_size.second = smaa_output_desc.Height;
+    }
+    if (smaa_current_size !=
+        std::make_pair(frontbuffer_width, frontbuffer_height)) {
+      if (paint_context_.smaa_output_texture ||
+          paint_context_.smaa_edges_texture) {
+        paint_context_.paint_completion_timeline
+            ->AwaitSubmissionAndUpdateCompleted(
+                paint_context_.smaa_texture_last_usage);
+        paint_context_.smaa_edges_texture.Reset();
+        paint_context_.smaa_weights_texture.Reset();
+        paint_context_.smaa_output_texture.Reset();
+      }
+      D3D12_RESOURCE_DESC smaa_texture_desc = {};
+      smaa_texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      smaa_texture_desc.Width = frontbuffer_width;
+      smaa_texture_desc.Height = frontbuffer_height;
+      smaa_texture_desc.DepthOrArraySize = 1;
+      smaa_texture_desc.MipLevels = 1;
+      smaa_texture_desc.SampleDesc.Count = 1;
+      smaa_texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      smaa_texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      const DXGI_FORMAT smaa_texture_formats[3] = {
+          DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+          kGuestOutputFormat};
+      Microsoft::WRL::ComPtr<ID3D12Resource>* const smaa_textures[3] = {
+          &paint_context_.smaa_edges_texture,
+          &paint_context_.smaa_weights_texture,
+          &paint_context_.smaa_output_texture};
+      const UINT smaa_rtv_indices[3] = {PaintContext::kRTVIndexSmaaEdges,
+                                        PaintContext::kRTVIndexSmaaWeights,
+                                        PaintContext::kRTVIndexSmaaOutput};
+      const UINT smaa_srv_indices[3] = {PaintContext::kViewIndexSmaaEdges,
+                                        PaintContext::kViewIndexSmaaWeights,
+                                        PaintContext::kViewIndexSmaaOutput};
+      for (size_t i = 0; i < 3; ++i) {
+        smaa_texture_desc.Format = smaa_texture_formats[i];
+        if (FAILED(device->CreateCommittedResource(
+                &util::kHeapPropertiesDefault,
+                provider_.GetHeapFlagCreateNotZeroed(), &smaa_texture_desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(smaa_textures[i]->ReleaseAndGetAddressOf())))) {
+          XELOGE(
+              "D3D12Presenter: Failed to create a {}x{} SMAA working texture",
+              frontbuffer_width, frontbuffer_height);
+          paint_context_.smaa_edges_texture.Reset();
+          paint_context_.smaa_weights_texture.Reset();
+          paint_context_.smaa_output_texture.Reset();
+          return false;
+        }
+        // RTV.
+        D3D12_RENDER_TARGET_VIEW_DESC smaa_rtv_desc;
+        smaa_rtv_desc.Format = smaa_texture_desc.Format;
+        smaa_rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        smaa_rtv_desc.Texture2D.MipSlice = 0;
+        smaa_rtv_desc.Texture2D.PlaneSlice = 0;
+        device->CreateRenderTargetView(
+            smaa_textures[i]->Get(), &smaa_rtv_desc,
+            provider_.OffsetRTVDescriptor(
+                paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart(),
+                smaa_rtv_indices[i]));
+        // SRV.
+        D3D12_SHADER_RESOURCE_VIEW_DESC smaa_srv_desc;
+        smaa_srv_desc.Format = smaa_texture_desc.Format;
+        smaa_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        smaa_srv_desc.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        smaa_srv_desc.Texture2D.MostDetailedMip = 0;
+        smaa_srv_desc.Texture2D.MipLevels = 1;
+        smaa_srv_desc.Texture2D.PlaneSlice = 0;
+        smaa_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        device->CreateShaderResourceView(
+            smaa_textures[i]->Get(), &smaa_srv_desc,
+            provider_.OffsetViewDescriptor(
+                paint_context_.view_heap->GetCPUDescriptorHandleForHeapStart(),
+                smaa_srv_indices[i]));
+      }
+      // The LUT SRVs live in the same heap - (re)create them together with the
+      // working texture views (also handles the very first use).
+      D3D12_SHADER_RESOURCE_VIEW_DESC smaa_lut_srv_desc;
+      smaa_lut_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      smaa_lut_srv_desc.Shader4ComponentMapping =
+          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      smaa_lut_srv_desc.Texture2D.MostDetailedMip = 0;
+      smaa_lut_srv_desc.Texture2D.MipLevels = 1;
+      smaa_lut_srv_desc.Texture2D.PlaneSlice = 0;
+      smaa_lut_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+      smaa_lut_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+      device->CreateShaderResourceView(
+          smaa_area_texture_.Get(), &smaa_lut_srv_desc,
+          provider_.OffsetViewDescriptor(
+              paint_context_.view_heap->GetCPUDescriptorHandleForHeapStart(),
+              PaintContext::kViewIndexSmaaArea));
+      smaa_lut_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+      device->CreateShaderResourceView(
+          smaa_search_texture_.Get(), &smaa_lut_srv_desc,
+          provider_.OffsetViewDescriptor(
+              paint_context_.view_heap->GetCPUDescriptorHandleForHeapStart(),
+              PaintContext::kViewIndexSmaaSearch));
+      // The guest output color SRV must be recreated for the new... actually
+      // for the resource identity - handled below.
+      paint_context_.smaa_color_srv_resource = nullptr;
+    }
+  }
+
+  // SRV of the current guest output texture at kViewIndexSmaaColor.
+  if (paint_context_.smaa_color_srv_resource != guest_output_resource) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC smaa_color_srv_desc;
+    smaa_color_srv_desc.Format = kGuestOutputFormat;
+    smaa_color_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    smaa_color_srv_desc.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    smaa_color_srv_desc.Texture2D.MostDetailedMip = 0;
+    smaa_color_srv_desc.Texture2D.MipLevels = 1;
+    smaa_color_srv_desc.Texture2D.PlaneSlice = 0;
+    smaa_color_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+    device->CreateShaderResourceView(
+        guest_output_resource, &smaa_color_srv_desc,
+        provider_.OffsetViewDescriptor(
+            paint_context_.view_heap->GetCPUDescriptorHandleForHeapStart(),
+            PaintContext::kViewIndexSmaaColor));
+    paint_context_.smaa_color_srv_resource = guest_output_resource;
+  }
+
+  paint_context_.smaa_texture_last_usage = current_paint_submission;
+
+  // Upload the lookup textures on first use.
+  if (!smaa_luts_uploaded_) {
+    constexpr uint32_t kAreaRowPitch =
+        (AREATEX_PITCH + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+        ~uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    constexpr uint32_t kAreaUploadSize = kAreaRowPitch * AREATEX_HEIGHT;
+    constexpr uint32_t kSearchUploadOffset =
+        (kAreaUploadSize + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+        ~uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+    constexpr uint32_t kSearchRowPitch =
+        (SEARCHTEX_PITCH + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+        ~uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_TEXTURE_COPY_LOCATION copy_dest, copy_source;
+    copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    copy_dest.SubresourceIndex = 0;
+    copy_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    copy_source.pResource = smaa_lut_upload_buffer_.Get();
+    copy_dest.pResource = smaa_area_texture_.Get();
+    copy_source.PlacedFootprint.Offset = 0;
+    copy_source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8_UNORM;
+    copy_source.PlacedFootprint.Footprint.Width = AREATEX_WIDTH;
+    copy_source.PlacedFootprint.Footprint.Height = AREATEX_HEIGHT;
+    copy_source.PlacedFootprint.Footprint.Depth = 1;
+    copy_source.PlacedFootprint.Footprint.RowPitch = kAreaRowPitch;
+    command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source,
+                                    nullptr);
+    copy_dest.pResource = smaa_search_texture_.Get();
+    copy_source.PlacedFootprint.Offset = kSearchUploadOffset;
+    copy_source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    copy_source.PlacedFootprint.Footprint.Width = SEARCHTEX_WIDTH;
+    copy_source.PlacedFootprint.Footprint.Height = SEARCHTEX_HEIGHT;
+    copy_source.PlacedFootprint.Footprint.RowPitch = kSearchRowPitch;
+    command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source,
+                                    nullptr);
+    D3D12_RESOURCE_BARRIER lut_barriers[2];
+    for (size_t i = 0; i < 2; ++i) {
+      lut_barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      lut_barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      lut_barriers[i].Transition.Subresource =
+          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      lut_barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      lut_barriers[i].Transition.StateAfter =
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    lut_barriers[0].Transition.pResource = smaa_area_texture_.Get();
+    lut_barriers[1].Transition.pResource = smaa_search_texture_.Get();
+    command_list->ResourceBarrier(2, lut_barriers);
+    smaa_luts_uploaded_ = true;
+  }
+
+  // Common state for the passes.
+  D3D12_VIEWPORT smaa_viewport;
+  smaa_viewport.TopLeftX = 0.0f;
+  smaa_viewport.TopLeftY = 0.0f;
+  smaa_viewport.Width = float(frontbuffer_width);
+  smaa_viewport.Height = float(frontbuffer_height);
+  smaa_viewport.MinDepth = 0.0f;
+  smaa_viewport.MaxDepth = 1.0f;
+  command_list->RSSetViewports(1, &smaa_viewport);
+  D3D12_RECT smaa_scissor;
+  smaa_scissor.left = 0;
+  smaa_scissor.top = 0;
+  smaa_scissor.right = LONG(frontbuffer_width);
+  smaa_scissor.bottom = LONG(frontbuffer_height);
+  command_list->RSSetScissorRects(1, &smaa_scissor);
+  command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  // (1/w, 1/h, w, h) - SMAA_RT_METRICS.
+  float smaa_rt_metrics[4] = {
+      1.0f / float(frontbuffer_width), 1.0f / float(frontbuffer_height),
+      float(frontbuffer_width), float(frontbuffer_height)};
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
+      paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
+      paint_context_.view_heap->GetGPUDescriptorHandleForHeapStart();
+  const float kSmaaClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  D3D12_RESOURCE_BARRIER smaa_barriers[2];
+  for (size_t i = 0; i < 2; ++i) {
+    smaa_barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    smaa_barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    smaa_barriers[i].Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  }
+
+  // Pass 1: edge detection (edges -> RT, draw, then edges -> SRV together
+  // with weights -> RT).
+  smaa_barriers[0].Transition.pResource =
+      paint_context_.smaa_edges_texture.Get();
+  smaa_barriers[0].Transition.StateBefore =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  smaa_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  command_list->ResourceBarrier(1, smaa_barriers);
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE edges_rtv = provider_.OffsetRTVDescriptor(
+        rtv_heap_start, PaintContext::kRTVIndexSmaaEdges);
+    command_list->OMSetRenderTargets(1, &edges_rtv, true, nullptr);
+    command_list->ClearRenderTargetView(edges_rtv, kSmaaClearColor, 0,
+                                        nullptr);
+    command_list->SetGraphicsRootSignature(smaa_root_signature_2_srvs_.Get());
+    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRootDescriptorTable(
+        1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
+                                          PaintContext::kViewIndexSmaaColor));
+    // Color (max per-channel delta) edge detection is a superset of luma -
+    // "both" is accepted as an alias since it would be identical output.
+    ID3D12PipelineState* smaa_edge_pipeline =
+        smaa_pipelines_[quality][kSmaaPassEdges].Get();
+    if ((cvars::postprocess_smaa_edge_detection == "color" ||
+         cvars::postprocess_smaa_edge_detection == "both") &&
+        smaa_edge_color_pipelines_[quality]) {
+      smaa_edge_pipeline = smaa_edge_color_pipelines_[quality].Get();
+    }
+    command_list->SetPipelineState(smaa_edge_pipeline);
+    command_list->DrawInstanced(3, 1, 0, 0);
+  }
+
+  // Pass 2: blend weight calculation.
+  smaa_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  smaa_barriers[0].Transition.StateAfter =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  smaa_barriers[1].Transition.pResource =
+      paint_context_.smaa_weights_texture.Get();
+  smaa_barriers[1].Transition.StateBefore =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  smaa_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  command_list->ResourceBarrier(2, smaa_barriers);
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE weights_rtv = provider_.OffsetRTVDescriptor(
+        rtv_heap_start, PaintContext::kRTVIndexSmaaWeights);
+    command_list->OMSetRenderTargets(1, &weights_rtv, true, nullptr);
+    command_list->ClearRenderTargetView(weights_rtv, kSmaaClearColor, 0,
+                                        nullptr);
+    command_list->SetGraphicsRootSignature(smaa_root_signature_3_srvs_.Get());
+    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRootDescriptorTable(
+        1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
+                                          PaintContext::kViewIndexSmaaEdges));
+    command_list->SetPipelineState(
+        smaa_pipelines_[quality][kSmaaPassWeights].Get());
+    command_list->DrawInstanced(3, 1, 0, 0);
+  }
+
+  // Pass 3: neighborhood blending into the SMAA output.
+  smaa_barriers[0].Transition.pResource =
+      paint_context_.smaa_weights_texture.Get();
+  smaa_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  smaa_barriers[0].Transition.StateAfter =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  smaa_barriers[1].Transition.pResource =
+      paint_context_.smaa_output_texture.Get();
+  smaa_barriers[1].Transition.StateBefore =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  smaa_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  command_list->ResourceBarrier(2, smaa_barriers);
+  {
+    D3D12_CPU_DESCRIPTOR_HANDLE output_rtv = provider_.OffsetRTVDescriptor(
+        rtv_heap_start, PaintContext::kRTVIndexSmaaOutput);
+    command_list->OMSetRenderTargets(1, &output_rtv, true, nullptr);
+    command_list->DiscardResource(paint_context_.smaa_output_texture.Get(),
+                                  nullptr);
+    command_list->SetGraphicsRootSignature(smaa_root_signature_2_srvs_.Get());
+    command_list->SetGraphicsRoot32BitConstants(0, 4, smaa_rt_metrics, 0);
+    command_list->SetGraphicsRootDescriptorTable(
+        1, provider_.OffsetViewDescriptor(view_heap_gpu_start,
+                                          PaintContext::kViewIndexSmaaColor));
+    command_list->SetPipelineState(
+        smaa_pipelines_[quality][kSmaaPassBlend].Get());
+    command_list->DrawInstanced(3, 1, 0, 0);
+  }
+
+  // Back to the steady state for use as the source of the scaling chain.
+  smaa_barriers[0].Transition.pResource =
+      paint_context_.smaa_output_texture.Get();
+  smaa_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  smaa_barriers[0].Transition.StateAfter =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  command_list->ResourceBarrier(1, smaa_barriers);
+
+  // One-time activity marker for diagnosing the configuration.
+  static bool smaa_logged = false;
+  if (!smaa_logged) {
+    smaa_logged = true;
+    XELOGI(
+        "D3D12Presenter: SMAA active (quality preset {}, {} edge detection), "
+        "{}x{}",
+        quality,
+        (cvars::postprocess_smaa_edge_detection == "color" ||
+         cvars::postprocess_smaa_edge_detection == "both") &&
+                smaa_edge_color_pipelines_[quality]
+            ? "color"
+            : "luma",
+        frontbuffer_width, frontbuffer_height);
+  }
+
+  return true;
 }
 
 }  // namespace d3d12

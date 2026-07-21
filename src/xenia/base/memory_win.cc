@@ -9,8 +9,30 @@
 
 #include "xenia/base/memory.h"
 
+#include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/platform_win.h"
+
+#if XE_PLATFORM_WINRT
+#include <fileapifromapp.h>  // CreateFileFromAppW for the guest swap file.
+#endif
+
+#if XE_PLATFORM_WINRT
+DEFINE_string(
+    winrt_guest_memory_swap_file, "",
+    "Xbox UWP: base path of the swap files to try backing the guest VIRTUAL "
+    "memory ranges with (e.g. \"D:\\\\xenia_guest_swap.bin\" - a second file "
+    "with a .1 suffix is created next to it, ~2 GB preallocated in total), or "
+    "empty (recommended) to keep everything on the standard pagefile-backed "
+    "section. EXPERIMENTAL AND KNOWN NOT TO WORK on current console OS "
+    "builds: the OS charges writable file-backed views against the app's "
+    "commit budget anyway (ERROR_NOT_ENOUGH_MEMORY on mapping / 1455 later), "
+    "so nothing is gained; the emulator detects this and automatically falls "
+    "back to the pagefile-backed section for everything.",
+    "Memory");
+#endif  // XE_PLATFORM_WINRT
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | \
                             WINAPI_PARTITION_SYSTEM | WINAPI_PARTITION_GAMES)
@@ -259,6 +281,108 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   return true;
 }
 
+#if XE_PLATFORM_WINRT
+// xbox-swap-inspired guest memory swapping. Backing the whole guest mapping
+// with ONE file-backed section fails on the console: the OS appears to charge
+// roughly the section size against the app's commit budget for EVERY writable
+// view (observed: the first 1 GB view of the 4.5 GB section maps, the second
+// fails with ERROR_NOT_ENOUGH_MEMORY at any base address, with ~5 GB free).
+// So instead only the two non-aliased guest virtual ranges are backed - each
+// by its own section over its own swap file sized exactly like the single
+// view it gets - while the aliased XEX/physical ranges stay on the
+// pagefile-backed SEC_RESERVE section (aliased views must share one section
+// anyway). This moves up to 2 GB of guest virtual heap commit (where game
+// allocations live) off the 5 GB budget.
+static bool last_mapping_used_guest_swap_file = false;
+static bool guest_memory_swap_file_disabled = false;
+// The two unique (non-aliased) ranges of the guest mapping; the file offset
+// and view length must match Memory's map_info entries exactly - MapFileView
+// substitutes the swap section only on an exact match for the guest mapping
+// handle.
+static const struct {
+  uint64_t file_offset;
+  size_t length;
+} kGuestSwapRanges[2] = {{0x00000000ull, 0x40000000},
+                         {0x40000000ull, 0x3F000000}};
+static HANDLE guest_swap_sections[2] = {nullptr, nullptr};
+// Whether the CURRENT view of each range actually comes from its swap section
+// (per-view fallback may leave a range on the pagefile-backed section) - the
+// heaps skip host commit only for genuinely file-backed ranges.
+static bool guest_swap_range_mapped[2] = {false, false};
+// The pagefile-backed guest mapping whose views the swap sections substitute
+// (also keeps the swap away from other CreateFileMappingHandle users - the
+// JIT code cache in particular).
+static FileMappingHandle guest_swap_main_mapping = kFileMappingHandleInvalid;
+
+bool LastFileMappingUsedGuestSwapFile() {
+  return last_mapping_used_guest_swap_file;
+}
+
+bool IsGuestMemoryRangeSwapBacked(uint64_t file_offset) {
+  for (size_t i = 0; i < xe::countof(kGuestSwapRanges); ++i) {
+    if (kGuestSwapRanges[i].file_offset == file_offset) {
+      return guest_swap_range_mapped[i];
+    }
+  }
+  return false;
+}
+
+void DisableGuestMemorySwapFile() {
+  guest_memory_swap_file_disabled = true;
+  for (auto& section : guest_swap_sections) {
+    if (section) {
+      CloseHandle(section);
+      section = nullptr;
+    }
+  }
+  for (auto& mapped : guest_swap_range_mapped) {
+    mapped = false;
+  }
+  guest_swap_main_mapping = kFileMappingHandleInvalid;
+}
+
+// Creates a section over a freshly truncated (the guest must see zeroed
+// memory), fully preallocated swap file covering one guest range. NOT sparse,
+// and the clusters are explicitly allocated: only fully guaranteed backing
+// storage lets writable views avoid the commit charge.
+static HANDLE CreateGuestSwapRangeSection(const std::filesystem::path& path,
+                                          size_t range_length, ULONG protect) {
+  HANDLE file =
+      CreateFileFromAppW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                         nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    XELOGW("Failed to create guest swap file {} (error {})",
+           xe::path_to_utf8(path), GetLastError());
+    return nullptr;
+  }
+  FILE_ALLOCATION_INFO allocation_info;
+  allocation_info.AllocationSize.QuadPart = LONGLONG(range_length);
+  SetFileInformationByHandle(file, FileAllocationInfo, &allocation_info,
+                             sizeof(allocation_info));
+  LARGE_INTEGER file_size;
+  file_size.QuadPart = LONGLONG(range_length);
+  if (!SetFilePointerEx(file, file_size, nullptr, FILE_BEGIN) ||
+      !SetEndOfFile(file)) {
+    XELOGW("Failed to size guest swap file {} to {} MB (error {})",
+           xe::path_to_utf8(path), range_length >> 20, GetLastError());
+    CloseHandle(file);
+    return nullptr;
+  }
+  // Unnamed - the name isn't needed for anything. The section holds its own
+  // reference to the file object, so the file handle is closed regardless of
+  // the outcome.
+  HANDLE mapping = CreateFileMappingFromApp(file, nullptr, protect,
+                                            ULONG64(range_length), nullptr);
+  CloseHandle(file);
+  if (!mapping) {
+    XELOGW("Failed to create a section over guest swap file {} (error {})",
+           xe::path_to_utf8(path), GetLastError());
+  }
+  return mapping;
+}
+#endif  // XE_PLATFORM_WINRT
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
                                           size_t length, PageAccess access,
                                           bool commit) {
@@ -270,6 +394,57 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
                             static_cast<DWORD>(length >> 32),
                             static_cast<DWORD>(length), full_path.c_str());
 #else
+#if XE_PLATFORM_WINRT
+  // The guest mapping (recognized by its size - the code cache and tests are
+  // far smaller) additionally gets the per-range swap sections; the returned
+  // mapping is always the pagefile-backed one, with MapFileView substituting
+  // the swap sections for the matching views (falling back per-view on
+  // failure).
+  if (length > kGuestSwapRanges[1].file_offset + kGuestSwapRanges[1].length &&
+      !commit) {
+    last_mapping_used_guest_swap_file = false;
+    if (!cvars::winrt_guest_memory_swap_file.empty() &&
+        !guest_memory_swap_file_disabled) {
+      bool swap_sections_created = true;
+      for (size_t i = 0; i < xe::countof(kGuestSwapRanges); ++i) {
+        if (guest_swap_sections[i]) {
+          CloseHandle(guest_swap_sections[i]);
+          guest_swap_sections[i] = nullptr;
+        }
+        std::filesystem::path range_path(
+            i ? cvars::winrt_guest_memory_swap_file + "." + std::to_string(i)
+              : cvars::winrt_guest_memory_swap_file);
+        guest_swap_sections[i] = CreateGuestSwapRangeSection(
+            range_path, kGuestSwapRanges[i].length,
+            ULONG(ToWin32ProtectFlags(access)));
+        if (!guest_swap_sections[i]) {
+          swap_sections_created = false;
+          break;
+        }
+      }
+      if (swap_sections_created) {
+        size_t swap_total = 0;
+        for (const auto& range : kGuestSwapRanges) {
+          swap_total += range.length;
+        }
+        XELOGI(
+            "Guest virtual memory ({} MB) will be backed by swap files at {} "
+            "- excluded from the app commit budget",
+            swap_total >> 20, cvars::winrt_guest_memory_swap_file);
+        last_mapping_used_guest_swap_file = true;
+      } else {
+        DisableGuestMemorySwapFile();
+      }
+    }
+    FileMappingHandle main_mapping = CreateFileMappingFromApp(
+        INVALID_HANDLE_VALUE, nullptr, ULONG(protect), ULONG64(length),
+        full_path.c_str());
+    guest_swap_main_mapping = last_mapping_used_guest_swap_file
+                                  ? main_mapping
+                                  : kFileMappingHandleInvalid;
+    return main_mapping;
+  }
+#endif  // XE_PLATFORM_WINRT
   return CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, ULONG(protect),
                                   ULONG64(length), full_path.c_str());
 #endif
@@ -277,6 +452,21 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
 
 void CloseFileMappingHandle(FileMappingHandle handle,
                             const std::filesystem::path& path) {
+#if XE_PLATFORM_WINRT
+  if (handle == guest_swap_main_mapping &&
+      guest_swap_main_mapping != kFileMappingHandleInvalid) {
+    for (auto& section : guest_swap_sections) {
+      if (section) {
+        CloseHandle(section);
+        section = nullptr;
+      }
+    }
+    for (auto& mapped : guest_swap_range_mapped) {
+      mapped = false;
+    }
+    guest_swap_main_mapping = kFileMappingHandleInvalid;
+  }
+#endif  // XE_PLATFORM_WINRT
   CloseHandle(handle);
 }
 
@@ -316,11 +506,77 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
   if (!placeholder) {
     return nullptr;
   }
+#if XE_PLATFORM_WINRT
+  // For the guest mapping, views of the non-aliased ranges come from the
+  // per-range swap-file sections when those are active. Falls back to the
+  // pagefile-backed section per-view on failure (reusing the placeholder).
+  if (handle == guest_swap_main_mapping &&
+      guest_swap_main_mapping != kFileMappingHandleInvalid) {
+    for (size_t i = 0; i < xe::countof(kGuestSwapRanges); ++i) {
+      if (!guest_swap_sections[i] ||
+          file_offset != kGuestSwapRanges[i].file_offset ||
+          length != kGuestSwapRanges[i].length) {
+        continue;
+      }
+      void* swap_mapping = MapViewOfFile3FromApp(
+          guest_swap_sections[i], process, placeholder, 0, length,
+          MEM_REPLACE_PLACEHOLDER, ULONG(ToWin32ProtectFlags(access)), nullptr,
+          0);
+      if (swap_mapping) {
+        guest_swap_range_mapped[i] = true;
+        static bool swap_view_logged[xe::countof(kGuestSwapRanges)] = {};
+        if (!swap_view_logged[i]) {
+          swap_view_logged[i] = true;
+          XELOGI(
+              "Guest memory range at file offset 0x{:X} ({} MB) mapped from "
+              "its swap file",
+              uint64_t(file_offset), uint64_t(length) >> 20);
+        }
+        return swap_mapping;
+      }
+      // A failed swap view means the OS charges commit for writable
+      // file-backed views after all (observed on the console: even a 1 GB
+      // view of a 1 GB section is refused with ERROR_NOT_ENOUGH_MEMORY, and a
+      // previously mapped swap view correlates with commit exhaustion - err
+      // 1455 on physical heap commits later). A partially swap-backed guest
+      // both fails the technique AND steals commit, so disable the swap
+      // entirely and fail this whole mapping pass - the caller retries at the
+      // next base address with everything on the pagefile-backed section.
+      XELOGW(
+          "MapFileView: swap section view (offset=0x{:X}, length=0x{:X}) "
+          "failed (err {}) - the OS charges commit for file-backed views; "
+          "disabling the guest memory swap files and remapping from the "
+          "pagefile-backed section only",
+          uint64_t(file_offset), uint64_t(length), GetLastError());
+      DisableGuestMemorySwapFile();
+      VirtualFree(placeholder, 0, MEM_RELEASE);
+      return nullptr;
+    }
+  }
+#endif  // XE_PLATFORM_WINRT
   void* mapping = MapViewOfFile3FromApp(
       handle, process, placeholder, ULONG64(file_offset), length,
       MEM_REPLACE_PLACEHOLDER, ULONG(ToWin32ProtectFlags(access)), nullptr, 0);
   if (!mapping) {
-    VirtualFree(placeholder, length, MEM_RELEASE);
+    // Capped: the guest mapping probes dozens of base addresses in a loop and
+    // the failure reason is the same at each of them, but a few occurrences
+    // are needed to also see the swap-file -> pagefile fallback pass; the
+    // error code is essential for telling why a section can't be view-mapped
+    // at all (e.g. commit charge for views of a not-fully-allocated file).
+    static int map_view_failures_logged = 0;
+    if (map_view_failures_logged < 4) {
+      ++map_view_failures_logged;
+      XELOGW(
+          "MapFileView: MapViewOfFile3FromApp(base={}, length=0x{:X}, "
+          "offset=0x{:X}, protect=0x{:X}) failed (err {})",
+          base_address, uint64_t(length), uint64_t(file_offset),
+          uint32_t(ToWin32ProtectFlags(access)), GetLastError());
+    }
+    // MEM_RELEASE requires a zero size - with `length` the call fails with
+    // ERROR_INVALID_PARAMETER and the placeholder leaks, permanently blocking
+    // this base address for any later mapping attempt (this is how a failed
+    // swap-file mapping pass used to also break the pagefile fallback).
+    VirtualFree(placeholder, 0, MEM_RELEASE);
     return nullptr;
   }
   return mapping;

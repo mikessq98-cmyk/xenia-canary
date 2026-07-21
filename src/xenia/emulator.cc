@@ -87,6 +87,7 @@ DEFINE_bool(allow_game_relative_writes, false,
             "General");
 
 DECLARE_bool(allow_plugins);
+DECLARE_bool(store_shaders_blocking_load);
 
 DEFINE_int32(priority_class, 0,
              "Forces Xenia to use different process priority than default one. "
@@ -1750,15 +1751,18 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     }
   }
 
-  // Initialize shader storage asynchronously - pipeline compilation happens in
-  // background while the game goes through its normal startup (loading screens,
-  // intro videos, etc.). With async_shader_compilation enabled, draws are
-  // skipped until pipelines are ready, so this is safe. By the time actual
-  // gameplay starts, most cached pipelines should be compiled.
+  // Initialize shader storage. By default this is asynchronous - pipeline
+  // compilation happens in the background while the game goes through its
+  // normal startup (loading screens, intro videos), and draws are skipped until
+  // pipelines are ready. With store_shaders_blocking_load the stored pipelines
+  // are all compiled up front (blocking) before the game starts, trading a
+  // longer initial load for no in-game stutter / GPU spike - preferable on
+  // fixed hardware where the stored cache matches the game exactly.
   if (graphics_system_) {
+    const bool blocking_shader_load = cvars::store_shaders_blocking_load;
     on_shader_storage_initialization(true);
     graphics_system_->InitializeShaderStorage(
-        cache_root_, title_id_.value(), false,
+        cache_root_, title_id_.value(), blocking_shader_load,
         [this]() { on_shader_storage_initialization(false); });
   }
 

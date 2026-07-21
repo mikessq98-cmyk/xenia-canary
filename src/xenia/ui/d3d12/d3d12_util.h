@@ -93,6 +93,16 @@ void CreateBufferTypedUAV(ID3D12Device* device,
                           ID3D12Resource* buffer, DXGI_FORMAT format,
                           uint32_t num_elements, uint64_t first_element = 0);
 
+// Calls ID3D12Device::CreateGraphicsPipelineState under a structured-exception
+// guard: the driver's shader compiler (newbe_xs.dll on the Xbox UWP runtime)
+// can hard-crash (access violation) on shaders that desktop compilers accept.
+// If it does, the exception code is stored to exception_code_out (0 on a
+// normal return, even a failing one) and E_FAIL is returned - the caller can
+// treat the pipeline as unsupported instead of the whole process dying.
+HRESULT CreateGraphicsPipelineStateGuarded(
+    ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid, void** pipeline_out, DWORD* exception_code_out);
+
 }  // namespace util
 }  // namespace d3d12
 }  // namespace ui

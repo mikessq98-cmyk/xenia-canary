@@ -48,7 +48,12 @@ class PPCFrontend {
   PPCBuiltins* builtins() { return &builtins_; }
 
   bool DeclareFunction(GuestFunction* function);
-  bool DefineFunction(GuestFunction* function, uint32_t debug_info_flags);
+  // out_of_memory_out, if not null, receives whether the definition failed
+  // only because the host ran out of memory - such a failure is transient, so
+  // the caller should leave the function undefined rather than marking it
+  // permanently failed.
+  bool DefineFunction(GuestFunction* function, uint32_t debug_info_flags,
+                      bool* out_of_memory_out = nullptr);
 
  private:
   Processor* processor_;

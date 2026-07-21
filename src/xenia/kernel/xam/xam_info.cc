@@ -63,6 +63,17 @@ DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kStub);
 dword_result_t XamGetStagingMode_entry() { return cvars::staging_mode; }
 DECLARE_XAM_EXPORT1(XamGetStagingMode, kNone, kStub);
 
+// Background downloads are never active in the emulator - report the "off"
+// mode and accept whatever mode the game sets (Max Payne 3 polls these two
+// every frame, flooding the log with undefined-extern errors otherwise).
+dword_result_t XamBackgroundDownloadGetMode_entry() { return 0; }
+DECLARE_XAM_EXPORT1(XamBackgroundDownloadGetMode, kNone, kStub);
+
+dword_result_t XamBackgroundDownloadSetMode_entry(dword_t mode) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamBackgroundDownloadSetMode, kNone, kStub);
+
 // Empty stub schema binary.
 uint8_t schema_bin[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
