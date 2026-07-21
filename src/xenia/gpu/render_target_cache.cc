@@ -585,6 +585,34 @@ void RenderTargetCache::MarkLastUpdateRenderTargetsUsedInSubmission(
   }
 }
 
+uint64_t RenderTargetCache::GetRenderTargetsUsedHeightMemory() const {
+  uint64_t used_height_bytes = 0;
+  for (const auto& render_target_pair : render_targets_) {
+    const RenderTarget* render_target = render_target_pair.second;
+    if (!render_target) {
+      continue;
+    }
+    uint64_t bytes = render_target->GetHostMemoryBytes();
+    if (!bytes) {
+      continue;
+    }
+    RenderTargetKey key = render_target->key();
+    uint32_t full_height =
+        GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
+    if (!full_height) {
+      continue;
+    }
+    uint32_t used_height = std::min(render_target->max_used_height(),
+                                    full_height);
+    // Height 0 means it has only ever been a transfer destination - keep it
+    // whole rather than pretending it costs nothing.
+    used_height_bytes +=
+        used_height ? (bytes * used_height + full_height - 1) / full_height
+                    : bytes;
+  }
+  return used_height_bytes;
+}
+
 uint64_t RenderTargetCache::TrimUnusedRenderTargets(
     uint64_t bytes_to_free, uint64_t completed_submission,
     uint64_t min_idle_submissions, bool evict_owners) {
@@ -957,6 +985,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       if (!render_target) {
         return false;
       }
+      // height_used is what this draw actually reaches - record the high water
+      // mark so the cost of the full-period allocation can be quantified.
+      render_target->SetMaxUsedHeightAtLeast(height_used);
       rts[rt_bit_index] = render_target;
     }
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;

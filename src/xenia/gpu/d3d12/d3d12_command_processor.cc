@@ -242,6 +242,10 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
       render_target_cache_
           ? render_target_cache_->GetHostMemoryRenderTargetCount()
           : 0;
+  uint64_t render_targets_used_height_mb =
+      render_target_cache_
+          ? (render_target_cache_->GetRenderTargetsUsedHeightMemory() >> 20)
+          : 0;
   uint64_t gpu_budget = 0, gpu_usage = 0;
   bool have_gpu_budget =
       GetD3D12Provider().QueryVideoMemoryUsage(gpu_budget, gpu_usage);
@@ -259,12 +263,12 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
         gpu_usage > accounted_bytes ? (gpu_usage - accounted_bytes) >> 20 : 0;
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
-        "resolve {} MB, render targets {} MB ({} cached), shaders(dxbc) {} MB "
-        "| GPU budget {}/{} MB used, {} MB elsewhere (presenter, pools, PSOs, "
-        "driver)",
+        "resolve {} MB, render targets {} MB ({} cached, {} MB at the heights "
+        "actually drawn), shaders(dxbc) {} MB | GPU budget {}/{} MB used, {} "
+        "MB elsewhere (presenter, pools, PSOs, driver)",
         shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, shaders_mb, gpu_usage >> 20, gpu_budget >> 20,
-        other_mb);
+        render_target_count, render_targets_used_height_mb, shaders_mb,
+        gpu_usage >> 20, gpu_budget >> 20, other_mb);
   } else {
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "

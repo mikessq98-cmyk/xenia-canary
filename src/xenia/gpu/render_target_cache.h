@@ -205,6 +205,12 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(
       uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // Sums, over the live host render targets, the fraction of each one's memory
+  // that corresponds to the height draws have actually needed. The gap against
+  // the real usage is what allocating render targets to the height in use
+  // (growing on demand) could save - measured before it is built.
+  uint64_t GetRenderTargetsUsedHeightMemory() const;
+
   // Releases host render targets that hold no EDRAM data anymore and that the
   // GPU finished with at least min_idle_submissions ago, least recently used
   // first, until bytes_to_free has been freed (or nothing is left to release).
@@ -358,6 +364,17 @@ class RenderTargetCache {
     // track it (0 = unknown, which excludes it from memory-pressure trimming).
     virtual uint64_t GetHostMemoryBytes() const { return 0; }
 
+    // The greatest height, in host pixels, any draw has actually needed from
+    // this render target. Every host render target is allocated tall enough to
+    // cover a whole EDRAM addressing period (the guest may address any of it),
+    // but games render to a fraction of that - the difference is what a
+    // height-on-demand allocation would save, and is reported in the [MEM]
+    // telemetry before anything is built on it.
+    uint32_t max_used_height() const { return max_used_height_; }
+    void SetMaxUsedHeightAtLeast(uint32_t height) {
+      max_used_height_ = std::max(max_used_height_, height);
+    }
+
     // Submission the render target was last bound in - a render target the GPU
     // has finished with, and that owns no EDRAM data, may be released to free
     // its host memory (see TrimUnusedRenderTargets).
@@ -372,6 +389,7 @@ class RenderTargetCache {
    private:
     RenderTargetKey key_;
     uint64_t last_use_submission_ = 0;
+    uint32_t max_used_height_ = 0;
   };
 
   struct Transfer {
