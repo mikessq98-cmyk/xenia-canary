@@ -168,6 +168,13 @@ class KernelState {
   ~KernelState();
 
   static KernelState* shared();
+  // Reports the guest stack size of every live guest thread. For memory
+  // telemetry - a title with dozens of threads spends a real part of the
+  // budget on their stacks alone.
+  void ForEachGuestThreadStack(
+      const std::function<void(uint32_t stack_size)>& callback);
+
+
 
   Emulator* emulator() const { return emulator_; }
   Memory* memory() const { return memory_; }

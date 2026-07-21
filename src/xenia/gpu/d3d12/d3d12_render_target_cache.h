@@ -211,12 +211,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // released (it is recreated if the game comes back to it, so this only needs
   // to be long enough to not thrash on alternating frames).
   static constexpr uint64_t kRenderTargetIdleSubmissions = 60;
-  // Size above which render targets the game has long stopped using are
-  // released even with memory to spare, and how long "long" is (~10 seconds of
-  // gameplay). Housekeeping only ever releases targets holding no rendering,
-  // so the worst it can cost is recreating one.
-  static constexpr uint64_t kHousekeepingBytes = 768ULL << 20;
-  static constexpr uint64_t kRenderTargetHousekeepingIdleSubmissions = 600;
+  // Releasing long-unused render targets that hold no rendering, even with
+  // memory to spare, is driven by d3d12_render_target_cache_housekeeping_mb
+  // and d3d12_render_target_cache_idle_submissions.
+  // Size at which, with the host also short on memory, render targets holding
+  // the game's rendering are released too rather than letting the emulator run
+  // out of memory.
+  static constexpr uint64_t kCriticalBytes = 1280ULL << 20;
   // Minimum spacing between trims, and the spacing after a trim that freed
   // almost nothing - when the pressure is structural (the live render targets
   // themselves don't fit), retrying every submission only costs recreations.

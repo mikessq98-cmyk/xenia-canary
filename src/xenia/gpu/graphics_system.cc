@@ -16,6 +16,9 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/kernel/kernel_state.h"
@@ -167,6 +170,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                         Clock::QueryHostTickFrequency()) {
                   last_memory_stats_time = now;
                   memory_->LogMemoryStatistics();
+                  LogHostCpuMemoryStatistics();
                   command_processor_->LogHostMemoryStatistics();
                 }
               }
@@ -251,6 +255,39 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   }
 
   return X_STATUS_SUCCESS;
+}
+
+void GraphicsSystem::LogHostCpuMemoryStatistics() {
+  // The CPU side of the budget: what the emulator itself costs on top of the
+  // guest's memory and the GPU caches. Without this the difference between the
+  // process commit and everything accounted for is just an unexplained
+  // gigabyte.
+  uint64_t jit_used_mb = 0, jit_reserved_mb = 0;
+  if (processor_) {
+    const cpu::backend::Backend* backend = processor_->backend();
+    if (backend) {
+      const cpu::backend::CodeCache* code_cache = backend->code_cache();
+      if (code_cache) {
+        jit_used_mb = uint64_t(code_cache->used_size()) >> 20;
+        jit_reserved_mb = uint64_t(code_cache->total_size()) >> 20;
+      }
+    }
+  }
+  size_t guest_thread_count = 0;
+  uint64_t guest_thread_stacks_mb = 0;
+  if (kernel_state_) {
+    kernel_state_->ForEachGuestThreadStack(
+        [&guest_thread_count, &guest_thread_stacks_mb](uint32_t stack_size) {
+          ++guest_thread_count;
+          guest_thread_stacks_mb += stack_size;
+        });
+    guest_thread_stacks_mb >>= 20;
+  }
+  XELOGI(
+      "[MEM] emulator: JIT code {} MB (of {} MB reserved), {} guest threads "
+      "holding {} MB of stacks",
+      jit_used_mb, jit_reserved_mb, guest_thread_count,
+      guest_thread_stacks_mb);
 }
 
 void GraphicsSystem::Shutdown() {

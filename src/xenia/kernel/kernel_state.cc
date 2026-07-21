@@ -108,6 +108,18 @@ KernelState::~KernelState() {
 
 KernelState* KernelState::shared() { return shared_kernel_state_; }
 
+void KernelState::ForEachGuestThreadStack(
+    const std::function<void(uint32_t stack_size)>& callback) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& thread_pair : threads_by_id_) {
+    XThread* thread = thread_pair.second;
+    if (!thread || !thread->is_guest_thread()) {
+      continue;
+    }
+    callback(thread->creation_params()->stack_size);
+  }
+}
+
 uint32_t KernelState::title_id() const {
   if (!executable_module_) {
     return 0;

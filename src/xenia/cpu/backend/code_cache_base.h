@@ -116,6 +116,7 @@ class CodeCacheBase : public CodeCache {
     return kGeneratedCodeExecuteBase;
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
+  size_t used_size() const override { return generated_code_offset_; }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
 

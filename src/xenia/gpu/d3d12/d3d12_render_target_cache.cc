@@ -57,6 +57,25 @@ DEFINE_int32(
     "costs nothing when the host is running short of memory.",
     "D3D12");
 
+DEFINE_int32(
+    d3d12_render_target_cache_housekeeping_mb, 512,
+    "Size, in megabytes, above which host render targets the game has stopped "
+    "using are released even when the host has memory to spare. Only targets "
+    "that hold no rendering at all are touched, so the worst this can cost is "
+    "recreating one later. Lower to keep the cache smaller (more recreations, "
+    "more small hitches), raise to keep more of it. 0 disables it - trimming "
+    "then only happens when the host is already short on memory.",
+    "D3D12");
+
+DEFINE_int32(
+    d3d12_render_target_cache_idle_submissions, 300,
+    "How long a host render target must go unused before it may be released, "
+    "in submissions (roughly a few per frame). Lower reclaims memory sooner "
+    "and recreates more often - the recreation is what is felt as a hitch, so "
+    "this is the knob to raise if releasing render targets stutters, and to "
+    "lower if the cache grows faster than it is trimmed.",
+    "D3D12");
+
 DEFINE_bool(
     native_stencil_value_output_d3d12_intel, false,
     "Allow stencil reference output usage on Direct3D 12 on Intel GPUs - not "
@@ -1231,14 +1250,29 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
       // Free the deficit plus a margin, so this doesn't run every submission.
       bytes_to_free = kHostMemoryTrimThreshold - host_memory_left +
                       kHostMemoryTrimExtra;
-    } else if (resident_bytes > kHousekeepingBytes) {
+      // Last resort: when the render targets alone are this big and the host
+      // is still short, the ones holding no rendering have already been
+      // released and there is nothing else left to give. Releasing targets
+      // that DO hold rendering costs a surface coming back empty for a frame;
+      // not releasing them costs the emulator (measured: a title sitting at
+      // 2098 MB across 35 targets, every one of them holding EDRAM data,
+      // trimming nothing and dying of exhaustion).
+      if (resident_bytes > kCriticalBytes) {
+        evict_owners = true;
+      }
+    } else if (cvars::d3d12_render_target_cache_housekeeping_mb > 0 &&
+               resident_bytes >
+                   (uint64_t(cvars::d3d12_render_target_cache_housekeeping_mb)
+                    << 20)) {
       // Not under pressure - but render targets the game stopped using long
       // ago cost nothing to release and everything to keep: a game that walked
       // through several surface configurations was seen holding 2 GB of them
       // while the host still had just enough memory free to never trigger the
       // pressure path, and then died of exhaustion anyway. Only long-idle ones
       // that hold no rendering are touched here.
-      bytes_to_free = resident_bytes - kHousekeepingBytes;
+      bytes_to_free =
+          resident_bytes -
+          (uint64_t(cvars::d3d12_render_target_cache_housekeeping_mb) << 20);
       housekeeping_only = true;
     }
 #else
@@ -1266,11 +1300,24 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
   // sure nothing references them on the device either.
   uint64_t freed_bytes = TrimUnusedRenderTargets(
       bytes_to_free, command_processor_.GetCompletedSubmission(),
-      housekeeping_only ? kRenderTargetHousekeepingIdleSubmissions
-                        : kRenderTargetIdleSubmissions,
+      housekeeping_only
+          ? uint64_t(std::max(1, cvars::d3d12_render_target_cache_idle_submissions))
+          : kRenderTargetIdleSubmissions,
       evict_owners);
   if (freed_bytes >= kRenderTargetTrimUselessBytes) {
     render_target_trim_interval_ = kRenderTargetTrimIntervalSubmissions;
+    if (evict_owners && cvars::d3d12_render_target_cache_max_mb <= 0) {
+      static bool critical_logged = false;
+      if (!critical_logged) {
+        critical_logged = true;
+        XELOGW(
+            "D3D12RenderTargetCache: {} MB of render targets with the host "
+            "nearly out of memory - releasing some that still hold the game's "
+            "rendering (a surface may briefly come back empty; this is what "
+            "keeps the emulator alive)",
+            resident_bytes >> 20);
+      }
+    }
     XELOGI(
         "D3D12RenderTargetCache: released {} MB of unused host render targets "
         "({} MB left resident{})",

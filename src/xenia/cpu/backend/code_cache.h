@@ -28,6 +28,9 @@ class CodeCache {
   virtual const std::filesystem::path& file_name() const = 0;
   virtual uintptr_t execute_base_address() const = 0;
   virtual size_t total_size() const = 0;
+  // Bytes of the code cache actually filled with generated code - the reserved
+  // total says nothing about what the title has cost so far.
+  virtual size_t used_size() const = 0;
 
   // Finds a function based on the given host PC (that may be within a
   // function).

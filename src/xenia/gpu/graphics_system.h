@@ -113,6 +113,11 @@ class GraphicsSystem {
 
   Memory* memory_ = nullptr;
   cpu::Processor* processor_ = nullptr;
+  // Logs the emulator's own CPU-side memory (JIT code, guest thread stacks) -
+  // the part of the process that is neither the guest's memory nor the GPU
+  // caches.
+  void LogHostCpuMemoryStatistics();
+
   kernel::KernelState* kernel_state_ = nullptr;
   ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<ui::GraphicsProvider> provider_;
