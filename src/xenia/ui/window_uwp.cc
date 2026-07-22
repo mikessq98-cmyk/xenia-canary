@@ -267,11 +267,31 @@ void UWPWindow::RequestPaintImpl() {
   // be called from the guest-output refresh (GPU) thread, so we must never call
   // OnPaint() inline here. Mirror Win32 by marshaling a coalesced paint onto the
   // UI thread through the windowed-app context's pending-function queue.
+  // While waiting for the system to put the on-screen keyboard up, thin the
+  // paints out. Every paint occupies the UI thread until the next vsync, and
+  // the keyboard needs that same thread to appear - a dialog repainting every
+  // frame (dialogs drive their own repaints through the presenter, so the
+  // paint-driver timer's own backoff doesn't cover them) is exactly why the
+  // keyboard used to arrive only once the dialog had closed and the UI thread
+  // was free again.
+  if (keyboard_wanted_.load(std::memory_order_relaxed) &&
+      !keyboard_visible_.load(std::memory_order_relaxed) &&
+      !keyboard_dismissed_by_user_.load(std::memory_order_relaxed)) {
+    int64_t now_ms =
+        int64_t(winrt::clock::now().time_since_epoch().count() / 10000);
+    if (now_ms - last_paint_ms_.load(std::memory_order_relaxed) <
+        kKeyboardWaitPaintIntervalMs) {
+      return;
+    }
+  }
   if (paint_pending_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
   if (!app_context().CallInUIThreadDeferred([this]() {
         paint_pending_.store(false, std::memory_order_release);
+        last_paint_ms_.store(
+            int64_t(winrt::clock::now().time_since_epoch().count() / 10000),
+            std::memory_order_relaxed);
         try {
           OnPaint();
         } catch (const winrt::hresult_error& e) {
@@ -467,10 +487,13 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
                  const winrt::Windows::UI::ViewManagement::Core::
                      CoreInputViewHidingEventArgs&) {
             keyboard_visible_ = false;
-            // A dialog that still wants the keyboard re-requests it from its
-            // next frame; make sure a frame happens.
-            NoteInputActivity();
-            RequestPaint();
+            // If the keyboard went away while this code still wanted it on
+            // screen, the user closed it themselves - and that has to win.
+            // Asking for it again here is what made it impossible to close:
+            // every dismissal was answered with another show request.
+            if (keyboard_wanted_) {
+              keyboard_dismissed_by_user_ = true;
+            }
           });
       keyboard_visibility_tracked_ = true;
       return;
@@ -641,15 +664,21 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
 
 void UWPWindow::ShowOnScreenKeyboard() {
   // Called every frame from a dialog's draw while its text field should be
-  // editable, which is what makes this reliable: a transient refusal, or a
-  // system-side dismissal, is retried on a later frame.
+  // editable, which is what makes this reliable: a transient refusal is
+  // retried on a later frame. A dismissal by the user is NOT a transient
+  // refusal - it stands until the dialog gives the keyboard up and asks
+  // again.
   explicit_keyboard_hold_ = true;
+  if (keyboard_dismissed_by_user_) {
+    return;
+  }
   RequestOnScreenKeyboardState(true);
 }
 
 void UWPWindow::HideOnScreenKeyboard() {
-  bool had_hold = explicit_keyboard_hold_;
-  explicit_keyboard_hold_ = false;
+  bool had_hold = explicit_keyboard_hold_.exchange(false);
+  // The dialog is done with the keyboard - a later one starts from scratch.
+  keyboard_dismissed_by_user_ = false;
   if (!had_hold && !keyboard_visible_ && !keyboard_wanted_) {
     // Nothing to do - avoid queueing a hide every frame from the drawer's
     // no-dialogs safety net.
@@ -668,6 +697,13 @@ void UWPWindow::UpdateOnScreenKeyboard() {
   // which ImGui context is current here. This is what serves ImGui text fields
   // that don't manage the keyboard themselves - the settings editor above all.
   const bool want = imgui_wants_text_input();
+  if (!want) {
+    // Nothing wants text input anymore, so a keyboard the user closed earlier
+    // is forgotten - activating a field again brings it back.
+    keyboard_dismissed_by_user_ = false;
+  } else if (keyboard_dismissed_by_user_) {
+    return;
+  }
   if (want == keyboard_visible_ && !keyboard_request_pending_) {
     return;
   }

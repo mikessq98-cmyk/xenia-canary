@@ -105,6 +105,12 @@ class UWPWindow final : public Window {
   // WantTextInput path must not interfere. Set from wherever the dialogs are
   // drawn, read on the UI thread.
   std::atomic<bool> explicit_keyboard_hold_{false};
+  // Set when the system hid the keyboard while this code still wanted it -
+  // i.e. the user closed it. Until whatever wanted it gives up (the text field
+  // is deactivated, or the dialog closes), it is not asked for again; without
+  // this the dismissal was immediately answered with another show request and
+  // the keyboard could not be closed at all.
+  std::atomic<bool> keyboard_dismissed_by_user_{false};
   // Set by input handlers, consumed by the paint-driver timer.
   std::atomic<bool> input_activity_{false};
   // The following are touched only on the timer thread.
@@ -127,6 +133,10 @@ class UWPWindow final : public Window {
   // so only one OnPaint is marshaled to the UI thread at a time, mirroring how
   // Win32 InvalidateRect collapses into a single WM_PAINT.
   std::atomic<bool> paint_pending_{false};
+  // When the last paint ran, and how far apart paints are kept while waiting
+  // for the on-screen keyboard to appear (see RequestPaintImpl).
+  std::atomic<int64_t> last_paint_ms_{0};
+  static constexpr int64_t kKeyboardWaitPaintIntervalMs = 50;
   bool input_wired_ = false;
   // Written on the UI thread (system visibility events / the apply call), read
   // by the paint-driver timer thread as well.
