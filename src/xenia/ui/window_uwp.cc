@@ -496,6 +496,9 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
             }
           });
       keyboard_visibility_tracked_ = true;
+      XELOGI(
+          "UWPWindow: on-screen keyboard visibility tracked through "
+          "CoreInputView");
       return;
     }
   } catch (const winrt::hresult_error& e) {
@@ -522,15 +525,24 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
                  const winrt::Windows::UI::ViewManagement::
                      InputPaneVisibilityEventArgs&) {
             keyboard_visible_ = false;
-            NoteInputActivity();
-            RequestPaint();
+            // Same as in the CoreInputView path: a keyboard that goes away
+            // while this code still wants it was closed by the user, and must
+            // not be asked for again until the reason to show it is gone.
+            if (keyboard_wanted_) {
+              keyboard_dismissed_by_user_ = true;
+            }
           });
       keyboard_visibility_tracked_ = true;
+      XELOGI(
+          "UWPWindow: on-screen keyboard visibility tracked through InputPane");
     }
   } catch (...) {
+  }
+  if (!keyboard_visibility_tracked_) {
     XELOGW(
         "UWPWindow: no on-screen keyboard visibility events available - the "
-        "keyboard state is tracked blindly");
+        "keyboard state is tracked blindly (it can't be told that the user "
+        "closed it)");
   }
 }
 
