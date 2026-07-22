@@ -581,6 +581,13 @@ class PipelineCache {
   // Counts how many EndSubmission calls until the next memory-pressure check
   // (the GlobalMemoryStatusEx query is not worth doing every submission).
   uint32_t memory_pressure_check_counter_ = 0;
+  // Host memory below which translated shader bytecode is given up, and the
+  // amount that has to be resident for doing so to be worth the retranslation
+  // it costs. Both are deliberately far from where a title that fits settles -
+  // releasing a couple of megabytes over and over is all cost and no headroom.
+  static constexpr uint64_t kMemoryPressureThreshold = UINT64_C(512) << 20;
+  static constexpr uint64_t kMemoryPressureWorthReleasingBytes = UINT64_C(32)
+                                                                << 20;
   // Nonzero while TranslateShadersForStorage is running on the loader
   // thread(s) - the memory-pressure release must not free binaries out from
   // under an in-progress storage translation.

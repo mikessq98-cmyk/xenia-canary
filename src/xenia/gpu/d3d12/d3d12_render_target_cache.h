@@ -35,6 +35,8 @@
 #include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
+DECLARE_int32(d3d12_render_target_max_height);
+
 namespace xe {
 namespace gpu {
 namespace d3d12 {
@@ -145,7 +147,23 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
   }
   uint32_t GetMaxRenderTargetHeight() const override {
-    return D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    uint32_t host_limit = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    // Every host render target is allocated tall enough to cover a whole EDRAM
+    // addressing period for its pitch, because the guest may address any of it
+    // - up to 8192 guest rows for a narrow one (a 160x8192 render target has
+    // been seen in the wild, 21 MB of it at a 2x2 draw resolution scale for a
+    // strip 160 pixels wide). Games render to a small fraction of that, and
+    // this is by far the largest host allocation on a memory-constrained
+    // target. The common code already clamps the height to whatever this
+    // returns, keeping every rectangle, transfer and ownership range
+    // consistent with it, so lowering it is enough - at the cost of the bottom
+    // of a taller surface not being rendered, which is why it's opt-in.
+    if (cvars::d3d12_render_target_max_height > 0) {
+      host_limit = std::min(host_limit,
+                            uint32_t(cvars::d3d12_render_target_max_height) *
+                                draw_resolution_scale_y());
+    }
+    return host_limit;
   }
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;

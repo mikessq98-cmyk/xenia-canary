@@ -41,6 +41,27 @@
 #endif
 
 DEFINE_int32(
+    d3d12_render_target_max_height, 0,
+    "Maximum height, in GUEST pixel rows, of a host render target. Direct3D "
+    "12 only.\n"
+    "A host render target has to cover a whole EDRAM addressing period for "
+    "its pitch, because the guest may address any of it - which for a narrow "
+    "one means up to 8192 rows (a 160x8192 target really does get created, "
+    "costing 21 MB at a 2x2 draw resolution scale for a strip 160 pixels "
+    "wide). Games render to a small fraction of that, and render targets are "
+    "by far the largest host allocation at a resolution scale - two thirds of "
+    "the GPU memory in the titles measured.\n"
+    "Capping the height is the one lever that shrinks them, and the emulator "
+    "already clamps everything else (rectangles, transfers, ownership ranges) "
+    "to whatever height it ends up with, so the result stays consistent. What "
+    "it costs is the bottom of any surface taller than the cap not being "
+    "rendered - so it is off by default. 1024 is generous for a 720p console "
+    "and roughly halves the memory the cache needs; lower it further only if "
+    "the game still doesn't fit.\n"
+    "0 (the default) means no cap beyond what the guest and the host allow.",
+    "D3D12");
+
+DEFINE_int32(
     d3d12_render_target_cache_max_mb, 0,
     "Budget, in megabytes, for cached host render targets. Each host render "
     "target spans a whole EDRAM addressing period, so at a draw resolution "

@@ -931,14 +931,21 @@ void PipelineCache::EndSubmission() {
   // The binding limit on Xbox is the COMMIT charge (ullAvailPageFile), NOT
   // free physical RAM (ullAvailPhys): telemetry shows allocations fail with
   // E_OUTOFMEMORY once commit-free drops to ~750 MB while ullAvailPhys still
-  // reports ~1.8 GB free, so watching ullAvailPhys never fired. Trigger with a
-  // 1 GB commit-free margin so the release happens BEFORE the wall.
+  // reports ~1.8 GB free, so watching ullAvailPhys never fired.
+  // Both conditions matter. The margin has to be BELOW where a title that fits
+  // settles, or the release runs forever: with the render target height capped,
+  // Forza sits at 750-900 MB free, and a 1 GB margin fired 18 times in a
+  // session, each time dropping over a hundred translations worth 0-2 MB and
+  // buying nothing but the retranslation stutter. And there is no point
+  // releasing at all unless enough is resident to matter.
   if (cvars::d3d12_release_shader_translations_on_memory_pressure &&
       ++memory_pressure_check_counter_ >= 64) {
     memory_pressure_check_counter_ = 0;
     MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
     if (GlobalMemoryStatusEx(&memory_status) &&
-        memory_status.ullAvailPageFile < (UINT64_C(1024) << 20)) {
+        memory_status.ullAvailPageFile < kMemoryPressureThreshold &&
+        translated_shader_bytes_.load(std::memory_order_relaxed) >=
+            kMemoryPressureWorthReleasingBytes) {
       ReleaseTranslationsUnderMemoryPressure(
           uint64_t(memory_status.ullAvailPageFile));
     }
