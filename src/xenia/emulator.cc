@@ -32,6 +32,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -50,6 +51,9 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/memory.h"
 #include "xenia/ui/file_picker.h"
+#if XE_PLATFORM_WINRT
+#include "xenia/ui/file_picker_uwp.h"
+#endif
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/imgui_host_notification.h"
@@ -1248,6 +1252,47 @@ bool Emulator::RestoreFromFile(const std::filesystem::path& path) {
 const std::filesystem::path Emulator::GetNewDiscPath(
     std::string window_message) {
   std::filesystem::path path = "";
+
+#if XE_PLATFORM_WINRT
+  // The synchronous picker is a no-op on UWP (it is async and UI-thread
+  // affine - see file_picker_uwp.cc), so this used to hand the caller an empty
+  // path and a two-disc title would sit forever waiting for a disc that was
+  // never mounted. This runs on the guest thread that called XamSwapDisc, so
+  // it can wait for the async pick - what must not be blocked is the UI
+  // thread, which is where the picker itself runs.
+  if (display_window_ && !display_window_->app_context().IsInUIThread()) {
+    std::vector<std::pair<std::string, std::string>> extensions = {
+        {"Supported Files", "*.iso;*.xex;*.zar;*.*"},
+        {"Disc Image (*.iso)", "*.iso"},
+        {"Disc Archive (*.zar)", "*.zar"},
+        {"Xbox Executable (*.xex)", "*.xex"},
+        {"All Files (*.*)", "*.*"},
+    };
+    std::filesystem::path picked_path;
+    xe::threading::Fence pick_fence;
+    if (display_window_->app_context().CallInUIThreadDeferred(
+            [this, &extensions, &picked_path, &pick_fence]() {
+              ui::ShowFileOpenPickerAsyncUWP(
+                  display_window_, extensions, /*multi_selection=*/false,
+                  [&picked_path, &pick_fence](
+                      std::vector<std::filesystem::path> files) {
+                    if (!files.empty()) {
+                      picked_path = files[0];
+                    }
+                    pick_fence.Signal();
+                  });
+            })) {
+      pick_fence.Wait();
+      XELOGI("Disc swap: the user picked {}",
+             picked_path.empty() ? "nothing" : picked_path.string().c_str());
+      return picked_path;
+    }
+  }
+  XELOGE(
+      "Disc swap requested, but no picker could be shown - the title will "
+      "keep waiting for the other disc");
+  return path;
+#endif  // XE_PLATFORM_WINRT
 
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
