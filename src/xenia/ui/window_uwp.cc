@@ -507,6 +507,15 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
                  const winrt::Windows::UI::ViewManagement::Core::
                      CoreInputViewHidingEventArgs&) {
             keyboard_visible_ = false;
+            // Confirms the runtime does report hides - the gamepad is handed
+            // back to the UI here (see ImGuiDrawer::UpdateGamepads), so if
+            // this never appeared, that would be why the pad stopped working
+            // after using the keyboard.
+            static uint32_t hiding_log_count = 0;
+            if (hiding_log_count < 4) {
+              ++hiding_log_count;
+              XELOGI("UWPWindow: the system reports the on-screen keyboard hidden");
+            }
             // If the keyboard went away while this code still wanted it on
             // screen, the user closed it themselves - and that has to win.
             // Asking for it again here is what made it impossible to close:

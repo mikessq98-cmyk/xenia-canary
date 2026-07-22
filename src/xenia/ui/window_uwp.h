@@ -44,6 +44,9 @@ class UWPWindow final : public Window {
   // while its text field should be editable (naturally retrying transient
   // CoreInputView refusals), and Hide when it's done. Takes an "explicit hold"
   // that suspends the automatic WantTextInput-driven show/hide.
+  bool IsOnScreenKeyboardVisible() const override {
+    return keyboard_visible_.load(std::memory_order_relaxed);
+  }
   void ShowOnScreenKeyboard() override;
   void HideOnScreenKeyboard() override;
 

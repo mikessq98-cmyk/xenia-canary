@@ -327,6 +327,10 @@ class Window {
   // hold is active, the automatic WantTextInput-driven show/hide is suspended
   // so it can't immediately hide an explicitly requested keyboard. No-ops on
   // platforms with a physical keyboard.
+  // Whether the system's on-screen keyboard is currently up. While it is, the
+  // gamepad is being used to operate IT, not this application's UI.
+  virtual bool IsOnScreenKeyboardVisible() const { return false; }
+
   virtual void ShowOnScreenKeyboard() {}
   virtual void HideOnScreenKeyboard() {}
 
