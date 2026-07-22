@@ -675,13 +675,15 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
 }
 
 void UWPWindow::ShowOnScreenKeyboard() {
-  // Called every frame from a dialog's draw while its text field should be
-  // editable, which is what makes this reliable: a transient refusal is
-  // retried on a later frame. A dismissal by the user is NOT a transient
-  // refusal - it stands until the dialog gives the keyboard up and asks
-  // again.
-  explicit_keyboard_hold_ = true;
-  if (keyboard_dismissed_by_user_) {
+  // Called every frame from a dialog's draw for as long as its text field
+  // should be editable. Asking the system every frame is what fights the user:
+  // the keyboard is asked for when the dialog TAKES the keyboard, and then
+  // only until it actually appears - after that, and after the user closes it,
+  // the request stands down.
+  if (!explicit_keyboard_hold_.exchange(true)) {
+    BeginOnScreenKeyboardRequest();
+  }
+  if (!ShouldKeepAskingForOnScreenKeyboard()) {
     return;
   }
   RequestOnScreenKeyboardState(true);
@@ -689,14 +691,43 @@ void UWPWindow::ShowOnScreenKeyboard() {
 
 void UWPWindow::HideOnScreenKeyboard() {
   bool had_hold = explicit_keyboard_hold_.exchange(false);
-  // The dialog is done with the keyboard - a later one starts from scratch.
-  keyboard_dismissed_by_user_ = false;
+  if (had_hold) {
+    // The dialog is done with the keyboard - the next one starts from scratch,
+    // including forgetting that the user closed this one. Only on a real
+    // release: the ImGui drawer calls this every frame when no dialog is open,
+    // and clearing the dismissal there would re-open the keyboard the user
+    // just closed on the very next frame.
+    keyboard_dismissed_by_user_ = false;
+  }
   if (!had_hold && !keyboard_visible_ && !keyboard_wanted_) {
-    // Nothing to do - avoid queueing a hide every frame from the drawer's
-    // no-dialogs safety net.
     return;
   }
   RequestOnScreenKeyboardState(false);
+}
+
+void UWPWindow::BeginOnScreenKeyboardRequest() {
+  // A fresh reason to show the keyboard - an earlier dismissal doesn't apply
+  // to it, and the system gets a window in which transient refusals are
+  // retried.
+  keyboard_dismissed_by_user_ = false;
+  keyboard_request_deadline_ms_.store(
+      int64_t(winrt::clock::now().time_since_epoch().count() / 10000) +
+          kKeyboardRequestWindowMs,
+      std::memory_order_relaxed);
+}
+
+bool UWPWindow::ShouldKeepAskingForOnScreenKeyboard() const {
+  if (keyboard_dismissed_by_user_ || keyboard_visible_) {
+    // The user closed it, or it's already up - either way, stop asking.
+    return false;
+  }
+  // Retry only for a while after the request was made. Beyond that the system
+  // is refusing for a reason of its own, and hammering it just keeps the UI
+  // thread busy.
+  int64_t now_ms =
+      int64_t(winrt::clock::now().time_since_epoch().count() / 10000);
+  return now_ms <=
+         keyboard_request_deadline_ms_.load(std::memory_order_relaxed);
 }
 
 void UWPWindow::UpdateOnScreenKeyboard() {
@@ -709,17 +740,25 @@ void UWPWindow::UpdateOnScreenKeyboard() {
   // which ImGui context is current here. This is what serves ImGui text fields
   // that don't manage the keyboard themselves - the settings editor above all.
   const bool want = imgui_wants_text_input();
+  const bool want_became_true = want && !keyboard_want_previous_;
+  keyboard_want_previous_ = want;
   if (!want) {
-    // Nothing wants text input anymore, so a keyboard the user closed earlier
-    // is forgotten - activating a field again brings it back.
+    // Nothing wants text input anymore. The next field to become active is a
+    // new reason to show the keyboard, so forget that the user closed this one.
     keyboard_dismissed_by_user_ = false;
-  } else if (keyboard_dismissed_by_user_) {
+    if (keyboard_visible_ || keyboard_wanted_) {
+      RequestOnScreenKeyboardState(false);
+    }
     return;
   }
-  if (want == keyboard_visible_ && !keyboard_request_pending_) {
+  if (want_became_true) {
+    // A field just became active - this is the moment to ask.
+    BeginOnScreenKeyboardRequest();
+  }
+  if (!ShouldKeepAskingForOnScreenKeyboard()) {
     return;
   }
-  RequestOnScreenKeyboardState(want);
+  RequestOnScreenKeyboardState(true);
 }
 
 }  // namespace ui

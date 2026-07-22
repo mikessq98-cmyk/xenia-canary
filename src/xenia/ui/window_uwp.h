@@ -66,6 +66,12 @@ class UWPWindow final : public Window {
   // Shows/hides the system on-screen keyboard (InputPane) to match ImGui's
   // current text-input need - this is the "pop-up keyboard" on Xbox.
   void UpdateOnScreenKeyboard();
+  // Starts a fresh reason to show the keyboard: forgets an earlier dismissal
+  // and opens the window during which transient refusals are retried.
+  void BeginOnScreenKeyboardRequest();
+  // Whether asking the system again is still appropriate - false once it is on
+  // screen, once the user has closed it, and once the retry window has passed.
+  bool ShouldKeepAskingForOnScreenKeyboard() const;
   // Subscribes to the system's own on-screen keyboard show/hide events so
   // keyboard_visible_ reflects reality rather than only what was requested.
   void WireKeyboardVisibilityTracking();
@@ -111,6 +117,14 @@ class UWPWindow final : public Window {
   // this the dismissal was immediately answered with another show request and
   // the keyboard could not be closed at all.
   std::atomic<bool> keyboard_dismissed_by_user_{false};
+  // Until when transient refusals from the system are retried, after something
+  // asked for the keyboard. Past it the request stands down rather than
+  // occupying the UI thread the system needs to show it.
+  std::atomic<int64_t> keyboard_request_deadline_ms_{0};
+  static constexpr int64_t kKeyboardRequestWindowMs = 3000;
+  // Whether ImGui wanted text input at the previous update - the keyboard is
+  // asked for when a field BECOMES active, not for as long as one is.
+  bool keyboard_want_previous_ = false;
   // Set by input handlers, consumed by the paint-driver timer.
   std::atomic<bool> input_activity_{false};
   // The following are touched only on the timer thread.
