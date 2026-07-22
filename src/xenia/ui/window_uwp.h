@@ -125,6 +125,11 @@ class UWPWindow final : public Window {
   // Whether ImGui wanted text input at the previous update - the keyboard is
   // asked for when a field BECOMES active, not for as long as one is.
   bool keyboard_want_previous_ = false;
+  // Frames painted, and characters received, since the keyboard came up. A
+  // character arriving with no frames painted means nothing can consume it
+  // yet - see the CharacterReceived handler.
+  std::atomic<uint32_t> paints_since_keyboard_shown_{0};
+  std::atomic<uint32_t> keyboard_char_count_{0};
   // Set by input handlers, consumed by the paint-driver timer.
   std::atomic<bool> input_activity_{false};
   // The following are touched only on the timer thread.

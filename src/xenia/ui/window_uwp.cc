@@ -292,6 +292,9 @@ void UWPWindow::RequestPaintImpl() {
         last_paint_ms_.store(
             int64_t(winrt::clock::now().time_since_epoch().count() / 10000),
             std::memory_order_relaxed);
+        if (keyboard_visible_.load(std::memory_order_relaxed)) {
+          paints_since_keyboard_shown_.fetch_add(1, std::memory_order_relaxed);
+        }
         try {
           OnPaint();
         } catch (const winrt::hresult_error& e) {
@@ -347,6 +350,23 @@ void UWPWindow::WireCoreWindowInput() {
   core_window_.CharacterReceived(
       [this](const wuc::CoreWindow&, const wuc::CharacterReceivedEventArgs& e) {
         NoteInputActivity();
+        // Typed text only reaches an ImGui field if a frame runs while the
+        // field is active - and the system keyboard is an overlay that may
+        // take the UI thread for itself. Report the character together with
+        // how many frames have been painted since the keyboard came up: zero
+        // means the characters are piling up in ImGui's queue to be applied
+        // whenever a frame finally runs, which is what "the text appears the
+        // next time the field is opened" looks like.
+        uint32_t char_count =
+            keyboard_char_count_.fetch_add(1, std::memory_order_relaxed);
+        if (char_count < 16) {
+          XELOGI(
+              "UWPWindow: character 0x{:04X} received - {} frames painted "
+              "since the keyboard came up, ImGui wants text input: {}",
+              uint32_t(e.KeyCode()),
+              paints_since_keyboard_shown_.load(std::memory_order_relaxed),
+              imgui_wants_text_input() ? "yes" : "no");
+        }
         KeyEvent ke(this, static_cast<VirtualKey>(e.KeyCode()),
                     int(e.KeyStatus().RepeatCount), e.KeyStatus().WasKeyDown,
                     false, false, false, false);
@@ -671,6 +691,10 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
     // still wanted it asked again - the keyboard reopening itself over and
     // over. The hiding event, which does arrive, is what clears this again.
     keyboard_visible_ = show;
+    if (show) {
+      paints_since_keyboard_shown_.store(0, std::memory_order_relaxed);
+      keyboard_char_count_.store(0, std::memory_order_relaxed);
+    }
   } else if (show) {
     ++show_fail_count;
   }
