@@ -241,6 +241,14 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   size_t render_target_count =
       render_target_cache_ ? render_target_cache_->GetCachedRenderTargetCount()
                            : 0;
+  // Upload pools only ever grow - Reclaim moves pages back to the free list
+  // rather than releasing them - so they hold whatever the busiest frame
+  // needed. Worth seeing separately from the rest of "elsewhere".
+  uint64_t pools_bytes =
+      constant_buffer_pool_ ? constant_buffer_pool_->GetAllocatedBytes() : 0;
+  if (shared_memory_) {
+    pools_bytes += shared_memory_->GetUploadPoolAllocatedBytes();
+  }
   uint64_t gpu_budget = 0, gpu_usage = 0;
   bool have_gpu_budget =
       GetD3D12Provider().QueryVideoMemoryUsage(gpu_budget, gpu_usage);
@@ -253,23 +261,24 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     uint64_t accounted_bytes = (uint64_t(shared_memory_mb) << 20) +
                                (uint64_t(textures_mb) << 20) +
                                (uint64_t(scaled_resolve_mb) << 20) +
-                               render_targets_bytes;
+                               render_targets_bytes + pools_bytes;
     uint64_t other_mb =
         gpu_usage > accounted_bytes ? (gpu_usage - accounted_bytes) >> 20 : 0;
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
-        "resolve {} MB, render targets {} MB ({} cached), shaders(dxbc) {} MB "
-        "| GPU budget {}/{} MB used, {} MB elsewhere (presenter, pools, PSOs, "
-        "driver)",
+        "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
+        "shaders(dxbc) {} MB | GPU budget {}/{} MB used, {} MB elsewhere "
+        "(presenter, PSOs, driver)",
         shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, shaders_mb, gpu_usage >> 20, gpu_budget >> 20,
-        other_mb);
+        render_target_count, pools_bytes >> 20, shaders_mb, gpu_usage >> 20,
+        gpu_budget >> 20, other_mb);
   } else {
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
-        "resolve {} MB, render targets {} MB ({} cached), shaders(dxbc) {} MB",
+        "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
+        "shaders(dxbc) {} MB",
         shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, shaders_mb);
+        render_target_count, pools_bytes >> 20, shaders_mb);
   }
 }
 
@@ -3848,6 +3857,27 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       view_bindful_heap_pool_->Reclaim(frame_completed_);
       sampler_bindful_heap_pool_->Reclaim(frame_completed_);
     }
+#if XE_PLATFORM_WINRT
+    // Reclaiming only moves pages back to the free list - the pool keeps
+    // whatever the busiest frame of the session needed for the rest of it.
+    // When the host is short on memory, hand the spare ones back; a few are
+    // kept so the next frame doesn't immediately allocate again.
+    if (++constant_buffer_pool_trim_counter_ >= kConstantBufferPoolTrimFrames) {
+      constant_buffer_pool_trim_counter_ = 0;
+      MEMORYSTATUSEX pool_trim_status = {sizeof(pool_trim_status)};
+      if (GlobalMemoryStatusEx(&pool_trim_status) &&
+          pool_trim_status.ullAvailPageFile < kPoolTrimMemoryThreshold) {
+        size_t released =
+            constant_buffer_pool_->TrimWritablePages(kConstantBufferPoolKeep);
+        if (released) {
+          XELOGI(
+              "D3D12CommandProcessor: released {} KB of spare constant buffer "
+              "pool pages ({} MB of host memory left)",
+              released >> 10, pool_trim_status.ullAvailPageFile >> 20);
+        }
+      }
+    }
+#endif  // XE_PLATFORM_WINRT
 
     pix_capturing_ =
         pix_capture_requested_.exchange(false, std::memory_order_relaxed);

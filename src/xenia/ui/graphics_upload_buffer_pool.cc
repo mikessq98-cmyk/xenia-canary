@@ -9,6 +9,8 @@
 
 #include "xenia/ui/graphics_upload_buffer_pool.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
 
@@ -71,6 +73,38 @@ void GraphicsUploadBufferPool::ClearCache() {
     writable_first_ = next_;
   }
   writable_last_ = nullptr;
+  page_count_ = 0;
+}
+
+size_t GraphicsUploadBufferPool::TrimWritablePages(size_t keep_page_count) {
+  // The first writable page may be the one currently being filled - never
+  // touch it, and keep the requested number of spares so the common case
+  // doesn't have to allocate again immediately. Everything past that has been
+  // reclaimed (the GPU is done with it) and is free to release.
+  Page* keep_last = writable_first_;
+  size_t kept = keep_last ? 1 : 0;
+  while (keep_last && kept < std::max(keep_page_count, size_t(1))) {
+    if (!keep_last->next_) {
+      break;
+    }
+    keep_last = keep_last->next_;
+    ++kept;
+  }
+  if (!keep_last || !keep_last->next_) {
+    return 0;
+  }
+  Page* page = keep_last->next_;
+  keep_last->next_ = nullptr;
+  writable_last_ = keep_last;
+  size_t released_pages = 0;
+  while (page) {
+    Page* next = page->next_;
+    delete page;
+    page = next;
+    ++released_pages;
+  }
+  page_count_ -= released_pages;
+  return released_pages * page_size_;
 }
 
 GraphicsUploadBufferPool::Page::~Page() {}
@@ -124,6 +158,7 @@ GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(
         // Failed to create.
         return nullptr;
       }
+      ++page_count_;
       writable_first_->last_submission_index_ = submission_index;
       writable_first_->next_ = nullptr;
       writable_last_ = writable_first_;

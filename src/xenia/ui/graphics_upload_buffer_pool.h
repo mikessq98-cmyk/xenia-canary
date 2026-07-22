@@ -35,6 +35,15 @@ class GraphicsUploadBufferPool {
   void ChangeSubmissionTimeline();
   void ClearCache();
 
+  // Host memory the pool is holding. Reclaim only moves pages back to the
+  // writable list, so without trimming a pool keeps whatever the busiest
+  // moment of the session needed, forever.
+  size_t GetAllocatedBytes() const { return page_count_ * page_size_; }
+
+  // Releases pages beyond keep_page_count from the list of free (already
+  // reclaimed, so not in use by the GPU) ones. Returns the bytes released.
+  size_t TrimWritablePages(size_t keep_page_count);
+
   // Should be called before submitting anything using this pool, unless the
   // implementation doesn't require explicit flushing.
   void FlushWrites();
@@ -77,6 +86,9 @@ class GraphicsUploadBufferPool {
 
   size_t current_page_used_ = 0;
   size_t current_page_flushed_ = 0;
+
+  // Pages currently allocated, across both lists (see GetAllocatedBytes).
+  size_t page_count_ = 0;
 };
 
 }  // namespace ui

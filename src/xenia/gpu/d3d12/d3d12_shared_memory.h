@@ -45,6 +45,12 @@ class D3D12SharedMemory : public SharedMemory {
   void CompletedSubmissionUpdated();
   void BeginSubmission();
 
+  // Host memory held by the upload pool that feeds the guest memory copies -
+  // it keeps whatever the busiest frame needed. For the [MEM] telemetry.
+  size_t GetUploadPoolAllocatedBytes() const {
+    return upload_buffer_pool_ ? upload_buffer_pool_->GetAllocatedBytes() : 0;
+  }
+
   // RequestRange may transition the buffer to copy destination - call it before
   // UseForReading or UseForWriting.
 
