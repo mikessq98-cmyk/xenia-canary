@@ -216,8 +216,10 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     scaled_resolve_mb = texture_cache_->GetScaledResolveCommittedBytes() >> 20;
   }
   uint64_t shaders_mb = 0;
+  size_t pipelines_total = 0, pipelines_pending = 0;
   if (pipeline_cache_) {
     shaders_mb = pipeline_cache_->GetTranslatedShaderBytes() >> 20;
+    pipeline_cache_->GetPipelineCounts(pipelines_total, pipelines_pending);
   }
   // The shared-memory buffer mirrors guest physical memory for the GPU. With
   // usable tiled resources only the touched tiles are backed; on the Xbox UWP
@@ -267,18 +269,19 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
         "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
-        "shaders(dxbc) {} MB | GPU budget {}/{} MB used, {} MB elsewhere "
-        "(presenter, PSOs, driver)",
+        "shaders(dxbc) {} MB, pipelines {} ({} still being built) | GPU budget "
+        "{}/{} MB used, {} MB elsewhere (presenter, PSOs, driver)",
         shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, pools_bytes >> 20, shaders_mb, gpu_usage >> 20,
-        gpu_budget >> 20, other_mb);
+        render_target_count, pools_bytes >> 20, shaders_mb, pipelines_total,
+        pipelines_pending, gpu_usage >> 20, gpu_budget >> 20, other_mb);
   } else {
     XELOGI(
         "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
         "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
-        "shaders(dxbc) {} MB",
+        "shaders(dxbc) {} MB, pipelines {} ({} still being built)",
         shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, pools_bytes >> 20, shaders_mb);
+        render_target_count, pools_bytes >> 20, shaders_mb, pipelines_total,
+        pipelines_pending);
   }
 }
 

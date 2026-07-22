@@ -139,6 +139,22 @@ class PipelineCache {
 
   // Total resident translated shader bytecode (DXBC), for telemetry. Atomic
   // scalar, safe to read from any thread.
+  // Pipelines in the cache and how many of them have no state object yet
+  // (still queued or being created). A count that keeps climbing means the
+  // game is asking for new pipeline permutations faster than they can be
+  // built - the draws using them are skipped meanwhile, which looks like
+  // missing geometry and a machine busy doing nothing visible.
+  void GetPipelineCounts(size_t& total_out, size_t& pending_out) const {
+    total_out = pipelines_.size();
+    size_t pending = 0;
+    for (const auto& pipeline_pair : pipelines_) {
+      if (!pipeline_pair.second->state.load(std::memory_order_relaxed)) {
+        ++pending;
+      }
+    }
+    pending_out = pending;
+  }
+
   uint64_t GetTranslatedShaderBytes() const {
     return translated_shader_bytes_.load(std::memory_order_relaxed);
   }

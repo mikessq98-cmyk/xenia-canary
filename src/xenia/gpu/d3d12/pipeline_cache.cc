@@ -3255,8 +3255,27 @@ void PipelineCache::EnsurePipelineShadersTranslated(
       if (use_try_claim) {
         should_translate = translation->TryClaimTranslation();
         if (!should_translate) {
-          // Another thread is translating - wait for it.
+          // Another thread is translating - wait for it. Not forever, though:
+          // if that translation fails, or its binary is released under memory
+          // pressure, is_translated() never becomes true and this creation
+          // thread would spin here for the rest of the run - burning a core
+          // and, worse, never building another pipeline, so every draw that
+          // needs one is skipped from then on.
+          uint64_t wait_start_ticks = Clock::QueryHostTickCount();
+          uint64_t wait_warn_ticks = Clock::QueryHostTickFrequency() * 5;
+          bool wait_reported = false;
           while (!translation->is_translated()) {
+            if (!wait_reported &&
+                Clock::QueryHostTickCount() - wait_start_ticks >
+                    wait_warn_ticks) {
+              wait_reported = true;
+              XELOGW(
+                  "Pipeline cache: still waiting for another thread to "
+                  "translate shader {:016X} after 5 seconds - if this repeats, "
+                  "that translation never completed and pipeline creation is "
+                  "stuck behind it",
+                  translation->shader().ucode_data_hash());
+            }
             std::this_thread::yield();
           }
         }
