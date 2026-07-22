@@ -664,11 +664,13 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
              show_fail_count);
       show_fail_count = 0;
     }
-    // With visibility tracking the system's event is the authority; without
-    // it, this is the only signal there is.
-    if (!keyboard_visibility_tracked_) {
-      keyboard_visible_ = show;
-    }
+    // The call returning true means the system took the request - believe it
+    // rather than waiting for a confirming event. On this runtime the
+    // PrimaryViewShowing event never arrives, so waiting for it left the
+    // keyboard permanently "not visible" here, and every field or dialog that
+    // still wanted it asked again - the keyboard reopening itself over and
+    // over. The hiding event, which does arrive, is what clears this again.
+    keyboard_visible_ = show;
   } else if (show) {
     ++show_fail_count;
   }
@@ -710,6 +712,11 @@ void UWPWindow::BeginOnScreenKeyboardRequest() {
   // to it, and the system gets a window in which transient refusals are
   // retried.
   keyboard_dismissed_by_user_ = false;
+  // Don't trust what this code believes about the keyboard being up: the
+  // runtime may not report a hide either, and a stale "it's already there"
+  // would mean never asking again. Asking for a keyboard that happens to be
+  // on screen already costs nothing.
+  keyboard_visible_ = false;
   keyboard_request_deadline_ms_.store(
       int64_t(winrt::clock::now().time_since_epoch().count() / 10000) +
           kKeyboardRequestWindowMs,
