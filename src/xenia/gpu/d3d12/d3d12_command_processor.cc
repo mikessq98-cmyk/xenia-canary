@@ -17,9 +17,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -36,6 +38,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+#include "xenia/ui/imgui_drawer.h"
 
 DEFINE_bool(d3d12_bindless, true,
             "Use bindless resources where available - may improve performance, "
@@ -75,6 +78,26 @@ DEFINE_string(
     "regardless of vertex shader; multiple pairs may be listed, e.g. "
     "\"[a,b],[sol,c]\". The affected geometry becomes invisible, but the GPU "
     "no longer crashes.",
+    "D3D12");
+
+DEFINE_string(
+    d3d12_isolate_shaders, "off",
+    "Xbox UWP diagnostic to find the shader behind a visual bug (a black "
+    "scene, a stuck full-screen filter). Cycles through the shaders the game "
+    "uses, skipping ONE at a time for about a second, and shows which one in "
+    "the bottom-right corner. Watch the screen: when the bug appears or "
+    "disappears, the shader named at that moment is the cause.\n"
+    "Modes:\n"
+    "  off  - disabled (default).\n"
+    "  vs   - isolate one VERTEX shader at a time (skips every draw using it).\n"
+    "  ps   - isolate one PIXEL shader at a time.\n"
+    "  pair - isolate one VS+PS pair at a time (finer, but many more steps).\n"
+    "Changeable while running.",
+    "D3D12");
+DEFINE_int32(
+    d3d12_isolate_shaders_ms, 1000,
+    "How long (milliseconds) each shader is isolated before moving to the next "
+    "in d3d12_isolate_shaders.",
     "D3D12");
 #endif
 
@@ -180,6 +203,113 @@ bool D3D12CommandProcessor::IsShaderSkipped(
     uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) const {
 #if XE_PLATFORM_WINRT
   return EvaluateShaderSkip(vertex_shader_hash, pixel_shader_hash);
+#else
+  return false;
+#endif
+}
+
+bool D3D12CommandProcessor::ShaderIsolationSkipsDraw(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+#if XE_PLATFORM_WINRT
+  // Resolve the mode from the cvar (checked each draw so it can be toggled
+  // live; a tiny string compare).
+  const std::string& mode_str = cvars::d3d12_isolate_shaders;
+  int mode = 0;
+  if (mode_str == "vs") {
+    mode = 1;
+  } else if (mode_str == "ps") {
+    mode = 2;
+  } else if (mode_str == "pair") {
+    mode = 3;
+  }
+  if (mode != isolate_mode_) {
+    // Mode changed (or turned off) - start over.
+    isolate_mode_ = mode;
+    isolate_index_ = 0;
+    isolate_last_advance_ticks_ = 0;
+    isolate_vertex_shaders_.clear();
+    isolate_pixel_shaders_.clear();
+    isolate_shader_pairs_.clear();
+    if (mode == 0) {
+      ui::SetDebugOverlayLine("");
+    }
+  }
+  if (mode == 0) {
+    return false;
+  }
+
+  // Record this draw's shader(s) in discovery order (linear scans - the lists
+  // are small, a few hundred at most, and this is a debug path).
+  auto record = [](std::vector<uint64_t>& list, uint64_t hash) {
+    for (uint64_t existing : list) {
+      if (existing == hash) {
+        return;
+      }
+    }
+    list.push_back(hash);
+  };
+  size_t list_size = 0;
+  if (mode == 1) {
+    record(isolate_vertex_shaders_, vertex_shader_hash);
+    list_size = isolate_vertex_shaders_.size();
+  } else if (mode == 2) {
+    record(isolate_pixel_shaders_, pixel_shader_hash);
+    list_size = isolate_pixel_shaders_.size();
+  } else {
+    std::pair<uint64_t, uint64_t> pair(vertex_shader_hash, pixel_shader_hash);
+    bool found = false;
+    for (const auto& existing : isolate_shader_pairs_) {
+      if (existing == pair) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      isolate_shader_pairs_.push_back(pair);
+    }
+    list_size = isolate_shader_pairs_.size();
+  }
+  if (!list_size) {
+    return false;
+  }
+
+  // Advance the isolated index on the timer.
+  uint64_t now_ticks = xe::Clock::QueryHostTickCount();
+  uint64_t interval_ticks =
+      (xe::Clock::QueryHostTickFrequency() *
+       uint64_t(std::max(int32_t(50), cvars::d3d12_isolate_shaders_ms))) /
+      1000;
+  if (!isolate_last_advance_ticks_) {
+    isolate_last_advance_ticks_ = now_ticks;
+  } else if (now_ticks - isolate_last_advance_ticks_ >= interval_ticks) {
+    isolate_last_advance_ticks_ = now_ticks;
+    ++isolate_index_;
+  }
+  size_t current = list_size ? (isolate_index_ % list_size) : 0;
+
+  // Publish the current isolation to the on-screen overlay.
+  const char* mode_name = mode == 1 ? "VS" : (mode == 2 ? "PS" : "VS+PS");
+  std::string overlay;
+  bool skip = false;
+  if (mode == 1) {
+    uint64_t iso = isolate_vertex_shaders_[current];
+    overlay = fmt::format("ISOLATING {} {}/{}: {:016X}", mode_name, current + 1,
+                          list_size, iso);
+    skip = (vertex_shader_hash == iso);
+  } else if (mode == 2) {
+    uint64_t iso = isolate_pixel_shaders_[current];
+    overlay = fmt::format("ISOLATING {} {}/{}: {:016X}", mode_name, current + 1,
+                          list_size, iso);
+    skip = (pixel_shader_hash == iso);
+  } else {
+    const auto& iso = isolate_shader_pairs_[current];
+    overlay = fmt::format("ISOLATING {} {}/{}: VS {:016X} PS {:016X}", mode_name,
+                          current + 1, list_size, iso.first, iso.second);
+    skip = (vertex_shader_hash == iso.first &&
+            pixel_shader_hash == iso.second);
+  }
+  ui::SetDebugOverlayLine(overlay);
+  return skip;
 #else
   return false;
 #endif
@@ -2974,6 +3104,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // is invisible, but the GPU survives).
   if (IsShaderSkipped(vertex_shader ? vertex_shader->ucode_data_hash() : 0,
                       pixel_shader ? pixel_shader->ucode_data_hash() : 0)) {
+    return true;
+  }
+  // Shader-isolation diagnostic (d3d12_isolate_shaders): cycle through the
+  // shaders one at a time, skipping the current one's draws for a second, so a
+  // visual bug (Max Payne's black scene, a stuck full-screen filter) can be
+  // traced to the shader that causes it. Returns true to skip this draw.
+  if (ShaderIsolationSkipsDraw(
+          vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0)) {
     return true;
   }
 #endif

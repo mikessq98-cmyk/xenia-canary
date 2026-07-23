@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "third_party/imgui/imgui.h"
@@ -35,6 +36,13 @@ namespace ui {
 class ImGuiDialog;
 class ImGuiNotification;
 class Window;
+
+// A single line of debug text drawn in the bottom-right corner of the ImGui
+// overlay (over guest output too). Thread-safe: written from any thread (e.g.
+// the GPU command processor for the shader-isolation diagnostic), read on the
+// UI thread. Empty string hides it.
+void SetDebugOverlayLine(const std::string& text);
+std::string GetDebugOverlayLine();
 
 using IconsData = std::map<uint32_t, std::span<const uint8_t>>;
 

@@ -100,6 +100,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IsShaderSkipped(uint64_t vertex_shader_hash,
                        uint64_t pixel_shader_hash) const;
 
+  // Shader-isolation diagnostic (d3d12_isolate_shaders). Records the shader,
+  // advances the cycle on a timer, updates the on-screen overlay, and returns
+  // whether this draw's shader is the one currently being isolated (so it's
+  // skipped). Always false off UWP or when the mode is "off". Called on the
+  // GPU command processor thread.
+  bool ShaderIsolationSkipsDraw(uint64_t vertex_shader_hash,
+                                uint64_t pixel_shader_hash);
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
@@ -567,6 +575,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
   bool submission_open_ = false;
+
+#if XE_PLATFORM_WINRT
+  // Shader-isolation diagnostic state (d3d12_isolate_shaders). All touched only
+  // on the GPU command processor thread. The lists are the distinct shader
+  // hashes seen, in discovery order; the index is the one currently isolated.
+  std::vector<uint64_t> isolate_vertex_shaders_;
+  std::vector<uint64_t> isolate_pixel_shaders_;
+  std::vector<std::pair<uint64_t, uint64_t>> isolate_shader_pairs_;
+  size_t isolate_index_ = 0;
+  uint64_t isolate_last_advance_ticks_ = 0;
+  int isolate_mode_ = 0;  // 0 off, 1 vs, 2 ps, 3 pair.
+#endif  // XE_PLATFORM_WINRT
 
   // For awaiting non-submission queue operations such as UpdateTileMappings in
   // AwaitAllQueueOperationsCompletion when they're queued after the latest

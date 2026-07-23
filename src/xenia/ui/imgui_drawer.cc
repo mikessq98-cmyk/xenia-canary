@@ -11,7 +11,9 @@
 
 #include <cfloat>
 #include <cstring>
+#include <mutex>
 #include <ranges>
+#include <string>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
@@ -49,6 +51,18 @@ UPDATE_from_uint32(font_size, 2024, 8, 31, 20, 12);
 
 namespace xe {
 namespace ui {
+
+// Bottom-right debug overlay line (see imgui_drawer.h).
+static std::mutex debug_overlay_mutex;
+static std::string debug_overlay_line;
+void SetDebugOverlayLine(const std::string& text) {
+  std::lock_guard<std::mutex> lock(debug_overlay_mutex);
+  debug_overlay_line = text;
+}
+std::string GetDebugOverlayLine() {
+  std::lock_guard<std::mutex> lock(debug_overlay_mutex);
+  return debug_overlay_line;
+}
 
 // File: 'ProggyTiny.ttf' (35656 bytes)
 // Exported using binary_to_compressed_c.cpp
@@ -654,13 +668,16 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     return;
   }
 
-  bool force_uwp_render = false;
+  // A debug overlay line forces a frame so it's visible even over bare guest
+  // output with no dialogs or menu.
+  std::string debug_overlay = GetDebugOverlayLine();
+  bool force_uwp_render = !debug_overlay.empty();
 #if XE_PLATFORM_WINRT
   // On UWP the main menu is drawn with ImGui (no native menu bar), so while it
   // is visible the ImGui frame must be rendered every frame even with no
   // dialogs/notifications. When the menu is hidden (game running), behave like
   // the desktop build: draw only for dialogs/notifications.
-  force_uwp_render = uwp_menu_visible_;
+  force_uwp_render |= uwp_menu_visible_;
   // Safety net for the explicit keyboard hold: only dialogs may hold the
   // on-screen keyboard, so with no dialogs left, release it - a dialog
   // destroyed through any path (including ClearDialogs on title launch) must
@@ -722,6 +739,24 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     DrawMainMenuBarImGui(window_);
   }
 #endif
+
+  // Debug overlay, bottom-right, over everything.
+  if (!debug_overlay.empty()) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 pos(viewport->WorkPos.x + viewport->WorkSize.x - 12.0f,
+               viewport->WorkPos.y + viewport->WorkSize.y - 12.0f);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.75f);
+    if (ImGui::Begin("##xe_debug_overlay", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_NoSavedSettings)) {
+      ImGui::TextUnformatted(debug_overlay.c_str());
+    }
+    ImGui::End();
+  }
 
   assert_true(!IsDrawingDialogs());
   dialog_loop_next_index_ = 0;
