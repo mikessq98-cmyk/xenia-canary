@@ -128,6 +128,16 @@ class UWPWindow final : public Window {
   // Whether ImGui wanted text input at the previous update - the keyboard is
   // asked for when a field BECOMES active, not for as long as one is.
   bool keyboard_want_previous_ = false;
+  // Owner-based lifecycle for the automatic (WantTextInput-driven) keyboard: a
+  // text field becoming active opens the keyboard ONCE and owns it as a
+  // "session"; WantTextInput toggling during that session does not open a
+  // second one. The session ends when the field is really gone (WantTextInput
+  // stays false for kKeyboardSessionEndFrames updates, not a one-frame blip),
+  // at which point the keyboard is forced down once, or when the user closes
+  // it. Touched only on the UI thread (UpdateOnScreenKeyboard, after paint).
+  bool keyboard_session_active_ = false;
+  uint32_t keyboard_want_false_frames_ = 0;
+  static constexpr uint32_t kKeyboardSessionEndFrames = 30;
   // Frames painted, and characters received, since the keyboard came up. A
   // character arriving with no frames painted means nothing can consume it
   // yet - see the CharacterReceived handler.

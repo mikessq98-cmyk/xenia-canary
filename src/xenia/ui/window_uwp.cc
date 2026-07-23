@@ -782,23 +782,40 @@ void UWPWindow::UpdateOnScreenKeyboard() {
   const bool want = imgui_wants_text_input();
   const bool want_became_true = want && !keyboard_want_previous_;
   keyboard_want_previous_ = want;
-  if (!want) {
-    // Nothing wants text input anymore. The next field to become active is a
-    // new reason to show the keyboard, so forget that the user closed this one.
-    keyboard_dismissed_by_user_ = false;
-    if (keyboard_visible_ || keyboard_wanted_) {
-      RequestOnScreenKeyboardState(false);
+
+  if (!keyboard_session_active_) {
+    // Nothing owns the keyboard. A text field BECOMING active opens it once
+    // and takes ownership of it for as long as that field is used - one
+    // appearance per activation, no matter how WantTextInput toggles after.
+    if (!want_became_true) {
+      return;
     }
-    return;
-  }
-  if (want_became_true) {
-    // A field just became active - this is the moment to ask.
+    keyboard_session_active_ = true;
+    keyboard_want_false_frames_ = 0;
     BeginOnScreenKeyboardRequest();
   }
-  if (!ShouldKeepAskingForOnScreenKeyboard()) {
+
+  // A session is active.
+  if (keyboard_dismissed_by_user_) {
+    // The user closed the keyboard. Don't fight them - release the session so
+    // it stays closed; the next field activation opens a fresh one.
+    keyboard_session_active_ = false;
     return;
   }
-  RequestOnScreenKeyboardState(true);
+  if (want) {
+    keyboard_want_false_frames_ = 0;
+  } else if (++keyboard_want_false_frames_ >= kKeyboardSessionEndFrames) {
+    // The field is really gone (not a one-frame blip while the overlay has
+    // focus) - force the keyboard down once and end the session.
+    keyboard_session_active_ = false;
+    RequestOnScreenKeyboardState(false);
+    return;
+  }
+  // Retry the single show only until it is actually up or the window passes -
+  // ShouldKeepAsking goes false once keyboard_visible_ is set.
+  if (want && ShouldKeepAskingForOnScreenKeyboard()) {
+    RequestOnScreenKeyboardState(true);
+  }
 }
 
 }  // namespace ui
