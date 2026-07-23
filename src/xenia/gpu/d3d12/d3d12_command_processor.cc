@@ -279,11 +279,14 @@ bool D3D12CommandProcessor::ShaderIsolationSkipsDraw(
       (xe::Clock::QueryHostTickFrequency() *
        uint64_t(std::max(int32_t(50), cvars::d3d12_isolate_shaders_ms))) /
       1000;
+  bool advanced = false;
   if (!isolate_last_advance_ticks_) {
     isolate_last_advance_ticks_ = now_ticks;
+    advanced = true;  // Report the first one too.
   } else if (now_ticks - isolate_last_advance_ticks_ >= interval_ticks) {
     isolate_last_advance_ticks_ = now_ticks;
     ++isolate_index_;
+    advanced = true;
   }
   size_t current = list_size ? (isolate_index_ % list_size) : 0;
 
@@ -309,6 +312,12 @@ bool D3D12CommandProcessor::ShaderIsolationSkipsDraw(
             pixel_shader_hash == iso.second);
   }
   ui::SetDebugOverlayLine(overlay);
+  if (advanced) {
+    // Also to the log, so the isolation can be followed there even if the
+    // on-screen overlay isn't visible (and to timestamp each step against what
+    // is seen on screen).
+    XELOGI("Shader isolation: now skipping {} - watch the screen", overlay);
+  }
   return skip;
 #else
   return false;

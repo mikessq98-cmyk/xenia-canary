@@ -30,6 +30,7 @@
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/surface_uwp.h"
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/windowed_app_context_uwp.h"
@@ -177,8 +178,11 @@ void UWPWindow::StartPaintLoop() {
         const bool wants_text = imgui_wants_text_input();
         const bool holding_view =
             view_hold_start_ms_.load(std::memory_order_relaxed) != 0;
+        // While a debug overlay is active, keep painting so the ImGui drawer
+        // registers itself and the overlay stays on screen over guest output.
+        const bool debug_overlay_active = !GetDebugOverlayLine().empty();
 
-        bool should_paint = wants_text || holding_view;
+        bool should_paint = wants_text || holding_view || debug_overlay_active;
         if (wants_text && !keyboard_visible_.load(std::memory_order_relaxed)) {
           // Waiting for the system to bring the on-screen keyboard up. Every
           // paint blocks on vsync on the UI thread, and the keyboard needs
@@ -305,6 +309,9 @@ void UWPWindow::RequestPaintImpl() {
         } catch (...) {
           XELOGE("UWPWindow paint unknown exception");
         }
+        // Let the ImGui drawer re-evaluate whether it must be registered (e.g.
+        // for a debug overlay set from another thread).
+        RunUIThreadPaintTickCallback();
         // After ImGui has updated its IO during OnPaint, reflect its text-input
         // need on the system on-screen keyboard.
         UpdateOnScreenKeyboard();
