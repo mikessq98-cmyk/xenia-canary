@@ -1067,17 +1067,11 @@ void ImGuiDrawer::UpdateGamepads() {
 
   auto& io = GetIO();
 
-  // While the system on-screen keyboard is up, the gamepad belongs to it: the
-  // user is moving around ITS keys and pressing A to type and B to erase.
-  // XInput reports those presses to us all the same, and forwarding them to
-  // ImGui made B mean "cancel" - deactivating the very text field being typed
-  // into, so the characters that arrived afterwards had nowhere to go and sat
-  // in ImGui's queue until some field became active again (the text appearing
-  // "next time"). Typed characters still arrive through CharacterReceived, so
-  // ignoring the pad here costs nothing while the keyboard is on screen.
-  if (window_ && window_->IsOnScreenKeyboardVisible()) {
-    return;
-  }
+  // NOTE: gating this on window_->IsOnScreenKeyboardVisible() (to keep pad
+  // presses on the system keyboard from reaching ImGui, where B is Cancel)
+  // stopped text input entirely and left the pad dead in the UI once the
+  // keyboard closed, so it was reverted. The pad is fed to ImGui as usual;
+  // the field-deactivation-while-typing problem is to be solved differently.
 
   // Rescan which user slots actually have a gamepad only about once a second:
   // this runs every UI frame, and probing empty XInput slots (GetCapabilities /
