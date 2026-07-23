@@ -290,13 +290,66 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
         !ImGui::IsMouseClicked(0)) {
       ImGui::SetKeyboardFocusHere();
     }
+    bool input_submitted = false;
 #if XE_PLATFORM_WINRT
     imgui_drawer()->window()->ShowOnScreenKeyboard();
-#endif
+    if (first_draw) {
+      // Discard anything typed before this dialog opened.
+      imgui_drawer()->window()->ClearTypedCharacters();
+    }
+    // The Xbox system keyboard overlay blocks our painting, so ImGui's
+    // InputText never gets a frame to consume the typed characters (they would
+    // pile up in ImGui's queue and land in the next field). Drain the window's
+    // direct character queue into the buffer ourselves, and show it read-only.
+    std::vector<uint32_t> typed =
+        imgui_drawer()->window()->TakeTypedCharacters();
+    if (!typed.empty()) {
+      std::string current(text_buffer_.data());
+      for (uint32_t codepoint : typed) {
+        if (codepoint == 0x08) {  // Backspace.
+          if (!current.empty()) {
+            // Drop the last UTF-8 code unit sequence (continuation bytes first).
+            while (!current.empty() &&
+                   (uint8_t(current.back()) & 0xC0) == 0x80) {
+              current.pop_back();
+            }
+            if (!current.empty()) {
+              current.pop_back();
+            }
+          }
+        } else if (codepoint == 0x0D || codepoint == 0x0A) {  // Enter.
+          input_submitted = true;
+        } else if (codepoint >= 0x20 && codepoint != 0x7F) {  // Printable.
+          char utf8[4];
+          size_t utf8_len = 0;
+          if (codepoint < 0x80) {
+            utf8[utf8_len++] = char(codepoint);
+          } else if (codepoint < 0x800) {
+            utf8[utf8_len++] = char(0xC0 | (codepoint >> 6));
+            utf8[utf8_len++] = char(0x80 | (codepoint & 0x3F));
+          } else {
+            utf8[utf8_len++] = char(0xE0 | (codepoint >> 12));
+            utf8[utf8_len++] = char(0x80 | ((codepoint >> 6) & 0x3F));
+            utf8[utf8_len++] = char(0x80 | (codepoint & 0x3F));
+          }
+          if (current.size() + utf8_len < max_length_) {
+            current.append(utf8, utf8_len);
+          }
+        }
+      }
+      xe::string_util::copy_truncating(text_buffer_.data(), current,
+                                       text_buffer_.size());
+    }
     ImGui::PushID("input_text");
-    bool input_submitted =
-        ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
-                         ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
+                     ImGuiInputTextFlags_ReadOnly);
+    ImGui::PopID();
+#else
+    ImGui::PushID("input_text");
+    if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
+                         ImGuiInputTextFlags_EnterReturnsTrue)) {
+      input_submitted = true;
+    }
     // Context menu for paste functionality
     if (ImGui::BeginPopupContextItem("input_context_menu")) {
       if (ImGui::MenuItem("Paste")) {
@@ -309,6 +362,7 @@ void KeyboardInputDialog::OnDraw(ImGuiIO& io) {
       ImGui::EndPopup();
     }
     ImGui::PopID();
+#endif
     bool closing = false;
     if (input_submitted) {
       text_ = std::string(text_buffer_.data(), text_buffer_.size());

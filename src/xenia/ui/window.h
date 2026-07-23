@@ -15,8 +15,10 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "xenia/base/platform.h"
 #include "xenia/ui/menu_item.h"
@@ -319,6 +321,27 @@ class Window {
   void SetImGuiWantsTextInput(bool want) { imgui_wants_text_input_ = want; }
   bool imgui_wants_text_input() const { return imgui_wants_text_input_; }
 
+  // Direct typed-character queue (see the note in OnKeyChar). Fed for every
+  // character the window receives; drained by consumers that can't rely on
+  // ImGui's frame-based input - the guest on-screen keyboard dialog. Bounded so
+  // it can't grow without a consumer. Thread-safe.
+  void AppendTypedCharacter(uint32_t codepoint) {
+    std::lock_guard<std::mutex> lock(typed_characters_mutex_);
+    if (typed_characters_.size() < kTypedCharactersMax) {
+      typed_characters_.push_back(codepoint);
+    }
+  }
+  std::vector<uint32_t> TakeTypedCharacters() {
+    std::lock_guard<std::mutex> lock(typed_characters_mutex_);
+    std::vector<uint32_t> taken;
+    taken.swap(typed_characters_);
+    return taken;
+  }
+  void ClearTypedCharacters() {
+    std::lock_guard<std::mutex> lock(typed_characters_mutex_);
+    typed_characters_.clear();
+  }
+
   // Explicit system on-screen keyboard control for UI code that knows a text
   // field is being edited (dialogs with text input call Show every frame while
   // the field should be editable, and Hide when leaving - the reliable pattern
@@ -343,6 +366,11 @@ class Window {
   bool uwp_menu_suppressed() const { return uwp_menu_suppressed_; }
 
  private:
+  // Direct typed-character queue - see AppendTypedCharacter.
+  static constexpr size_t kTypedCharactersMax = 4096;
+  std::mutex typed_characters_mutex_;
+  std::vector<uint32_t> typed_characters_;
+
   // Read from the UWP paint-driver timer thread as well as the UI thread, so
   // these are atomic (benign relaxed flags).
   std::atomic<bool> imgui_wants_text_input_{false};

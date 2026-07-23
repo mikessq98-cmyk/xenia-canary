@@ -598,6 +598,13 @@ void Window::OnKeyUp(KeyEvent& e,
 
 void Window::OnKeyChar(KeyEvent& e,
                        WindowDestructionReceiver& destruction_receiver) {
+  // Also record the character in the direct queue. ImGui's InputText consumes
+  // characters only during a running frame with the field active - which never
+  // happens while the Xbox system keyboard overlay is up (no frames run), so
+  // typed text would otherwise pile up in ImGui's queue and land in the next
+  // field. Consumers that must work under the overlay (the guest keyboard
+  // dialog) drain this instead.
+  AppendTypedCharacter(uint32_t(e.virtual_key()));
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyChar(e);
