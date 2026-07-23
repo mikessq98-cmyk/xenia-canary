@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -153,6 +154,36 @@ class PipelineCache {
       }
     }
     pending_out = pending;
+  }
+
+  // How many DISTINCT pixel shaders the busiest vertex shader is paired with,
+  // and that vertex shader's hash - a game pairing one VS with a great many
+  // PS (a material/permutation explosion) would show a large number here.
+  // Computed from the pipeline map, so it costs a walk of it; only call from
+  // the telemetry path.
+  void GetMaxPixelShadersPerVertexShader(uint32_t& max_ps_out,
+                                         uint64_t& vertex_shader_hash_out) const {
+    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> ps_by_vs;
+    for (const auto& pipeline_pair : pipelines_) {
+      const PipelineRuntimeDescription& desc = pipeline_pair.second->description;
+      if (!desc.vertex_shader) {
+        continue;
+      }
+      uint64_t vs_hash = desc.vertex_shader->shader().ucode_data_hash();
+      uint64_t ps_hash =
+          desc.pixel_shader ? desc.pixel_shader->shader().ucode_data_hash() : 0;
+      ps_by_vs[vs_hash].insert(ps_hash);
+    }
+    uint32_t max_ps = 0;
+    uint64_t worst_vs = 0;
+    for (const auto& vs_pair : ps_by_vs) {
+      if (vs_pair.second.size() > max_ps) {
+        max_ps = uint32_t(vs_pair.second.size());
+        worst_vs = vs_pair.first;
+      }
+    }
+    max_ps_out = max_ps;
+    vertex_shader_hash_out = worst_vs;
   }
 
   uint64_t GetTranslatedShaderBytes() const {
