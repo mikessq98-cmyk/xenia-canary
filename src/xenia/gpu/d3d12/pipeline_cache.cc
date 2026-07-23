@@ -85,6 +85,19 @@ DEFINE_bool(
 
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
+    d3d12_async_vs_only_pipelines, true,
+    "Xbox UWP: build VS-only pipelines (depth pre-pass, shadow maps, clears) "
+    "on background threads, skipping the draw until the pipeline is ready. "
+    "True (default) keeps the slow driver from stalling the render thread when "
+    "many appear at once, at the cost of a brief pop-in. Set to FALSE if a "
+    "game shows a black scene with a working UI and video: some titles (Max "
+    "Payne 3) generate VS-only permutations continuously, so with async on "
+    "their depth buffer is never complete and the color pass depth-tests to "
+    "nothing. False builds these synchronously - the depth pre-pass actually "
+    "runs - which may stutter but makes the scene visible.",
+    "D3D12");
+
+DEFINE_bool(
     d3d12_toxic_shader_solver, true,
     "Xbox UWP: automatically detect and permanently skip graphics pipelines "
     "whose creation hard-crashes the GPU driver. Each pipeline creation is "
@@ -1185,7 +1198,15 @@ bool PipelineCache::ConfigurePipeline(
   // removes even that on subsequent runs.
   bool background_vs_only = cvars::d3d12_pipeline_aggressive_async;
 #if XE_PLATFORM_WINRT
-  background_vs_only = true;
+  // On Xbox, VS-only draws (depth pre-pass, shadow maps, clears) are backgrounded
+  // by default so a burst of them doesn't stall the slow driver. The cost is
+  // that the draw is SKIPPED until the pipeline is ready - and a game that keeps
+  // generating new VS-only permutations (Max Payne 3) then never gets a complete
+  // depth buffer, so its color pass depth-tests to nothing and the scene is
+  // black while the UI, video and audio are fine. d3d12_async_vs_only_pipelines
+  // lets those draws be built synchronously instead (a possible stall, but the
+  // depth pre-pass actually happens).
+  background_vs_only = cvars::d3d12_async_vs_only_pipelines;
 #endif  // XE_PLATFORM_WINRT
   bool use_async = cvars::async_shader_compilation && !creation_threads_.empty() &&
                    (pixel_shader != nullptr || background_vs_only);
