@@ -72,15 +72,14 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
 
 DEFINE_bool(
     d3d12_pipeline_aggressive_async, true,
-    "Offload EVERY graphics pipeline creation (including VS-only depth/shadow "
-    "passes) to background threads AND drop those threads to below-normal CPU "
-    "priority, so a burst of shader compilation - e.g. entering a new area - "
-    "can never saturate the cores and starve the guest CPU / GPU-emulation "
-    "threads, which is a common cause of hard stutter even when "
-    "async_shader_compilation is already on. Trades a brief pop-in of "
-    "not-yet-compiled geometry for a smooth frame rate. Requires "
-    "async_shader_compilation. Persistent shader storage removes the pop-in on "
-    "later runs.",
+    "Drop the pipeline compilation threads to below-normal CPU priority so a "
+    "burst of shader compilation - e.g. entering a new area - can never "
+    "saturate the cores and starve the guest CPU / GPU-emulation threads, a "
+    "common cause of hard stutter even with async_shader_compilation on.\n"
+    "On desktop it also offloads VS-only (depth/shadow/clear) pipelines to the "
+    "background. On Xbox that part is instead governed by "
+    "d3d12_async_vs_only_pipelines - here this flag ONLY sets the thread "
+    "priority. Requires async_shader_compilation.",
     "D3D12");
 
 #if XE_PLATFORM_WINRT
