@@ -576,11 +576,16 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
       presenter_->RemoveUIDrawerFromUIThread(this);
       uwp_ui_drawer_registered_ = false;
     }
+    window_->SetUIThreadPaintTickCallback(nullptr);
     window_->RemoveInputListener(this);
   }
   presenter_ = new_presenter;
   if (presenter_) {
     window_->AddInputListener(this, z_order_);
+    // Let the window's UI-thread paint re-evaluate our registration, so a debug
+    // overlay set asynchronously (from the GPU thread) can register us.
+    window_->SetUIThreadPaintTickCallback(
+        [this]() { RefreshUWPUIDrawerRegistration(); });
     if (uwp_menu_visible_ || !dialogs_.empty() || !notifications_.empty()) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
       uwp_ui_drawer_registered_ = true;
@@ -606,23 +611,17 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
 }
 
 #if XE_PLATFORM_WINRT
-void ImGuiDrawer::SetUWPMenuVisible(bool visible) {
-  if (visible && window_ && window_->uwp_menu_suppressed()) {
-    // The menu must stay completely inaccessible while a game is running.
-    return;
-  }
-  if (uwp_menu_visible_ == visible) {
-    return;
-  }
-  uwp_menu_visible_ = visible;
+void ImGuiDrawer::RefreshUWPUIDrawerRegistration() {
   if (!presenter_) {
     return;
   }
-  // Register while there is anything to draw: the menu, a dialog or a
-  // notification. Otherwise unregister so the guest output thread presents
-  // directly at full speed.
+  // Register while there is anything to draw: the menu, a dialog, a
+  // notification, or a debug overlay line (set asynchronously from another
+  // thread, which is why this is polled). Otherwise unregister so the guest
+  // output thread presents directly at full speed.
   const bool should_be_registered =
-      uwp_menu_visible_ || !dialogs_.empty() || !notifications_.empty();
+      uwp_menu_visible_ || !dialogs_.empty() || !notifications_.empty() ||
+      !GetDebugOverlayLine().empty();
   if (should_be_registered && !uwp_ui_drawer_registered_) {
     presenter_->AddUIDrawerFromUIThread(this, z_order_);
     uwp_ui_drawer_registered_ = true;
@@ -632,6 +631,17 @@ void ImGuiDrawer::SetUWPMenuVisible(bool visible) {
   }
 }
 
+void ImGuiDrawer::SetUWPMenuVisible(bool visible) {
+  if (visible && window_ && window_->uwp_menu_suppressed()) {
+    // The menu must stay completely inaccessible while a game is running.
+    return;
+  }
+  if (uwp_menu_visible_ == visible) {
+    return;
+  }
+  uwp_menu_visible_ = visible;
+  RefreshUWPUIDrawerRegistration();
+}
 #endif  // XE_PLATFORM_WINRT
 
 void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
