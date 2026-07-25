@@ -28,9 +28,9 @@
 #include <gamingdeviceinformation.h>
 #include <xinput.h>  // XInputGetState / dwPacketNumber for the idle-wake poll.
 
+#include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
-#include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/surface_uwp.h"
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/windowed_app_context_uwp.h"
@@ -178,12 +178,22 @@ void UWPWindow::StartPaintLoop() {
         const bool wants_text = imgui_wants_text_input();
         const bool holding_view =
             view_hold_start_ms_.load(std::memory_order_relaxed) != 0;
-        // While a debug overlay is active, keep painting so the ImGui drawer
-        // registers itself and the overlay stays on screen over guest output.
-        const bool debug_overlay_active = !GetDebugOverlayLine().empty();
+        const bool keyboard_up =
+            keyboard_visible_.load(std::memory_order_relaxed);
 
-        bool should_paint = wants_text || holding_view || debug_overlay_active;
-        if (wants_text && !keyboard_visible_.load(std::memory_order_relaxed)) {
+        // While the system on-screen keyboard is up, paint every tick. This is
+        // what actually makes typed text appear: the app does not repaint on
+        // its own while a field is being edited under the overlay, so the active
+        // consumer - an ImGui InputText, or the guest keyboard dialog draining
+        // the typed-character queue - never gets a frame to take the characters,
+        // and they only land the next time a frame happens to run. Earlier this
+        // was driven indirectly: an editable field set io.WantTextInput, which
+        // fed wants_text below. A read-only field (the guest dialog) does not,
+        // so that signal was lost. Driving frames off keyboard_up restores it
+        // for every field WITHOUT re-issuing the keyboard show each frame, which
+        // is what used to make the keyboard flicker and reopen itself.
+        bool should_paint = wants_text || holding_view || keyboard_up;
+        if (wants_text && !keyboard_up) {
           // Waiting for the system to bring the on-screen keyboard up. Every
           // paint blocks on vsync on the UI thread, and the keyboard needs
           // that same thread to appear - painting flat out here is what makes
@@ -309,9 +319,7 @@ void UWPWindow::RequestPaintImpl() {
         } catch (...) {
           XELOGE("UWPWindow paint unknown exception");
         }
-        // Let the ImGui drawer re-evaluate whether it must be registered (e.g.
-        // for a debug overlay set from another thread).
-        RunUIThreadPaintTickCallback();
+
         // After ImGui has updated its IO during OnPaint, reflect its text-input
         // need on the system on-screen keyboard.
         UpdateOnScreenKeyboard();

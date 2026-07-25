@@ -114,7 +114,7 @@ void CrashDump() {
   --in_crash_dump;
 }
 
-static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
+static inline bool ShouldSkipHostCommit(const BaseHeap&) {
   // When the host page size is larger than 4 KB (e.g. 16 KB on macOS ARM64,
   // 64 KB on some ARM64 Linux kernels), mprotect on 4 KB guest page boundaries
   // fails with EINVAL. All heaps are backed by a shared file mapping
@@ -123,18 +123,6 @@ static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
   if (xe::memory::page_size() > 0x1000) {
     return true;
   }
-#if XE_PLATFORM_WINRT
-  // With winrt_guest_memory_swap_file, the guest virtual heaps live in views
-  // of file-backed sections, whose pages are all committed at map time (RW) -
-  // committing again is a no-op at best and may be rejected on mapped
-  // file-backed pages, so skip it like on large-host-page systems. Checked
-  // per range: a view may have individually fallen back to the pagefile
-  // section, where commit is still required.
-  if (heap.heap_type() == HeapType::kGuestVirtual &&
-      xe::memory::IsGuestMemoryRangeSwapBacked(heap.heap_base())) {
-    return true;
-  }
-#endif  // XE_PLATFORM_WINRT
   return false;
 }
 
@@ -236,33 +224,6 @@ bool Memory::Initialize() {
       break;
     }
   }
-#if XE_PLATFORM_WINRT
-  if (!mapping_base_ && xe::memory::LastFileMappingUsedGuestSwapFile()) {
-    // The swap-file-backed section was created, but its views can't be mapped
-    // on this system - retry with the standard pagefile-backed section instead
-    // of failing to boot (winrt_guest_memory_swap_file is best-effort).
-    XELOGW(
-        "Unable to map views of the swap-file-backed guest memory section; "
-        "falling back to the pagefile-backed section (the "
-        "winrt_guest_memory_swap_file technique is unavailable here)");
-    xe::memory::CloseFileMappingHandle(mapping_, file_name_);
-    xe::memory::DisableGuestMemorySwapFile();
-    mapping_ = xe::memory::CreateFileMappingHandle(
-        file_name_, 0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
-    if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
-      XELOGE("Unable to reserve the 4gb guest address space.");
-      assert_always();
-      return false;
-    }
-    for (size_t n = 32; n < 64; n++) {
-      auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
-      if (!MapViews(mapping_base)) {
-        mapping_base_ = mapping_base;
-        break;
-      }
-    }
-  }
-#endif  // XE_PLATFORM_WINRT
   if (!mapping_base_) {
     XELOGE("Unable to find a continuous block in the 64bit address space.");
     assert_always();

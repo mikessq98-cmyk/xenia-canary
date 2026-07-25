@@ -70,32 +70,7 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
             "D3D12");
 
-DEFINE_bool(
-    d3d12_pipeline_aggressive_async, true,
-    "Drop the pipeline compilation threads to below-normal CPU priority so a "
-    "burst of shader compilation - e.g. entering a new area - can never "
-    "saturate the cores and starve the guest CPU / GPU-emulation threads, a "
-    "common cause of hard stutter even with async_shader_compilation on.\n"
-    "On desktop it also offloads VS-only (depth/shadow/clear) pipelines to the "
-    "background. On Xbox that part is instead governed by "
-    "d3d12_async_vs_only_pipelines - here this flag ONLY sets the thread "
-    "priority. Requires async_shader_compilation.",
-    "D3D12");
-
 #if XE_PLATFORM_WINRT
-DEFINE_bool(
-    d3d12_async_vs_only_pipelines, true,
-    "Xbox UWP: build VS-only pipelines (depth pre-pass, shadow maps, clears) "
-    "on background threads, skipping the draw until the pipeline is ready. "
-    "True (default) keeps the slow driver from stalling the render thread when "
-    "many appear at once, at the cost of a brief pop-in. Set to FALSE if a "
-    "game shows a black scene with a working UI and video: some titles (Max "
-    "Payne 3) generate VS-only permutations continuously, so with async on "
-    "their depth buffer is never complete and the color pass depth-tests to "
-    "nothing. False builds these synchronously - the depth pre-pass actually "
-    "runs - which may stutter but makes the scene visible.",
-    "D3D12");
-
 DEFINE_bool(
     d3d12_toxic_shader_solver, true,
     "Xbox UWP: automatically detect and permanently skip graphics pipelines "
@@ -145,11 +120,6 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/tessellation_adaptive_vs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/tessellation_indexed_vs.h"
 }  // namespace shaders
-
-// THREAD_PRIORITY_BELOW_NORMAL. When aggressive-async is on, background
-// pipeline compilation runs at this priority so a compile burst yields to the
-// normal-priority guest CPU and GPU-emulation threads instead of starving them.
-static constexpr int32_t kAggressiveAsyncCreationThreadPriority = -1;
 
 PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
                              const RegisterFile& register_file,
@@ -251,9 +221,6 @@ bool PipelineCache::Initialize() {
           xe::threading::Thread::Create({}, [this, i]() { CreationThread(i); });
       assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
-      if (cvars::d3d12_pipeline_aggressive_async) {
-        creation_thread->set_priority(kAggressiveAsyncCreationThreadPriority);
-      }
       creation_threads_.push_back(std::move(creation_thread));
     }
   }
@@ -403,12 +370,6 @@ void PipelineCache::InitializeShaderStorage(
           });
       assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
-      if (cvars::d3d12_pipeline_aggressive_async) {
-        // Harmless during a blocking prewarm (nothing else competes for the
-        // cores then), but keeps a running game smooth during a non-blocking
-        // prewarm.
-        creation_thread->set_priority(kAggressiveAsyncCreationThreadPriority);
-      }
       creation_threads_.push_back(std::move(creation_thread));
     }
 
@@ -799,22 +760,6 @@ void PipelineCache::SolverOnDeviceLost() {
   }
 }
 
-void PipelineCache::SolverQuarantineExecutionSuspect(
-    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
-  if (!solver_enabled_) {
-    return;
-  }
-  SolverAppendToxic(vertex_shader_hash, pixel_shader_hash);
-  XELOGW(
-      "Toxic-shader solver: quarantined EXECUTION hang suspect VS {:016X}, "
-      "PS {:016X} (the most recently bound pipeline when the device hung) - "
-      "it will be skipped from the next launch; if the hang persists, the "
-      "next suspect will be quarantined on the next death. Remove the pair "
-      "from {} if it turns out innocent.",
-      vertex_shader_hash, pixel_shader_hash,
-      xe::path_to_utf8(solver_toxic_path_));
-}
-
 void PipelineCache::SolverShutdown(bool clean_exit) {
   std::lock_guard<std::mutex> lock(solver_journal_mutex_);
   if (solver_journal_file_) {
@@ -1187,25 +1132,15 @@ bool PipelineCache::ConfigurePipeline(
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
 
   // Check if we should use async pipeline creation.
-  // When enabled, defer shader translation and pipeline creation to background.
   // Normally VS-only pipelines (depth pre-pass, shadow maps, clears) are created
-  // synchronously because they're cheap to compile on a desktop driver. But on
-  // the slow Xbox UWP driver, and whenever aggressive-async is requested, a
-  // burst of new VS-only pipelines stalls the render thread, so background those
-  // too - the draw is skipped for the few frames until the pipeline is ready (a
-  // brief depth/shadow pop instead of a stall), and persistent shader storage
-  // removes even that on subsequent runs.
-  bool background_vs_only = cvars::d3d12_pipeline_aggressive_async;
+  // synchronously because they're cheap to compile on a desktop driver.
+  bool background_vs_only = false;
 #if XE_PLATFORM_WINRT
-  // On Xbox, VS-only draws (depth pre-pass, shadow maps, clears) are backgrounded
-  // by default so a burst of them doesn't stall the slow driver. The cost is
-  // that the draw is SKIPPED until the pipeline is ready - and a game that keeps
-  // generating new VS-only permutations (Max Payne 3) then never gets a complete
-  // depth buffer, so its color pass depth-tests to nothing and the scene is
-  // black while the UI, video and audio are fine. d3d12_async_vs_only_pipelines
-  // lets those draws be built synchronously instead (a possible stall, but the
-  // depth pre-pass actually happens).
-  background_vs_only = cvars::d3d12_async_vs_only_pipelines;
+  // On the slow Xbox UWP driver a burst of new VS-only pipelines stalls the
+  // render thread, so background them - the draw is skipped for the few frames
+  // until the pipeline is ready (a brief depth/shadow pop instead of a stall),
+  // and persistent shader storage removes even that on subsequent runs.
+  background_vs_only = true;
 #endif  // XE_PLATFORM_WINRT
   bool use_async = cvars::async_shader_compilation && !creation_threads_.empty() &&
                    (pixel_shader != nullptr || background_vs_only);

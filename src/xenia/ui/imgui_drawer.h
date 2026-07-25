@@ -116,11 +116,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // gamepad View button can bring the menu back on top of the game.
   void SetUWPMenuVisible(bool visible);
   bool uwp_menu_visible() const { return uwp_menu_visible_; }
-  // Re-evaluates whether the drawer should be registered as a UI drawer,
-  // registering/unregistering to match. Called each UI-thread paint (via the
-  // window's tick callback) so state that changes asynchronously - the debug
-  // overlay set from the GPU thread - takes effect. UI thread only.
-  void RefreshUWPUIDrawerRegistration();
 #endif
 
  protected:

@@ -13,7 +13,6 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -322,18 +321,6 @@ class Window {
   void SetImGuiWantsTextInput(bool want) { imgui_wants_text_input_ = want; }
   bool imgui_wants_text_input() const { return imgui_wants_text_input_; }
 
-  // A callback the UWP paint path runs on the UI thread each paint - the ImGui
-  // drawer uses it to re-evaluate whether it should be registered as a UI
-  // drawer (e.g. so the debug overlay can appear over bare guest output).
-  void SetUIThreadPaintTickCallback(std::function<void()> callback) {
-    ui_thread_paint_tick_callback_ = std::move(callback);
-  }
-  void RunUIThreadPaintTickCallback() {
-    if (ui_thread_paint_tick_callback_) {
-      ui_thread_paint_tick_callback_();
-    }
-  }
-
   // Direct typed-character queue (see the note in OnKeyChar). Fed for every
   // character the window receives; drained by consumers that can't rely on
   // ImGui's frame-based input - the guest on-screen keyboard dialog. Bounded so
@@ -383,9 +370,6 @@ class Window {
   static constexpr size_t kTypedCharactersMax = 4096;
   std::mutex typed_characters_mutex_;
   std::vector<uint32_t> typed_characters_;
-
-  // See SetUIThreadPaintTickCallback.
-  std::function<void()> ui_thread_paint_tick_callback_;
 
   // Read from the UWP paint-driver timer thread as well as the UI thread, so
   // these are atomic (benign relaxed flags).
