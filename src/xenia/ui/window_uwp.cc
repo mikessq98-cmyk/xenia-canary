@@ -208,6 +208,11 @@ void UWPWindow::StartPaintLoop() {
           --paint_tail_ticks_;
           should_paint = true;
         }
+        // While painting is parked for the on-screen keyboard (see
+        // RequestPaintImpl), don't queue frames that would only be skipped.
+        if (should_paint && IsPaintParkedForOnScreenKeyboard()) {
+          should_paint = false;
+        }
         // In-game the menu is suppressed and the guest drives its own presents;
         // only nudge a paint on the conditions above (e.g. a just-opened
         // keyboard prompt) - never a periodic full-frame repaint.
@@ -272,6 +277,21 @@ bool UWPWindow::PollGamepadActivity() {
   return changed;
 }
 
+bool UWPWindow::IsPaintParkedForOnScreenKeyboard() const {
+  if (!keyboard_visible_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  int64_t shown_ms = keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+  if (!shown_ms) {
+    return false;
+  }
+  int64_t now_ms =
+      int64_t(winrt::clock::now().time_since_epoch().count() / 10000);
+  // Safety cap: if the system's hide event never arrives, resume painting
+  // anyway rather than leaving the UI frozen.
+  return now_ms - shown_ms <= kKeyboardPaintParkMaxMs;
+}
+
 void UWPWindow::RequestPaintImpl() {
   // The Win32 backend does `InvalidateRect`: thread-safe, coalescing, and the
   // real paint happens later on the UI thread via WM_PAINT. RequestPaint() may
@@ -306,6 +326,26 @@ void UWPWindow::RequestPaintImpl() {
         if (keyboard_visible_.load(std::memory_order_relaxed)) {
           paints_since_keyboard_shown_.fetch_add(1, std::memory_order_relaxed);
         }
+        // While the system on-screen keyboard overlay is up, do NOT paint:
+        // under the fullscreen overlay presents stop completing (the window is
+        // occluded), so OnPaint wedges the UI thread for the whole typing
+        // session - and a wedged UI thread cannot dispatch CharacterReceived,
+        // which is why the typed text only ever arrived a session late ("the
+        // previous input appears in the next window"). Nothing is visible
+        // behind the overlay anyway; the skipped frame is repainted the moment
+        // the keyboard hides.
+        if (IsPaintParkedForOnScreenKeyboard()) {
+          if (!paint_parked_for_keyboard_.exchange(
+                  true, std::memory_order_relaxed)) {
+            XELOGI(
+                "UWPWindow: painting parked while the on-screen keyboard is "
+                "up - the UI thread stays free to receive typed characters");
+          }
+          CheckKeyboardHoldGesture();
+          return;
+        }
+        int64_t paint_start_ms =
+            int64_t(winrt::clock::now().time_since_epoch().count() / 10000);
         try {
           OnPaint();
         } catch (const winrt::hresult_error& e) {
@@ -315,6 +355,18 @@ void UWPWindow::RequestPaintImpl() {
           XELOGE("UWPWindow paint exception: {}", e.what());
         } catch (...) {
           XELOGE("UWPWindow paint unknown exception");
+        }
+        {
+          // Premise probe: a paint that took hundreds of ms (or seconds) means
+          // the present blocked while the window was occluded - the mechanism
+          // the parking above exists to avoid.
+          int64_t paint_took_ms =
+              int64_t(winrt::clock::now().time_since_epoch().count() / 10000) -
+              paint_start_ms;
+          if (paint_took_ms > 500) {
+            XELOGW("UWPWindow: OnPaint blocked the UI thread for {} ms",
+                   paint_took_ms);
+          }
         }
         // Let the ImGui drawer re-evaluate whether it must be registered (e.g.
         // for a debug overlay set from another thread).
@@ -374,12 +426,25 @@ void UWPWindow::WireCoreWindowInput() {
         uint32_t char_count =
             keyboard_char_count_.fetch_add(1, std::memory_order_relaxed);
         if (char_count < 16) {
+          // The ms-after-show number is the decisive timing: characters
+          // arriving with small increasing values are LIVE (the UI thread is
+          // dispatching during the typing session); a burst of large identical
+          // values means they were queued and only delivered later.
+          int64_t shown_ms =
+              keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+          int64_t since_show_ms =
+              shown_ms
+                  ? int64_t(winrt::clock::now().time_since_epoch().count() /
+                            10000) -
+                        shown_ms
+                  : -1;
           XELOGI(
               "UWPWindow: character 0x{:04X} received - {} frames painted "
-              "since the keyboard came up, ImGui wants text input: {}",
+              "since the keyboard came up, {} ms after show, ImGui wants text "
+              "input: {}",
               uint32_t(e.KeyCode()),
               paints_since_keyboard_shown_.load(std::memory_order_relaxed),
-              imgui_wants_text_input() ? "yes" : "no");
+              since_show_ms, imgui_wants_text_input() ? "yes" : "no");
         }
         KeyEvent ke(this, static_cast<VirtualKey>(e.KeyCode()),
                     int(e.KeyStatus().RepeatCount), e.KeyStatus().WasKeyDown,
@@ -537,6 +602,13 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
             if (keyboard_wanted_) {
               keyboard_dismissed_by_user_ = true;
             }
+            // End the paint parking for the typing session and repaint, so the
+            // characters received during it land on screen right away.
+            keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
+            if (paint_parked_for_keyboard_.exchange(
+                    false, std::memory_order_relaxed)) {
+              RequestPaint();
+            }
           });
       keyboard_visibility_tracked_ = true;
       XELOGI(
@@ -573,6 +645,12 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
             // not be asked for again until the reason to show it is gone.
             if (keyboard_wanted_) {
               keyboard_dismissed_by_user_ = true;
+            }
+            // End the paint parking and repaint (see the CoreInputView path).
+            keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
+            if (paint_parked_for_keyboard_.exchange(
+                    false, std::memory_order_relaxed)) {
+              RequestPaint();
             }
           });
       keyboard_visibility_tracked_ = true;
@@ -717,6 +795,18 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
     if (show) {
       paints_since_keyboard_shown_.store(0, std::memory_order_relaxed);
       keyboard_char_count_.store(0, std::memory_order_relaxed);
+      // Park painting for the typing session - under the fullscreen overlay
+      // presents stop completing and would wedge the UI thread, which must
+      // stay free to dispatch the typed characters.
+      keyboard_shown_uptime_ms_.store(
+          int64_t(winrt::clock::now().time_since_epoch().count() / 10000),
+          std::memory_order_relaxed);
+    } else {
+      keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
+      if (paint_parked_for_keyboard_.exchange(false,
+                                              std::memory_order_relaxed)) {
+        RequestPaint();
+      }
     }
   } else if (show) {
     ++show_fail_count;

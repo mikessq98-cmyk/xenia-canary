@@ -143,6 +143,21 @@ class UWPWindow final : public Window {
   // yet - see the CharacterReceived handler.
   std::atomic<uint32_t> paints_since_keyboard_shown_{0};
   std::atomic<uint32_t> keyboard_char_count_{0};
+  // Host-uptime ms when the system on-screen keyboard was (successfully)
+  // shown; 0 while it is not up. While set, painting is PARKED: under the
+  // fullscreen keyboard overlay presents stop completing (the window is
+  // occluded), which wedges the UI thread inside OnPaint for the whole typing
+  // session - and a wedged UI thread cannot dispatch CharacterReceived, so the
+  // typed text only ever arrived a session late. Nothing is visible behind the
+  // overlay anyway. Cleared by the hide events / the applied hide call, with a
+  // time cap as a safety net in case no hide event ever arrives.
+  std::atomic<int64_t> keyboard_shown_uptime_ms_{0};
+  // A paint was skipped while parked - repaint as soon as the keyboard hides.
+  std::atomic<bool> paint_parked_for_keyboard_{false};
+  static constexpr int64_t kKeyboardPaintParkMaxMs = 120000;
+  // Whether painting is currently parked for the on-screen keyboard (visible,
+  // shown timestamp set, safety cap not yet exceeded).
+  bool IsPaintParkedForOnScreenKeyboard() const;
   // Set by input handlers, consumed by the paint-driver timer.
   std::atomic<bool> input_activity_{false};
   // The following are touched only on the timer thread.
