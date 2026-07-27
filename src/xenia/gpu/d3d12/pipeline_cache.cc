@@ -799,6 +799,22 @@ void PipelineCache::SolverOnDeviceLost() {
   }
 }
 
+void PipelineCache::SolverQuarantineExecutionSuspect(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+  if (!solver_enabled_) {
+    return;
+  }
+  SolverAppendToxic(vertex_shader_hash, pixel_shader_hash);
+  XELOGW(
+      "Toxic-shader solver: quarantined EXECUTION hang suspect VS {:016X}, "
+      "PS {:016X} (the most recently bound pipeline when the device hung) - "
+      "it will be skipped from the next launch; if the hang persists, the "
+      "next suspect will be quarantined on the next death. Remove the pair "
+      "from {} if it turns out innocent.",
+      vertex_shader_hash, pixel_shader_hash,
+      xe::path_to_utf8(solver_toxic_path_));
+}
+
 void PipelineCache::SolverShutdown(bool clean_exit) {
   std::lock_guard<std::mutex> lock(solver_journal_mutex_);
   if (solver_journal_file_) {
@@ -3344,7 +3360,16 @@ void PipelineCache::EnsurePipelineShadersTranslated(
                   "stuck behind it",
                   translation->shader().ucode_data_hash());
             }
-            std::this_thread::yield();
+            // Sleep rather than yield. These threads run at below-normal
+            // priority on a console with ~6-7 usable cores and 30+ emulator
+            // threads: a spinning yield() only ever offers the core to
+            // threads of equal or higher priority, so the below-normal thread
+            // that actually holds the translation may not get scheduled at
+            // all while its peers burn their quanta waiting for it - a
+            // priority inversion that stalls pipeline creation completely
+            // (observed as multi-second waits, and as "async compilation that
+            // stutters like sync"). Sleeping takes the waiter off the core.
+            xe::threading::Sleep(std::chrono::milliseconds(1));
           }
         }
       }

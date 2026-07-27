@@ -78,6 +78,15 @@ class PipelineCache {
   // pipeline creation (present/submission), including a creation call that
   // hung the driver's shader compiler and never returned.
   void SolverOnDeviceLost();
+  // Quarantines a pipeline identified as an EXECUTION-side hang suspect (the
+  // most recently bound pipeline when the device was removed with
+  // DXGI_ERROR_DEVICE_HUNG) - appends it to the per-game .toxic file so the
+  // next launch skips it. The creation-side solver cannot see this class of
+  // failure at all: nothing crashes while compiling, the GPU hangs executing
+  // an already-built pipeline. The suspect may be innocent (the hang can lag
+  // the guilty draw); the .toxic file is plain text and can be pruned.
+  void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
+                                        uint64_t pixel_shader_hash);
 #endif  // XE_PLATFORM_WINRT
 
   void EndSubmission();

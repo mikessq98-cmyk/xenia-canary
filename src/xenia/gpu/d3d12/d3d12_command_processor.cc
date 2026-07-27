@@ -55,6 +55,20 @@ DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(d3d12_substitute_pending_pipelines);
 
 DEFINE_bool(
+    d3d12_quarantine_exec_hang_suspects, false,
+    "Xbox UWP: when the GPU device is removed with DXGI_ERROR_DEVICE_HUNG, "
+    "add the most recently bound guest pipeline to the per-game toxic-shader "
+    "skip list, so the next launch does not execute it. This is the only "
+    "automatic defence against an execution-side hang - the creation-side "
+    "solver never sees it, because nothing crashes while compiling: the GPU "
+    "hangs running an already-built pipeline. Off by default because when "
+    "the hang is systemic (miscompiled control flow affecting many shaders - "
+    "see dxbc_switch_break_dispatch) it blames a different innocent pipeline "
+    "on every death; turn it on for a title where the hang is reproducible "
+    "and the log names the same pipeline each time.",
+    "D3D12");
+
+DEFINE_bool(
     d3d12_log_slow_draw_phases, true,
     "Xbox UWP: log when a single phase of a draw blocks the GPU command "
     "processor long enough to be felt as a stutter, naming the phase "
@@ -532,6 +546,19 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
     HRESULT reason = device->GetDeviceRemovedReason();
     XELOGE("Device loss diagnosis: GetDeviceRemovedReason=0x{:08X}",
            uint32_t(reason));
+    if (reason == DXGI_ERROR_DEVICE_HUNG && pipeline_cache_ &&
+        cvars::d3d12_quarantine_exec_hang_suspects) {
+      // The GPU hung executing work, so the creation journal has nothing -
+      // the most recently bound pipeline is the prime suspect. One per death,
+      // converging like the creation-side solver.
+      uint32_t next = exec_pipeline_ring_next_.load(std::memory_order_relaxed);
+      if (next != 0) {
+        const std::pair<uint64_t, uint64_t>& newest =
+            exec_pipeline_ring_[(next - 1) & (kExecPipelineRingSize - 1)];
+        pipeline_cache_->SolverQuarantineExecutionSuspect(newest.first,
+                                                          newest.second);
+      }
+    }
     ID3D12DeviceRemovedExtendedData* dred = nullptr;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
       D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
