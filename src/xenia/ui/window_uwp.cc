@@ -27,6 +27,13 @@
 
 #include <gamingdeviceinformation.h>
 #include <xinput.h>  // XInputGetState / dwPacketNumber for the idle-wake poll.
+// xinput.h defines these as macros, and xenia/hid/input.h (reached through
+// imgui_drawer.h -> input_system.h below) declares enumerators with the same
+// names - the macro expansion turns them into "0x01 = 0x01" and the whole
+// header fails to parse. Only these two collide (verified against the
+// 10.0.26100 SDK); the values are not used in this file.
+#undef XINPUT_DEVTYPE_GAMEPAD
+#undef XINPUT_DEVSUBTYPE_GAMEPAD
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
