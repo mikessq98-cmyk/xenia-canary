@@ -15,6 +15,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "third_party/fmt/include/fmt/format.h"
@@ -536,10 +537,36 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
         "first (execution-side toxic candidates for d3d12_skip_shaders or "
         "the .toxic file):",
         count);
+    std::unordered_map<uint64_t, uint32_t> vertex_shader_counts;
     for (uint32_t i = 0; i < count; ++i) {
       const std::pair<uint64_t, uint64_t>& entry =
           exec_pipeline_ring_[(next - 1 - i) & (kExecPipelineRingSize - 1)];
       XELOGE("  [{:2}] VS {:016X}, PS {:016X}", i, entry.first, entry.second);
+      ++vertex_shader_counts[entry.first];
+    }
+    // The pair alone is misleading when one VERTEX shader is the problem: it
+    // hangs with a different pixel shader each time, so quarantining pairs
+    // never converges (a new innocent pair is blamed on every death). Naming
+    // the dominant vertex shader turns that into one actionable suspect - if
+    // the same one leads across runs, skip it wholesale with
+    // d3d12_skip_shaders = "[<hash>,sol]".
+    uint64_t top_vertex_shader = 0;
+    uint32_t top_vertex_shader_count = 0;
+    for (const auto& pair : vertex_shader_counts) {
+      if (pair.second > top_vertex_shader_count) {
+        top_vertex_shader = pair.first;
+        top_vertex_shader_count = pair.second;
+      }
+    }
+    if (top_vertex_shader_count * 3 >= count) {
+      XELOGE(
+          "Device loss diagnosis: vertex shader {:016X} accounts for {} of "
+          "the last {} bound pipelines - if the same one leads after another "
+          "death, it is the suspect regardless of pixel shader: set "
+          "d3d12_skip_shaders = \"[{:016X},sol]\" to skip every draw using "
+          "it",
+          top_vertex_shader, top_vertex_shader_count, count,
+          top_vertex_shader);
     }
   }
   ID3D12Device* device = GetD3D12Provider().GetDevice();
