@@ -73,6 +73,21 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "D3D12");
 
 #if XE_PLATFORM_WINRT
+DEFINE_bool(
+    d3d12_async_vs_only_pipelines, false,
+    "Xbox UWP: build VS-only pipelines (depth pre-pass, shadow maps, clears) "
+    "on background threads, skipping their draws until they are ready.\n"
+    "Off by default, and that matters: a skipped depth-only draw leaves the "
+    "depth buffer incomplete, so the colour pass that follows depth-tests "
+    "against nothing and the object comes out BLACK. Titles that keep "
+    "generating new VS-only permutations (Black Ops, Max Payne 3) never catch "
+    "up, so the artefact is permanent rather than a brief pop. These "
+    "pipelines have no pixel shader and are cheap for the driver to compile, "
+    "which is why building them synchronously is the better trade.\n"
+    "Turn on only if synchronous compilation of them causes worse stutter "
+    "than the missing depth causes artefacts.",
+    "D3D12");
+
 DEFINE_string(
     d3d12_substitute_pending_pipelines, "once",
     "Xbox UWP: what to do with a draw whose pipeline the (slow) console driver "
@@ -1227,11 +1242,7 @@ bool PipelineCache::ConfigurePipeline(
   // synchronously because they're cheap to compile on a desktop driver.
   bool background_vs_only = false;
 #if XE_PLATFORM_WINRT
-  // On the slow Xbox UWP driver a burst of new VS-only pipelines stalls the
-  // render thread, so background them - the draw is skipped for the few frames
-  // until the pipeline is ready (a brief depth/shadow pop instead of a stall),
-  // and persistent shader storage removes even that on subsequent runs.
-  background_vs_only = true;
+  background_vs_only = cvars::d3d12_async_vs_only_pipelines;
 #endif  // XE_PLATFORM_WINRT
   bool use_async = cvars::async_shader_compilation && !creation_threads_.empty() &&
                    (pixel_shader != nullptr || background_vs_only);
