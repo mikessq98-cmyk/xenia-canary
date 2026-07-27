@@ -165,6 +165,17 @@ class D3D12TextureCache final : public TextureCache {
   }
   uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
     assert_true(IsDrawResolutionScaled());
+    if (!UseTiledScaledResolveBuffers()) {
+      // On the committed path (Xbox UWP, where tiled resources are not
+      // usable) the scaled address space is covered by dynamically sized
+      // regions, not by fixed gigabyte-aligned buffers - the current
+      // region's own base is where its resource starts. Returning the
+      // gigabyte formula here made callers compute an offset far outside
+      // the region's resource, which the GPU faults on (page fault at VA 0,
+      // device removed with DXGI_ERROR_INVALID_CALL) as soon as anything
+      // read back a resolution-scaled resolve.
+      return scaled_resolve_committed_buffer_base_;
+    }
     return uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
   }
 
