@@ -173,6 +173,15 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // UpdateGamepads - probing empty XInput slots every frame is a UI stall.
   uint32_t gamepad_connected_mask_ = 0;
   uint32_t gamepad_rescan_countdown_ = 0;
+#if XE_PLATFORM_WINRT
+  // Host-uptime time of the previous UpdateGamepads call, and until when the
+  // gamepad feed to ImGui is muted. See the frame-stall resume protection in
+  // UpdateGamepads: the press that closes the system on-screen keyboard must
+  // not reach ImGui, or it cancels the text field the typed characters are
+  // about to land in.
+  uint64_t gamepad_feed_prev_uptime_ms_ = 0;
+  uint64_t gamepad_feed_mute_until_uptime_ms_ = 0;
+#endif
 
   std::function<void(uint8_t)> onGuidePressFunction_;
   // All currently-attached dialogs that get drawn.

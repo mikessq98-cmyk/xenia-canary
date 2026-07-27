@@ -1119,8 +1119,10 @@ void ImGuiDrawer::UpdateGamepads() {
   // NOTE: gating this on window_->IsOnScreenKeyboardVisible() (to keep pad
   // presses on the system keyboard from reaching ImGui, where B is Cancel)
   // stopped text input entirely and left the pad dead in the UI once the
-  // keyboard closed, so it was reverted. The pad is fed to ImGui as usual;
-  // the field-deactivation-while-typing problem is to be solved differently.
+  // keyboard closed (the visibility flag is unreliable - the system's Showing
+  // event never arrives), so it was reverted. The pad is fed to ImGui as
+  // usual; only the press that CLOSES the keyboard is filtered out, by the
+  // time-bounded frame-stall resume protection below.
 
   // Rescan which user slots actually have a gamepad only about once a second:
   // this runs every UI frame, and probing empty XInput slots (GetCapabilities /
@@ -1173,6 +1175,56 @@ void ImGuiDrawer::UpdateGamepads() {
 
   io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
   hid::X_INPUT_GAMEPAD& gamepad = gamepad_state.gamepad;
+
+#if XE_PLATFORM_WINRT
+  // Frame-stall resume protection. While the system on-screen keyboard overlay
+  // is up, this application paints no frames (the overlay's UI starves the
+  // paint queue), so this function does not run and the pad presses operating
+  // the overlay never reach ImGui. The press that CLOSES the overlay, however,
+  // is still held when frames resume - and feeding it to ImGui on the first
+  // resumed frame is what canceled the still-active text field (B maps to
+  // NavCancel, A to activate) before the characters queued during the stall
+  // could land in it: in the menu the typed text only appeared after reopening
+  // the dialog, in a game keyboard dialog it was lost outright. So: if
+  // characters were typed since the previous call here and that call was over
+  // kGamepadStallMs ago (i.e. they arrived during a frame stall = an on-screen
+  // keyboard session), feed ImGui a fully released pad for a short window,
+  // extending it while a button is still physically held. Time-bounded and
+  // conditioned on actual typed characters, so it can never leave the pad
+  // dead - unlike the earlier attempt that gated the feed on the unreliable
+  // keyboard-visibility flag.
+  {
+    constexpr uint64_t kGamepadStallMs = 250;
+    constexpr uint64_t kGamepadResumeMuteMs = 400;
+    constexpr uint64_t kGamepadHeldExtendMs = 150;
+    const uint64_t now_ms = Clock::QueryHostUptimeMillis();
+    const uint64_t prev_ms = gamepad_feed_prev_uptime_ms_;
+    gamepad_feed_prev_uptime_ms_ = now_ms;
+    const uint64_t last_char_ms =
+        window_ ? window_->last_typed_character_uptime_ms() : 0;
+    if (prev_ms && now_ms - prev_ms > kGamepadStallMs &&
+        last_char_ms > prev_ms) {
+      gamepad_feed_mute_until_uptime_ms_ = now_ms + kGamepadResumeMuteMs;
+      static uint32_t mute_logs = 0;
+      if (mute_logs < 8) {
+        ++mute_logs;
+        XELOGI(
+            "ImGuiDrawer: muting the gamepad for {} ms - characters were typed "
+            "during a {} ms frame stall (on-screen keyboard session); the "
+            "closing press must not cancel the field they land in",
+            kGamepadResumeMuteMs, now_ms - prev_ms);
+      }
+    }
+    if (now_ms < gamepad_feed_mute_until_uptime_ms_) {
+      if (gamepad.buttons) {
+        // The closing press is still physically held - keep muting until it is
+        // released, plus a short tail.
+        gamepad_feed_mute_until_uptime_ms_ = now_ms + kGamepadHeldExtendMs;
+      }
+      gamepad = {};
+    }
+  }
+#endif  // XE_PLATFORM_WINRT
 
   // GUIDE BUTTON - More info needed
   if (gamepad_state.gamepad.buttons ==

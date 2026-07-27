@@ -354,6 +354,17 @@ class Window {
     std::lock_guard<std::mutex> lock(typed_characters_mutex_);
     typed_characters_.clear();
   }
+  // Host-uptime timestamp (ms) of the last typed character this window
+  // received. The ImGui drawer compares it against the time of its previous
+  // drawn frame to detect "characters were typed while no frames were running"
+  // - which on Xbox means the system on-screen keyboard overlay was up (its UI
+  // starves this application's paint queue while it is open).
+  void NoteTypedCharacterTime(uint64_t uptime_ms) {
+    last_typed_character_uptime_ms_.store(uptime_ms, std::memory_order_relaxed);
+  }
+  uint64_t last_typed_character_uptime_ms() const {
+    return last_typed_character_uptime_ms_.load(std::memory_order_relaxed);
+  }
 
   // Explicit system on-screen keyboard control for UI code that knows a text
   // field is being edited (dialogs with text input call Show every frame while
@@ -383,6 +394,8 @@ class Window {
   static constexpr size_t kTypedCharactersMax = 4096;
   std::mutex typed_characters_mutex_;
   std::vector<uint32_t> typed_characters_;
+  // See NoteTypedCharacterTime.
+  std::atomic<uint64_t> last_typed_character_uptime_ms_{0};
 
   // See SetUIThreadPaintTickCallback.
   std::function<void()> ui_thread_paint_tick_callback_;

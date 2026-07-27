@@ -605,6 +605,7 @@ void Window::OnKeyChar(KeyEvent& e,
   // field. Consumers that must work under the overlay (the guest keyboard
   // dialog) drain this instead.
   AppendTypedCharacter(uint32_t(e.virtual_key()));
+  NoteTypedCharacterTime(Clock::QueryHostUptimeMillis());
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyChar(e);
