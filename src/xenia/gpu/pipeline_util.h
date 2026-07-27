@@ -22,6 +22,13 @@ constexpr uint8_t kPriorityLowest = 0;     // Writes to unbound RTs only
 constexpr uint8_t kPriorityDepthOnly = 1;  // Depth-only writes
 constexpr uint8_t kPriorityVisibleRT = 2;  // Writes to any visible RT
 constexpr uint8_t kPriorityRT0 = 3;        // Writes to RT0 (main color buffer)
+// No pixel shader at all: a depth pre-pass, shadow map or z-fill. Compiled
+// before everything else, because until it exists its draws are skipped and
+// the depth buffer stays incomplete - every colour pass that follows then
+// depth-tests against nothing and its geometry comes out black. These are
+// also the cheapest pipelines to build (no pixel shader to compile), so
+// putting them first costs the colour pipelines almost nothing.
+constexpr uint8_t kPriorityNoPixelShader = 4;
 
 // Converts normalized_color_mask to a 4-bit bitmask of bound render targets.
 // normalized_color_mask uses 4 bits per RT (for RGBA components).
