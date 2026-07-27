@@ -43,6 +43,19 @@
 #include "xenia/ui/ui_event.h"
 #include "xenia/ui/windowed_app_context_uwp.h"
 
+DEFINE_bool(
+    uwp_use_system_keyboard, false,
+    "Xbox UWP: use the SYSTEM on-screen keyboard for text input instead of the "
+    "one Xenia draws itself. Not recommended, and off by default: the system "
+    "keyboard is a fullscreen overlay that stops this application's presents "
+    "from completing, which wedges the UI thread for the whole typing session "
+    "(typed characters then arrive a session late, landing in whatever field "
+    "is next), and none of the events that report when it opens or closes - "
+    "CoreInputView's Showing and Hiding, CoreWindow's Activated - are raised "
+    "on the console runtime, so its lifetime can only be guessed at. Xenia's "
+    "own keyboard has none of those problems.",
+    "UWP");
+
 DEFINE_int32(
     uwp_present_max_height, 0,
     "Cap the UWP swap-chain height in physical pixels (0 = use the native HDMI "
@@ -881,6 +894,11 @@ void UWPWindow::WireKeyboardVisibilityTracking() {
 }
 
 void UWPWindow::CheckKeyboardHoldGesture() {
+  if (!cvars::uwp_use_system_keyboard) {
+    // The gesture exists only to summon the SYSTEM keyboard; Xenia's own one
+    // is drawn by whichever dialog needs text.
+    return;
+  }
   int64_t start_ms = view_hold_start_ms_.load(std::memory_order_relaxed);
   if (!start_ms || view_hold_fired_) {
     return;
@@ -1030,6 +1048,12 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
 }
 
 void UWPWindow::ShowOnScreenKeyboard() {
+  if (!cvars::uwp_use_system_keyboard) {
+    // Text is entered through the keyboard Xenia draws itself (see
+    // ImGuiVirtualKeyboard) - never bring the system overlay up, it would
+    // wedge the UI thread in the present for as long as it is visible.
+    return;
+  }
   // Called every frame from a dialog's draw for as long as its text field
   // should be editable. Asking the system every frame is what fights the user:
   // the keyboard is asked for when the dialog TAKES the keyboard, and then
@@ -1091,6 +1115,12 @@ bool UWPWindow::ShouldKeepAskingForOnScreenKeyboard() const {
 }
 
 void UWPWindow::UpdateOnScreenKeyboard() {
+  if (!cvars::uwp_use_system_keyboard) {
+    // Xenia draws its own keyboard - an active text field must NOT summon the
+    // system overlay (this automatic path is what would still bring it up
+    // behind the dialogs' backs, taking the UI thread with it).
+    return;
+  }
   // A dialog is driving the keyboard explicitly - don't let the WantTextInput
   // automation hide (or re-show) it out from under the dialog.
   if (explicit_keyboard_hold_) {

@@ -37,6 +37,9 @@ class CreateProfileUI final : public XamDialog {
   char gamertag_[16] = "";
   bool valid_gamertag_ = false;
   Emulator* emulator_;
+#if XE_PLATFORM_WINRT
+  xe::ui::ImGuiVirtualKeyboard virtual_keyboard_;
+#endif  // XE_PLATFORM_WINRT
 };
 
 }  // namespace ui

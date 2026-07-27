@@ -13,6 +13,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/ui/imgui_virtual_keyboard.h"
 
 namespace xe {
 namespace kernel {
@@ -110,6 +111,12 @@ class KeyboardInputDialog : public XamDialog {
   std::vector<char> text_buffer_;
   std::string text_ = "";
   bool cancelled_ = true;
+#if XE_PLATFORM_WINRT
+  // Drawn inside the dialog - on a console the gamepad is the only way to
+  // enter text, and the system keyboard cannot be used here (see
+  // ImGuiVirtualKeyboard).
+  xe::ui::ImGuiVirtualKeyboard virtual_keyboard_;
+#endif  // XE_PLATFORM_WINRT
 };
 
 bool xeDrawProfileContent(xe::ui::ImGuiDrawer* imgui_drawer,
