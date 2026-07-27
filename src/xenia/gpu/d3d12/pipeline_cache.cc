@@ -34,6 +34,7 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/threading.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/base/string_buffer.h"
