@@ -77,11 +77,6 @@ class SharedMemory {
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
 
-    // Returns whether every page in the range is currently valid in the host GPU
-  // memory copy. Hold the global critical region if relying on this for state
-  // transitions such as watch installation.
-  bool IsRangeValid(uint32_t start, uint32_t length) const;
-
   void TryFindUploadRange(const uint32_t& block_first,
                           const uint32_t& block_last,
                           const uint32_t& page_first, const uint32_t& page_last,

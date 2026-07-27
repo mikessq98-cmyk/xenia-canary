@@ -52,7 +52,6 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
 
 DECLARE_bool(clear_memory_page_state);
 #if XE_PLATFORM_WINRT
-DECLARE_bool(d3d12_substitute_pending_pipelines);
 
 DEFINE_bool(
     d3d12_quarantine_exec_hang_suspects, false,
@@ -3357,10 +3356,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       // of a permutation burst - a briefly wrong shader is far less
       // noticeable, and the real pipeline takes over once compiled. The
       // substitute has the same root signature by construction.
+      // The mode (off / once / always) is applied inside the pipeline cache.
       void* substitute_handle =
-          cvars::d3d12_substitute_pending_pipelines
-              ? pipeline_cache_->GetReadySubstituteByHandle(pipeline_handle)
-              : nullptr;
+          pipeline_cache_->GetReadySubstituteByHandle(pipeline_handle);
       if (substitute_handle) {
         static std::atomic<uint32_t> substituted_draw_count{0};
         uint32_t n = substituted_draw_count.fetch_add(1);

@@ -151,6 +151,12 @@ class PipelineCache {
   // been found, because a suitable pipeline is usually only finished AFTER
   // the pending one was first asked for.
   void* GetReadySubstituteByHandle(void* handle);
+  // How hard to look for stand-ins - see d3d12_substitute_pending_pipelines.
+  enum class SubstituteMode {
+    kOff,
+    kOnce,
+    kAlways,
+  };
 #endif  // XE_PLATFORM_WINRT
 
   // Total resident translated shader bytecode (DXBC), for telemetry. Atomic
@@ -596,6 +602,8 @@ class PipelineCache {
   // All pipelines by substitute key, ready or not (readiness is checked when
   // picking one). Processor thread only.
   std::unordered_multimap<uint64_t, Pipeline*> substitute_index_;
+  // Parsed once at initialization - this is read per skipped draw.
+  SubstituteMode substitute_mode_ = SubstituteMode::kOnce;
 #endif  // XE_PLATFORM_WINRT
 
   // Comparator for priority queue - higher priority first.

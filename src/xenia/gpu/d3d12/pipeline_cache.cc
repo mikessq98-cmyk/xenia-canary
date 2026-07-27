@@ -72,15 +72,23 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "D3D12");
 
 #if XE_PLATFORM_WINRT
-DEFINE_bool(
-    d3d12_substitute_pending_pipelines, true,
-    "Xbox UWP: while a pipeline is still being compiled by the (slow) console "
-    "driver, draw with a READY pipeline that differs only in the pixel shader "
-    "(same root signature, vertex shader and render state) instead of "
-    "skipping the draw. Skipped draws show up as black objects in multi-pass "
-    "renderers (the depth pass is there, the material pass is not); a "
-    "briefly wrong shader is much less noticeable. The real pipeline takes "
-    "over as soon as it is ready.",
+DEFINE_string(
+    d3d12_substitute_pending_pipelines, "once",
+    "Xbox UWP: what to do with a draw whose pipeline the (slow) console driver "
+    "is still compiling. Skipping it shows up as black objects in multi-pass "
+    "renderers (the depth pass is there, the material pass is not), but "
+    "drawing with a stand-in means a briefly WRONG pixel shader - different "
+    "lighting or texture slots - so this is a trade between two artefacts.\n"
+    "  off    - skip the draw (upstream behaviour): no wrong shading ever, "
+    "black objects during a compile burst.\n"
+    "  once   - look for a stand-in when the pipeline is first needed and use "
+    "it if one already exists (default). Rarely finds one, so it is nearly "
+    "artefact-free while still covering the repeated permutations.\n"
+    "  always - keep looking every submission until a stand-in is found. "
+    "Covers far more draws, at the cost of visibly wrong shading on them.\n"
+    "A stand-in always has the same root signature, vertex shader and render "
+    "state, and writes the same render targets; only the pixel shader itself "
+    "differs. The real pipeline takes over as soon as it is ready.",
     "D3D12");
 
 DEFINE_bool(
@@ -164,7 +172,29 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
 
 PipelineCache::~PipelineCache() { Shutdown(); }
 
+#if XE_PLATFORM_WINRT
+static PipelineCache::SubstituteMode ParseSubstituteMode(
+    const std::string& value) {
+  std::string lower;
+  lower.reserve(value.size());
+  for (char c : value) {
+    lower.push_back(char(std::tolower(uint8_t(c))));
+  }
+  if (lower == "off" || lower == "false" || lower == "0") {
+    return PipelineCache::SubstituteMode::kOff;
+  }
+  if (lower == "always" || lower == "true" || lower == "1") {
+    return PipelineCache::SubstituteMode::kAlways;
+  }
+  return PipelineCache::SubstituteMode::kOnce;
+}
+#endif  // XE_PLATFORM_WINRT
+
 bool PipelineCache::Initialize() {
+#if XE_PLATFORM_WINRT
+  substitute_mode_ =
+      ParseSubstituteMode(cvars::d3d12_substitute_pending_pipelines);
+#endif  // XE_PLATFORM_WINRT
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
 
@@ -522,7 +552,7 @@ void PipelineCache::InitializeShaderStorage(
       std::memcpy(&new_pipeline->description, &pipeline_runtime_description,
                   sizeof(pipeline_runtime_description));
 #if XE_PLATFORM_WINRT
-      if (cvars::d3d12_substitute_pending_pipelines) {
+      if (substitute_mode_ != SubstituteMode::kOff) {
         // Stored pipelines are the best substitutes there are - they are
         // ready before the game asks for anything.
         new_pipeline->substitute_key =
@@ -1295,12 +1325,26 @@ bool PipelineCache::ConfigurePipeline(
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
 #if XE_PLATFORM_WINRT
-  if (cvars::d3d12_substitute_pending_pipelines) {
+  if (substitute_mode_ != SubstituteMode::kOff) {
     // Index every pipeline by what a stand-in must match, so a pipeline that
     // is still compiling can find a ready one to draw with (and so this one
     // can serve others once it is ready) in constant time per lookup.
     new_pipeline->substitute_key = ComputeSubstituteKey(runtime_description);
     substitute_index_.emplace(new_pipeline->substitute_key, new_pipeline);
+    // Look now, while the pipeline is being queued: in "once" mode this is
+    // the only search there will be.
+    if (use_async) {
+      auto range = substitute_index_.equal_range(new_pipeline->substitute_key);
+      for (auto it = range.first; it != range.second; ++it) {
+        Pipeline* candidate = it->second;
+        if (candidate != new_pipeline &&
+            candidate->state.load(std::memory_order_acquire) &&
+            AreSubstitutable(candidate->description, runtime_description)) {
+          new_pipeline->substitute.store(candidate, std::memory_order_release);
+          break;
+        }
+      }
+    }
   }
 #endif  // XE_PLATFORM_WINRT
 
@@ -1374,19 +1418,49 @@ bool PipelineCache::AreSubstitutable(const PipelineRuntimeDescription& a,
   PipelineDescription db = b.description;
   da.pixel_shader_hash = db.pixel_shader_hash = 0;
   da.pixel_shader_modification = db.pixel_shader_modification = 0;
-  return std::memcmp(&da, &db, sizeof(da)) == 0;
+  if (std::memcmp(&da, &db, sizeof(da)) != 0) {
+    return false;
+  }
+  // The stand-in must also WRITE the same things. Two pixel shaders can share
+  // a root signature and render state and still differ in whether they output
+  // colour or depth at all - substituting across that turns a subtle "wrong
+  // shading" into geometry that is missing or wrongly occluding.
+  if (!a.pixel_shader != !b.pixel_shader) {
+    return false;
+  }
+  if (a.pixel_shader && b.pixel_shader) {
+    const Shader& sa = a.pixel_shader->shader();
+    const Shader& sb = b.pixel_shader->shader();
+    if (!sa.is_ucode_analyzed() || !sb.is_ucode_analyzed()) {
+      // Without the analysis their outputs are unknown - don't guess.
+      return false;
+    }
+    if (sa.writes_color_targets() != sb.writes_color_targets() ||
+        sa.writes_depth() != sb.writes_depth()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void* PipelineCache::GetReadySubstituteByHandle(void* handle) {
+  if (substitute_mode_ == SubstituteMode::kOff) {
+    return nullptr;
+  }
   Pipeline* pipeline = reinterpret_cast<Pipeline*>(handle);
   Pipeline* substitute = pipeline->substitute.load(std::memory_order_acquire);
   if (substitute && substitute->state.load(std::memory_order_acquire)) {
     return substitute;
   }
-  // No substitute yet. Searching once when the pipeline was created finds
-  // almost nothing - the pipelines that could stand in for it are usually
-  // finished only afterwards - so retry, but at most once per submission per
-  // pipeline so a burst of skipped draws can't turn into a search storm.
+  if (substitute_mode_ != SubstituteMode::kAlways) {
+    // "once": only the stand-in found when this pipeline was first needed is
+    // used. Retrying finds one for far more draws, but every one of those
+    // draws is then shaded by the wrong pixel shader - which is the more
+    // visible artefact of the two in practice.
+    return nullptr;
+  }
+  // No substitute yet - retry, but at most once per submission per pipeline
+  // so a burst of skipped draws can't turn into a search storm.
   uint64_t submission = command_processor_.GetCurrentSubmission();
   if (pipeline->substitute_search_submission == submission) {
     return nullptr;
