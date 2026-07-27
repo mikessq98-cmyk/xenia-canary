@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <new>  // std::bad_alloc - host OOM containment on the creation threads.
@@ -1047,7 +1048,23 @@ void PipelineCache::AwaitPipelineCompletion() {
 
   if (await_creation_completion_event) {
     creation_request_cond_.notify_one();
+#if XE_PLATFORM_WINRT
+    // Bounded on the console. This waits for the WHOLE creation queue to
+    // drain, not just for the pipeline the caller needs, and that queue
+    // regularly holds a couple of hundred pipelines while a level streams in;
+    // with the driver's compiler as slow as it is, an unbounded wait blocked
+    // the GPU command processor for up to 1.7 seconds - measured - which is
+    // what showed up as the picture freezing while the game itself kept
+    // running, and as stale frames appearing over the new ones. The callers
+    // (occlusion query readback, EndSubmission) only need this to reduce
+    // racing against compilation, and all of them cope with it not having
+    // finished - so give up after a frame's worth of time and let the
+    // emulator keep presenting.
+    xe::threading::Wait(creation_completion_event_.get(), false,
+                        std::chrono::milliseconds(16));
+#else
     xe::threading::Wait(creation_completion_event_.get(), false);
+#endif  // XE_PLATFORM_WINRT
   }
 }
 
