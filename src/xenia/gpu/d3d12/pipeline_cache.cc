@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <new>  // std::bad_alloc - host OOM containment on the creation threads.
