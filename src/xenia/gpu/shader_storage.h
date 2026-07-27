@@ -378,6 +378,14 @@ class ShaderStorageWriter {
     if (storage_write_thread_) {
       {
         std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        size_t shaders_pending = storage_write_shader_queue_.size();
+        size_t pipelines_pending = storage_write_pipeline_queue_.size();
+        if (shaders_pending || pipelines_pending) {
+          XELOGGPU(
+              "Shader storage: writing out {} shader(s) and {} pipeline "
+              "description(s) still queued at shutdown",
+              shaders_pending, pipelines_pending);
+        }
         storage_write_thread_shutdown_ = true;
       }
       storage_write_request_cond_.notify_one();
@@ -481,9 +489,22 @@ class ShaderStorageWriter {
       bool write_pipeline = false;
       {
         std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-        if (storage_write_thread_shutdown_) {
+        if (storage_write_thread_shutdown_ &&
+            storage_write_shader_queue_.empty() &&
+            storage_write_pipeline_queue_.empty()) {
           return;
         }
+        // Note that shutdown does NOT return while anything is still queued.
+        // Returning immediately (and then clearing the queues in
+        // ShutdownShaderStorage) threw away everything written since the last
+        // time this thread got to run: on a console, where the queue keeps
+        // filling while a level streams in, a session that created hundreds
+        // of pipelines persisted a handful of them. Every launch then had to
+        // compile almost everything again, the creation queue grew to
+        // hundreds of entries, draws whose pipeline was not ready yet were
+        // skipped, and the render target kept the previous frame's contents
+        // where they should have been - the "old frames drawn over the new
+        // ones" the user was seeing.
         if (!storage_write_shader_queue_.empty()) {
           shader = storage_write_shader_queue_.front();
           storage_write_shader_queue_.pop_front();
