@@ -221,6 +221,13 @@ bool PipelineCache::Initialize() {
           xe::threading::Thread::Create({}, [this, i]() { CreationThread(i); });
       assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
+#if XE_PLATFORM_WINRT
+      // THREAD_PRIORITY_BELOW_NORMAL: on Xbox the app has ~6-7 cores for 30+
+      // emulator threads, and a burst of driver shader compilation at normal
+      // priority starves the guest CPU / GPU-emulation threads - the classic
+      // hard stutter when entering a new area.
+      creation_thread->set_priority(-1);
+#endif  // XE_PLATFORM_WINRT
       creation_threads_.push_back(std::move(creation_thread));
     }
   }
@@ -370,6 +377,13 @@ void PipelineCache::InitializeShaderStorage(
           });
       assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
+#if XE_PLATFORM_WINRT
+      // THREAD_PRIORITY_BELOW_NORMAL: on Xbox the app has ~6-7 cores for 30+
+      // emulator threads, and a burst of driver shader compilation at normal
+      // priority starves the guest CPU / GPU-emulation threads - the classic
+      // hard stutter when entering a new area.
+      creation_thread->set_priority(-1);
+#endif  // XE_PLATFORM_WINRT
       creation_threads_.push_back(std::move(creation_thread));
     }
 

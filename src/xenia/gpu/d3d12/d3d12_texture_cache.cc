@@ -1011,9 +1011,12 @@ bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
         if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
           scaled_resolve_committed_current_region_ = nullptr;
         }
+        // Retired with its LAST USE, which for an idle-eligible region is
+        // hundreds of submissions behind - the buffer frees on the next
+        // completed-buffers sweep instead of surviving until the current
+        // submission completes.
         scaled_resolve_retired_buffers_.push_back(
-            {command_processor_.GetCurrentSubmission(),
-             std::move(it->buffer)});
+            {it->last_use_submission, std::move(it->buffer)});
         it = scaled_resolve_regions_.erase(it);
       }
       if (scaled_resolve_committed_bytes_ + bytes_needed > cap_bytes) {
@@ -1053,18 +1056,26 @@ bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
     if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
       scaled_resolve_committed_current_region_ = nullptr;
     }
+    // Retired with the last use (long completed for an idle region), not the
+    // current submission - see the explicit-cap path above.
     scaled_resolve_retired_buffers_.push_back(
-        {command_processor_.GetCurrentSubmission(), std::move(it->buffer)});
+        {it->last_use_submission, std::move(it->buffer)});
     it = scaled_resolve_regions_.erase(it);
   }
   if (released_bytes) {
+    // An idle region's last GPU use is long completed, so this sweep frees
+    // the just-retired buffers immediately - the released memory can serve
+    // the CURRENT request, not just stop the growth.
+    ReleaseCompletedRetiredScaledResolveBuffers();
+    if (GlobalMemoryStatusEx(&memory_status)) {
+      available = memory_status.ullAvailPageFile;
+    }
     XELOGI(
         "D3D12TextureCache: released {} MB of idle scaled resolve regions "
-        "under memory pressure ({} MB commit left), {} MB still resident",
+        "under memory pressure ({} MB commit now available), {} MB still "
+        "resident",
         released_bytes >> 20, available >> 20,
         scaled_resolve_committed_bytes_ >> 20);
-    // The buffers are only freed once the GPU is done with them, so this
-    // doesn't help the current allocation - but it does stop the growth.
   }
   return available >= bytes_needed + kScaledResolveHostMemoryReserve;
 #else
@@ -1110,7 +1121,7 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
   // an overlapping region would have to be absorbed, but the result would
   // exceed the maximum region size.
   bool span_impossible = false;
-  auto compute_span = [&]() {
+  auto compute_span = [&](uint64_t merge_gap) {
     new_base = request_base;
     new_end = request_end;
     first_absorbed = SIZE_MAX;
@@ -1122,9 +1133,8 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
     // is the one that ends the highest.
     for (size_t i = 0; i < scaled_resolve_regions_.size(); ++i) {
       const ScaledResolveRegion& region = scaled_resolve_regions_[i];
-      if (region.base + region.size + kScaledResolveRegionMergeGap <=
-              request_base ||
-          region.base >= request_end + kScaledResolveRegionMergeGap) {
+      if (region.base + region.size + merge_gap <= request_base ||
+          region.base >= request_end + merge_gap) {
         continue;
       }
       if (first_absorbed == SIZE_MAX) {
@@ -1173,7 +1183,8 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
     }
     new_size = new_end - new_base;
   };
-  compute_span();
+  uint64_t span_merge_gap = kScaledResolveRegionMergeGap;
+  compute_span(span_merge_gap);
   if (span_impossible) {
     XELOGE(
         "D3D12TextureCache: scaled resolve range 0x{:X}-0x{:X} would need a "
@@ -1182,26 +1193,44 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
     return false;
   }
 
-  // Only the growth is new memory - the absorbed regions are given back.
-  if (new_size > absorbed_bytes &&
-      !MakeRoomForScaledResolveRegion(new_size - absorbed_bytes)) {
-    // Keep reporting periodically - a silent stream of these is the
-    // difference between "a few effects missing" and "the game can't render".
-    if (++scaled_resolve_budget_skips_ <= 8 ||
-        (scaled_resolve_budget_skips_ % 1000) == 0) {
-      XELOGW(
-          "D3D12TextureCache: no host memory for a {} MB scaled resolve "
-          "region at 0x{:X} ({} MB already resident) - skipping the range "
-          "(occurrence {})",
-          (new_size - absorbed_bytes) >> 20, new_base,
-          scaled_resolve_committed_bytes_ >> 20, scaled_resolve_budget_skips_);
+  // The absorbed regions' buffers stay alive until the GPU has executed the
+  // copy of their contents into the new buffer, so a merge transiently costs
+  // the WHOLE new buffer on top of everything it absorbs - budget the full new
+  // size, not just the growth (a 512 MB region grown by 4 MB peaks at over
+  // 1 GB; budgeting the 4 MB delta is how merges used to push the process
+  // into the commit wall). If the full merge doesn't fit, retry without
+  // bridging the merge gap: absorb only regions the request actually overlaps
+  // (two buffers covering the same scaled address would be incoherent) - the
+  // transient peak stays minimal at the cost of not coalescing neighbours.
+  if (!MakeRoomForScaledResolveRegion(new_size)) {
+    uint64_t full_size = new_size;
+    span_merge_gap = 0;
+    compute_span(span_merge_gap);
+    // Retrying with the same size can't succeed (the failed attempt already
+    // released what it could) - only a genuinely smaller minimal span can.
+    bool minimal_fits = !span_impossible && new_size < full_size &&
+                        MakeRoomForScaledResolveRegion(new_size);
+    if (!minimal_fits) {
+      // Keep reporting periodically - a silent stream of these is the
+      // difference between "a few effects missing" and "the game can't
+      // render".
+      if (++scaled_resolve_budget_skips_ <= 8 ||
+          (scaled_resolve_budget_skips_ % 1000) == 0) {
+        XELOGW(
+            "D3D12TextureCache: no host memory for a {} MB scaled resolve "
+            "region at 0x{:X} ({} MB already resident) - skipping the range "
+            "(occurrence {})",
+            new_size >> 20, new_base, scaled_resolve_committed_bytes_ >> 20,
+            scaled_resolve_budget_skips_);
+      }
+      return false;
     }
-    return false;
   }
 
   // Making room may have released regions this request would have absorbed -
-  // recompute against the list as it is now.
-  compute_span();
+  // recompute against the list as it is now (with the merge gap the budget was
+  // granted for).
+  compute_span(span_merge_gap);
   if (span_impossible) {
     return false;
   }
@@ -1243,14 +1272,20 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
     // reading garbage until it happens to resolve them again.
     DeferredCommandList& command_list =
         command_processor_.GetDeferredCommandList();
+    // All the transition barriers first, then all the copies - one barrier
+    // submission for the whole merge instead of one per absorbed region.
     for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
-      ScaledResolveRegion& old_region = scaled_resolve_regions_[i];
-      ScaledResolveVirtualBuffer& old_buffer = *old_region.buffer;
+      ScaledResolveVirtualBuffer& old_buffer =
+          *scaled_resolve_regions_[i].buffer;
       command_processor_.PushTransitionBarrier(
           old_buffer.resource(),
           old_buffer.SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE),
           D3D12_RESOURCE_STATE_COPY_SOURCE);
-      command_processor_.SubmitBarriers();
+    }
+    command_processor_.SubmitBarriers();
+    for (size_t i = first_absorbed; i <= last_absorbed; ++i) {
+      ScaledResolveRegion& old_region = scaled_resolve_regions_[i];
+      ScaledResolveVirtualBuffer& old_buffer = *old_region.buffer;
       command_list.D3DCopyBufferRegion(
           new_region.buffer->resource(), old_region.base - new_base,
           old_buffer.resource(), 0, old_region.size);
@@ -1261,6 +1296,9 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
         // The range must be made current again through the new buffer.
         scaled_resolve_committed_current_region_ = nullptr;
       }
+      // This buffer's contents are copied out in the CURRENT submission - it
+      // may only be freed once that has executed (unlike idle-released
+      // regions, which are retired with their long-completed last use).
       scaled_resolve_retired_buffers_.push_back(
           {command_processor_.GetCurrentSubmission(),
            std::move(old_region.buffer)});

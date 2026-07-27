@@ -28,6 +28,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
+#include "xenia/base/system.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/function.h"
 
@@ -116,6 +117,17 @@ class CodeCacheBase : public CodeCache {
     return kGeneratedCodeExecuteBase;
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
+  size_t committed_bytes() const override {
+    return generated_code_commit_mark_.load(std::memory_order_relaxed);
+  }
+  size_t indirection_committed_bytes() const override {
+    return indirection_committed_bytes_.load(std::memory_order_relaxed);
+  }
+  size_t function_count() const override {
+    // Telemetry-only read; the vector never reallocates (reserved to the
+    // maximum), so racing with a concurrent emplace_back is benign.
+    return generated_code_map_.size();
+  }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
 
@@ -140,8 +152,11 @@ class CodeCacheBase : public CodeCache {
         indirection_table_base_ + (guest_low - kIndirectionTableBase),
         guest_high - guest_low, xe::memory::AllocationType::kCommit,
         xe::memory::PageAccess::kReadWrite);
+    indirection_committed_bytes_ += guest_high - guest_low;
+    // One 4-byte slot per (4-byte-aligned) guest instruction address -
+    // stepping by 1 would rewrite every slot four times.
     uint32_t* p = reinterpret_cast<uint32_t*>(indirection_table_base_);
-    for (uint32_t address = guest_low; address < guest_high; ++address) {
+    for (uint32_t address = guest_low; address < guest_high; address += 4) {
       p[(address - kIndirectionTableBase) / 4] = indirection_default_value_;
     }
   }
@@ -183,6 +198,16 @@ class CodeCacheBase : public CodeCache {
           generated_code_write_base_ + generated_code_offset_;
 
       size_t high_mark = generated_code_offset_;
+      if (high_mark > kGeneratedCodeSize) {
+        // Without this the memcpy below writes into the tail of the
+        // reservation that can never be committed - a mystery access
+        // violation far from the cause. Make the exhaustion loud instead.
+        xe::FatalError(fmt::format(
+            "The JIT code cache is exhausted ({} MB of generated code, {} "
+            "functions) - the reservation in code_cache_base.h must be "
+            "enlarged.",
+            kGeneratedCodeSize >> 20, generated_code_map_.size()));
+      }
 
       generated_code_map_.emplace_back(
           (uint64_t(code_execute_address - generated_code_execute_base_)
@@ -235,6 +260,11 @@ class CodeCacheBase : public CodeCache {
       data_address = generated_code_write_base_ + generated_code_offset_;
       generated_code_offset_ += xe::round_up(length, 16);
       high_mark = generated_code_offset_;
+    }
+    if (high_mark > kGeneratedCodeSize) {
+      xe::FatalError(fmt::format(
+          "The JIT code cache is exhausted ({} MB) while placing data.",
+          kGeneratedCodeSize >> 20));
     }
     EnsureCommitted(high_mark);
     std::memcpy(data_address, data, length);
@@ -412,6 +442,9 @@ class CodeCacheBase : public CodeCache {
   uint8_t* generated_code_write_base_ = nullptr;
   size_t generated_code_offset_ = 0;
   std::atomic<size_t> generated_code_commit_mark_ = {0};
+  // Total bytes of the indirection table committed through
+  // CommitExecutableRange (i.e. the size of the guest executable ranges).
+  std::atomic<size_t> indirection_committed_bytes_ = {0};
   std::vector<std::pair<uint64_t, GuestFunction*>> generated_code_map_;
 
  private:
@@ -434,10 +467,17 @@ class CodeCacheBase : public CodeCache {
       // JIT code from them (observed as random execute-DEP crashes on
       // long-committed thunk/code pages whenever the cache grew).
       if (generated_code_execute_base_ == generated_code_write_base_) {
-        xe::memory::AllocFixed(generated_code_execute_base_ + old_commit_mark,
-                               new_commit_mark - old_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kExecuteReadWrite);
+        if (!xe::memory::AllocFixed(
+                generated_code_execute_base_ + old_commit_mark,
+                new_commit_mark - old_commit_mark,
+                xe::memory::AllocationType::kCommit,
+                xe::memory::PageAccess::kExecuteReadWrite)) {
+          // A silent failure here meant generated code was memcpy'd into
+          // uncommitted pages - a crash with no connection to the cause.
+          xe::FatalError(
+              "Failed to commit JIT code cache memory - the host is out of "
+              "memory.");
+        }
       } else {
         xe::memory::AllocFixed(generated_code_execute_base_ + old_commit_mark,
                                new_commit_mark - old_commit_mark,

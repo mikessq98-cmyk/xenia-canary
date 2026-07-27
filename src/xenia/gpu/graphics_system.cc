@@ -16,6 +16,9 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
+#include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/kernel/kernel_state.h"
@@ -168,6 +171,18 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                   last_memory_stats_time = now;
                   memory_->LogMemoryStatistics();
                   command_processor_->LogHostMemoryStatistics();
+                  if (processor_ && processor_->backend() &&
+                      processor_->backend()->code_cache()) {
+                    const cpu::backend::CodeCache* code_cache =
+                        processor_->backend()->code_cache();
+                    XELOGI(
+                        "[MEM] JIT: code cache {} MB committed (of {} MB "
+                        "reserved), indirection table {} MB, {} functions",
+                        code_cache->committed_bytes() >> 20,
+                        code_cache->total_size() >> 20,
+                        code_cache->indirection_committed_bytes() >> 20,
+                        code_cache->function_count());
+                  }
                 }
               }
 

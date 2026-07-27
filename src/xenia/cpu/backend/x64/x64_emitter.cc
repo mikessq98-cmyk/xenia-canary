@@ -739,6 +739,20 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     // Load the pointer to the indirection table maintained in X64CodeCache.
     // The target dword will either contain the address of the generated code
     // or a thunk to ResolveAddress.
+    // Telemetry: this site stays on the indirect path FOREVER, even after the
+    // callee is compiled - only callees already compiled when the CALLER is
+    // translated get the direct `call imm32` above, and lazy translation
+    // discovers callers before callees. The count sizes the potential win of
+    // a re-translation pass that would upgrade these to direct calls.
+    static std::atomic<uint32_t> stuck_indirect_sites{0};
+    uint32_t stuck =
+        stuck_indirect_sites.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (stuck >= 1024 && (stuck & (stuck - 1)) == 0) {  // Powers of two.
+      XELOGI(
+          "JIT: {} static call sites emitted through the indirection table "
+          "(callee not yet compiled when the caller was translated)",
+          stuck);
+    }
     mov(ebx, function->address());
     mov(eax, dword[ebx]);
   } else {
