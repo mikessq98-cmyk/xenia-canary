@@ -282,6 +282,9 @@ void PipelineCache::Shutdown() {
     }
     delete it.second;
   }
+#if XE_PLATFORM_WINRT
+  substitute_index_.clear();
+#endif  // XE_PLATFORM_WINRT
   pipelines_.clear();
   COUNT_profile_set("gpu/pipeline_cache/pipelines", 0);
 
@@ -517,6 +520,15 @@ void PipelineCache::InitializeShaderStorage(
       Pipeline* new_pipeline = new Pipeline;
       std::memcpy(&new_pipeline->description, &pipeline_runtime_description,
                   sizeof(pipeline_runtime_description));
+#if XE_PLATFORM_WINRT
+      if (cvars::d3d12_substitute_pending_pipelines) {
+        // Stored pipelines are the best substitutes there are - they are
+        // ready before the game asks for anything.
+        new_pipeline->substitute_key =
+            ComputeSubstituteKey(pipeline_runtime_description);
+        substitute_index_.emplace(new_pipeline->substitute_key, new_pipeline);
+      }
+#endif  // XE_PLATFORM_WINRT
       // Calculate priority based on whether shader writes to visible RTs.
       if (pixel_shader) {
         uint32_t bound_rts =
@@ -1261,17 +1273,17 @@ bool PipelineCache::ConfigurePipeline(
   pipelines_.emplace(hash, new_pipeline);
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
-  if (use_async) {
 #if XE_PLATFORM_WINRT
-    if (cvars::d3d12_substitute_pending_pipelines) {
-      // Find a READY pipeline this one can borrow while the driver compiles
-      // it - drawing with a same-VS/same-state pipeline whose only difference
-      // is the pixel shader beats skipping the draw outright (skips are the
-      // "black objects" during permutation bursts).
-      new_pipeline->substitute.store(FindReadySubstitute(runtime_description),
-                                     std::memory_order_release);
-    }
+  if (cvars::d3d12_substitute_pending_pipelines) {
+    // Index every pipeline by what a stand-in must match, so a pipeline that
+    // is still compiling can find a ready one to draw with (and so this one
+    // can serve others once it is ready) in constant time per lookup.
+    new_pipeline->substitute_key = ComputeSubstituteKey(runtime_description);
+    substitute_index_.emplace(new_pipeline->substitute_key, new_pipeline);
+  }
 #endif  // XE_PLATFORM_WINRT
+
+  if (use_async) {
     // Queue for background thread.
     new_pipeline->pending_vertex_shader = vertex_shader;
     new_pipeline->pending_pixel_shader = pixel_shader;
@@ -1311,31 +1323,63 @@ bool PipelineCache::ConfigurePipeline(
 }
 
 #if XE_PLATFORM_WINRT
-PipelineCache::Pipeline* PipelineCache::FindReadySubstitute(
-    const PipelineRuntimeDescription& runtime_description) const {
-  // The candidate must be interchangeable at the API level: the SAME root
-  // signature object (a substituted bind under a different root signature is
-  // a device loss - the binding layout recorded for the draw wouldn't match),
-  // the same vertex shader translation and geometry shader, and an identical
-  // fixed-function description. Only the pixel shader identity may differ.
-  for (const auto& entry : pipelines_) {
-    Pipeline* candidate = entry.second;
-    if (!candidate->state.load(std::memory_order_acquire)) {
+uint64_t PipelineCache::ComputeSubstituteKey(
+    const PipelineRuntimeDescription& runtime_description) {
+  struct {
+    ID3D12RootSignature* root_signature;
+    D3D12Shader::D3D12Translation* vertex_shader;
+    const std::vector<uint32_t>* geometry_shader;
+    PipelineDescription description;
+  } key_data;
+  std::memset(&key_data, 0, sizeof(key_data));
+  key_data.root_signature = runtime_description.root_signature;
+  key_data.vertex_shader = runtime_description.vertex_shader;
+  key_data.geometry_shader = runtime_description.geometry_shader;
+  key_data.description = runtime_description.description;
+  // The pixel shader identity is the one thing a substitute may differ in.
+  key_data.description.pixel_shader_hash = 0;
+  key_data.description.pixel_shader_modification = 0;
+  return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
+bool PipelineCache::AreSubstitutable(const PipelineRuntimeDescription& a,
+                                     const PipelineRuntimeDescription& b) {
+  if (a.root_signature != b.root_signature ||
+      a.vertex_shader != b.vertex_shader ||
+      a.geometry_shader != b.geometry_shader) {
+    return false;
+  }
+  PipelineDescription da = a.description;
+  PipelineDescription db = b.description;
+  da.pixel_shader_hash = db.pixel_shader_hash = 0;
+  da.pixel_shader_modification = db.pixel_shader_modification = 0;
+  return std::memcmp(&da, &db, sizeof(da)) == 0;
+}
+
+void* PipelineCache::GetReadySubstituteByHandle(void* handle) {
+  Pipeline* pipeline = reinterpret_cast<Pipeline*>(handle);
+  Pipeline* substitute = pipeline->substitute.load(std::memory_order_acquire);
+  if (substitute && substitute->state.load(std::memory_order_acquire)) {
+    return substitute;
+  }
+  // No substitute yet. Searching once when the pipeline was created finds
+  // almost nothing - the pipelines that could stand in for it are usually
+  // finished only afterwards - so retry, but at most once per submission per
+  // pipeline so a burst of skipped draws can't turn into a search storm.
+  uint64_t submission = command_processor_.GetCurrentSubmission();
+  if (pipeline->substitute_search_submission == submission) {
+    return nullptr;
+  }
+  pipeline->substitute_search_submission = submission;
+  auto range = substitute_index_.equal_range(pipeline->substitute_key);
+  for (auto it = range.first; it != range.second; ++it) {
+    Pipeline* candidate = it->second;
+    if (candidate == pipeline ||
+        !candidate->state.load(std::memory_order_acquire) ||
+        !AreSubstitutable(candidate->description, pipeline->description)) {
       continue;
     }
-    const PipelineRuntimeDescription& c = candidate->description;
-    if (c.root_signature != runtime_description.root_signature ||
-        c.vertex_shader != runtime_description.vertex_shader ||
-        c.geometry_shader != runtime_description.geometry_shader) {
-      continue;
-    }
-    PipelineDescription a = c.description;
-    PipelineDescription b = runtime_description.description;
-    a.pixel_shader_hash = b.pixel_shader_hash = 0;
-    a.pixel_shader_modification = b.pixel_shader_modification = 0;
-    if (std::memcmp(&a, &b, sizeof(a)) != 0) {
-      continue;
-    }
+    pipeline->substitute.store(candidate, std::memory_order_release);
     return candidate;
   }
   return nullptr;

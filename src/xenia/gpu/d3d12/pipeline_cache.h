@@ -137,16 +137,11 @@ class PipelineCache {
   // pixel shader differs - or nullptr. Drawing with it instead of skipping
   // the draw is what prevents "black objects" (a multi-pass renderer keeps
   // its depth pass but loses the material pass) while the console driver
-  // chews through a permutation burst.
-  void* GetReadySubstituteByHandle(void* handle) const {
-    Pipeline* substitute =
-        reinterpret_cast<const Pipeline*>(handle)->substitute.load(
-            std::memory_order_acquire);
-    if (!substitute || !substitute->state.load(std::memory_order_acquire)) {
-      return nullptr;
-    }
-    return substitute;
-  }
+  // chews through a permutation burst. Command processor thread only: the
+  // search re-runs (at most once per submission) while no substitute has
+  // been found, because a suitable pipeline is usually only finished AFTER
+  // the pending one was first asked for.
+  void* GetReadySubstituteByHandle(void* handle);
 #endif  // XE_PLATFORM_WINRT
 
   // Total resident translated shader bytecode (DXBC), for telemetry. Atomic
@@ -547,10 +542,16 @@ class PipelineCache {
     std::atomic<ID3D12PipelineState*> state{nullptr};
     PipelineRuntimeDescription description;
 #if XE_PLATFORM_WINRT
-    // See GetReadySubstituteByHandle. Set once at enqueue time on the
-    // processor thread; pipelines live until ClearCache, so the pointer stays
-    // valid for this pipeline's whole life.
+    // See GetReadySubstituteByHandle. Pipelines live until ClearCache, so a
+    // found substitute stays valid for this pipeline's whole life.
     std::atomic<Pipeline*> substitute{nullptr};
+    // Hash over everything a substitute must match (root signature, vertex
+    // and geometry shader, and the whole fixed-function description with the
+    // pixel shader identity zeroed) - the key into substitute_index_.
+    uint64_t substitute_key = 0;
+    // Submission of the last unsuccessful substitute search, so the search
+    // runs at most once per submission per pipeline.
+    uint64_t substitute_search_submission = UINT64_MAX;
 #endif  // XE_PLATFORM_WINRT
     // For background creation: stores the untranslated shaders.
     // Background thread translates both VS and PS together, then creates the
@@ -571,12 +572,19 @@ class PipelineCache {
   static void ReleasePipelineTranslationsFromCreation(Pipeline* pipeline);
 
 #if XE_PLATFORM_WINRT
-  // Finds a READY pipeline differing from the given description only in the
-  // pixel shader (the root signature must be the same object - a substituted
-  // bind under a different root signature is a device loss). Processor thread
-  // only (walks pipelines_). O(pipeline count), called once per NEW pipeline.
-  Pipeline* FindReadySubstitute(
-      const PipelineRuntimeDescription& runtime_description) const;
+  // Hash over everything a substitute must match - see Pipeline::
+  // substitute_key.
+  static uint64_t ComputeSubstituteKey(
+      const PipelineRuntimeDescription& runtime_description);
+  // Whether two pipelines may stand in for each other: everything except the
+  // pixel shader identity must be equal, and the root signature must be the
+  // SAME object (a substituted bind under a different root signature is a
+  // device loss).
+  static bool AreSubstitutable(const PipelineRuntimeDescription& a,
+                               const PipelineRuntimeDescription& b);
+  // All pipelines by substitute key, ready or not (readiness is checked when
+  // picking one). Processor thread only.
+  std::unordered_multimap<uint64_t, Pipeline*> substitute_index_;
 #endif  // XE_PLATFORM_WINRT
 
   // Comparator for priority queue - higher priority first.

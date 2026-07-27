@@ -53,6 +53,15 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
 DECLARE_bool(clear_memory_page_state);
 #if XE_PLATFORM_WINRT
 DECLARE_bool(d3d12_substitute_pending_pipelines);
+
+DEFINE_bool(
+    d3d12_log_slow_draw_phases, true,
+    "Xbox UWP: log when a single phase of a draw blocks the GPU command "
+    "processor long enough to be felt as a stutter, naming the phase "
+    "(pipeline configuration, texture requests, submission). This is how a "
+    "stutter is attributed to a cause instead of guessed at; the measurement "
+    "itself is two timer reads per phase.",
+    "D3D12");
 #endif  // XE_PLATFORM_WINRT
 
 #if XE_PLATFORM_WINRT
@@ -97,6 +106,30 @@ namespace gpu {
 namespace d3d12 {
 
 #if XE_PLATFORM_WINRT
+// Reports a phase of draw processing that blocked the GPU command processor
+// long enough for the user to feel it. Attributing a stutter to a phase is
+// the whole point - "async compilation is on but it stutters like sync" can
+// mean the pipeline path, the texture path, or waiting on the GPU, and these
+// need completely different fixes.
+static void ReportSlowDrawPhase(const char* phase, uint64_t start_ticks) {
+  if (!cvars::d3d12_log_slow_draw_phases) {
+    return;
+  }
+  static const double kTicksToMs =
+      1000.0 / double(Clock::QueryHostTickFrequency());
+  double ms = double(Clock::QueryHostTickCount() - start_ticks) * kTicksToMs;
+  if (ms < 20.0) {
+    return;
+  }
+  static std::atomic<uint32_t> slow_phase_count{0};
+  uint32_t n = slow_phase_count.fetch_add(1, std::memory_order_relaxed);
+  if (n < 32 || (n % 128) == 0) {
+    XELOGW(
+        "GPU command processor blocked {:.1f} ms in {} (slow phase {})", ms,
+        phase, n + 1);
+  }
+}
+
 // One [VS, PS] skip rule. std::nullopt means the keyword "sol" was given for
 // that position - a wildcard that matches any shader hash.
 struct ShaderSkipPair {
@@ -3175,6 +3208,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
+#if XE_PLATFORM_WINRT
+  uint64_t pipeline_phase_start_ticks = Clock::QueryHostTickCount();
+#endif  // XE_PLATFORM_WINRT
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
@@ -3186,6 +3222,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                    failure_count);
     return false;
   }
+#if XE_PLATFORM_WINRT
+  // Covers shader microcode analysis and, in the non-async path, the whole
+  // translation plus PSO creation on this thread.
+  ReportSlowDrawPhase("pipeline configuration", pipeline_phase_start_ticks);
+#endif  // XE_PLATFORM_WINRT
 
   if (cvars::async_shader_compilation) {
     if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
@@ -3238,7 +3279,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       (pixel_shader != nullptr
            ? pixel_shader->GetUsedTextureMaskAfterTranslation()
            : 0);
+#if XE_PLATFORM_WINRT
+  uint64_t texture_phase_start_ticks = Clock::QueryHostTickCount();
+#endif  // XE_PLATFORM_WINRT
   texture_cache_->RequestTextures(used_texture_mask);
+#if XE_PLATFORM_WINRT
+  // Covers loading and converting guest textures - the other classic source
+  // of a multi-frame hitch when a scene brings in new material.
+  ReportSlowDrawPhase("texture requests", texture_phase_start_ticks);
+#endif  // XE_PLATFORM_WINRT
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -4056,6 +4105,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+#if XE_PLATFORM_WINRT
+  // The third stutter candidate: waiting for the GPU / the driver at
+  // submission time rather than for anything on this thread.
+  struct SubmissionPhaseTimer {
+    uint64_t start_ticks = Clock::QueryHostTickCount();
+    ~SubmissionPhaseTimer() { ReportSlowDrawPhase("submission", start_ticks); }
+  } submission_phase_timer;
+#endif  // XE_PLATFORM_WINRT
 
   // Make sure there is a command allocator to write commands to.
   if (submission_open_ && !command_allocator_writable_first_) {
