@@ -35,6 +35,7 @@
 #undef XINPUT_DEVTYPE_GAMEPAD
 #undef XINPUT_DEVSUBTYPE_GAMEPAD
 
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/ui/imgui_drawer.h"
@@ -285,11 +286,15 @@ bool UWPWindow::IsPaintParkedForOnScreenKeyboard() const {
   if (!shown_ms) {
     return false;
   }
-  int64_t now_ms =
-      int64_t(winrt::clock::now().time_since_epoch().count() / 10000);
-  // Safety cap: if the system's hide event never arrives, resume painting
-  // anyway rather than leaving the UI frozen.
-  return now_ms - shown_ms <= kKeyboardPaintParkMaxMs;
+  // The typing session is confirmed alive by the show call and by every typed
+  // character. If neither has happened for a while, resume painting: on this
+  // runtime BOTH CoreInputView visibility events are known to never arrive,
+  // and the window-reactivation signal may be missing too - a lost session
+  // end must never freeze the UI for long.
+  int64_t last_activity_ms =
+      std::max(shown_ms, int64_t(last_typed_character_uptime_ms()));
+  int64_t now_ms = int64_t(Clock::QueryHostUptimeMillis());
+  return now_ms - last_activity_ms <= kKeyboardPaintParkMaxMs;
 }
 
 void UWPWindow::RequestPaintImpl() {
@@ -411,6 +416,41 @@ void UWPWindow::WireCoreWindowInput() {
            wuc::CoreVirtualKeyStates::Down;
   };
 
+  // The PRIMARY end-of-typing-session signal: when the system keyboard
+  // overlay dismisses, this window is reactivated. On this runtime BOTH
+  // CoreInputView visibility events (Showing and Hiding) never arrive, so
+  // without this the paint parking (see IsPaintParkedForOnScreenKeyboard)
+  // would only ever end through the activity time cap - a frozen UI after
+  // every keyboard use.
+  core_window_.Activated([this](const wuc::CoreWindow&,
+                                const wuc::WindowActivatedEventArgs& e) {
+    if (e.WindowActivationState() ==
+        wuc::CoreWindowActivationState::Deactivated) {
+      return;
+    }
+    NoteInputActivity();
+    if (!keyboard_shown_uptime_ms_.load(std::memory_order_relaxed)) {
+      // No typing session in progress - reactivation from something else
+      // (e.g. the guide overlay closing).
+      return;
+    }
+    XELOGI(
+        "UWPWindow: window reactivated - ending the on-screen keyboard "
+        "typing session ({} characters arrived)",
+        keyboard_char_count_.load(std::memory_order_relaxed));
+    keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
+    // Same semantics as the (never-arriving) Hiding event: the keyboard went
+    // away while something still wanted it - the user closed it, and that
+    // stands until the dialog/field gives the keyboard up.
+    keyboard_visible_ = false;
+    if (keyboard_wanted_.load(std::memory_order_relaxed)) {
+      keyboard_dismissed_by_user_ = true;
+    }
+    paint_parked_for_keyboard_.store(false, std::memory_order_relaxed);
+    // Repaint immediately so the collected characters land on screen now.
+    RequestPaint();
+  });
+
   // Typed characters - delivered for physical keys and for the on-screen
   // keyboard alike. This is what feeds ImGui text fields.
   core_window_.CharacterReceived(
@@ -433,11 +473,8 @@ void UWPWindow::WireCoreWindowInput() {
           int64_t shown_ms =
               keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
           int64_t since_show_ms =
-              shown_ms
-                  ? int64_t(winrt::clock::now().time_since_epoch().count() /
-                            10000) -
-                        shown_ms
-                  : -1;
+              shown_ms ? int64_t(Clock::QueryHostUptimeMillis()) - shown_ms
+                       : -1;
           XELOGI(
               "UWPWindow: character 0x{:04X} received - {} frames painted "
               "since the keyboard came up, {} ms after show, ImGui wants text "
@@ -798,9 +835,8 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
       // Park painting for the typing session - under the fullscreen overlay
       // presents stop completing and would wedge the UI thread, which must
       // stay free to dispatch the typed characters.
-      keyboard_shown_uptime_ms_.store(
-          int64_t(winrt::clock::now().time_since_epoch().count() / 10000),
-          std::memory_order_relaxed);
+      keyboard_shown_uptime_ms_.store(int64_t(Clock::QueryHostUptimeMillis()),
+                                      std::memory_order_relaxed);
     } else {
       keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
       if (paint_parked_for_keyboard_.exchange(false,

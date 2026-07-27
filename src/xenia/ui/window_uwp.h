@@ -149,12 +149,17 @@ class UWPWindow final : public Window {
   // occluded), which wedges the UI thread inside OnPaint for the whole typing
   // session - and a wedged UI thread cannot dispatch CharacterReceived, so the
   // typed text only ever arrived a session late. Nothing is visible behind the
-  // overlay anyway. Cleared by the hide events / the applied hide call, with a
-  // time cap as a safety net in case no hide event ever arrives.
+  // overlay anyway. Ended by the window-reactivation event (the reliable
+  // signal - BOTH CoreInputView visibility events never arrive on this
+  // runtime), the hide events if they ever do arrive, the applied hide call,
+  // or the activity time cap: painting resumes when neither the show call nor
+  // a typed character has confirmed the session within
+  // kKeyboardPaintParkMaxMs, so a lost session end can only freeze the UI
+  // briefly. Host-uptime ms (Clock::QueryHostUptimeMillis).
   std::atomic<int64_t> keyboard_shown_uptime_ms_{0};
   // A paint was skipped while parked - repaint as soon as the keyboard hides.
   std::atomic<bool> paint_parked_for_keyboard_{false};
-  static constexpr int64_t kKeyboardPaintParkMaxMs = 120000;
+  static constexpr int64_t kKeyboardPaintParkMaxMs = 20000;
   // Whether painting is currently parked for the on-screen keyboard (visible,
   // shown timestamp set, safety cap not yet exceeded).
   bool IsPaintParkedForOnScreenKeyboard() const;
