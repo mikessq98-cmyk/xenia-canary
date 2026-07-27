@@ -183,6 +183,34 @@ void UWPWindow::StartPaintLoop() {
           paint_tail_ticks_ = 12;  // ~200 ms of follow-up frames at 60 Hz.
         }
 
+        // On-screen keyboard close-probe expiry and activity cap. Every
+        // system end-of-session notification is dead on this runtime, so this
+        // timer is what actually ends the typing session (see
+        // EndOnScreenKeyboardSession).
+        int64_t session_shown_ms =
+            keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+        if (session_shown_ms) {
+          int64_t now_ms = int64_t(Clock::QueryHostUptimeMillis());
+          int64_t probe_deadline = keyboard_close_probe_deadline_ms_.load(
+              std::memory_order_relaxed);
+          if (probe_deadline && now_ms >= probe_deadline) {
+            keyboard_close_probe_deadline_ms_.store(0,
+                                                    std::memory_order_relaxed);
+            if (keyboard_char_count_.load(std::memory_order_relaxed) ==
+                keyboard_close_probe_char_count_.load(
+                    std::memory_order_relaxed)) {
+              keyboard_probe_end_ms_.store(now_ms, std::memory_order_relaxed);
+              EndOnScreenKeyboardSession(
+                  "a close-suspect press with no character following");
+            }
+          } else if (now_ms -
+                         std::max(session_shown_ms,
+                                  int64_t(last_typed_character_uptime_ms())) >
+                     kKeyboardPaintParkMaxMs) {
+            EndOnScreenKeyboardSession("no activity for the whole cap window");
+          }
+        }
+
         const bool wants_text = imgui_wants_text_input();
         const bool holding_view =
             view_hold_start_ms_.load(std::memory_order_relaxed) != 0;
@@ -243,6 +271,7 @@ bool UWPWindow::PollGamepadActivity() {
   // defeat the point of idling.
   const bool rescan_empty = (gamepad_rescan_counter_++ % 60) == 0;
   bool changed = false;
+  bool any_b_down = false;
   for (DWORD user = 0; user < 4; ++user) {
     if (!gamepad_connected_[user] && !rescan_empty) {
       continue;
@@ -259,6 +288,7 @@ bool UWPWindow::PollGamepadActivity() {
       // tiniest analog jitter, which would wake a repaint every single tick and
       // pin the GPU at a "static" menu forever.
       const XINPUT_GAMEPAD& pad = state.Gamepad;
+      any_b_down |= (pad.wButtons & XINPUT_GAMEPAD_B) != 0;
       constexpr uint8_t kTrigger = XINPUT_GAMEPAD_TRIGGER_THRESHOLD;  // 30
       uint32_t sig = pad.wButtons;
       sig |= QuantizeThumbAxis(pad.sThumbLX) << 16;
@@ -275,6 +305,25 @@ bool UWPWindow::PollGamepadActivity() {
       gamepad_connected_[user] = false;
     }
   }
+  // Close-press detection for the on-screen keyboard typing session: XInput
+  // sees the pad even while the system overlay consumes it. A B press that no
+  // character follows within kKeyboardCloseProbeMs is the press that CLOSED
+  // the keyboard - every typing press (letters via A, backspace X, space Y,
+  // enter) produces a character within tens of ms, and D-pad navigation
+  // between keys is deliberately not treated as a close suspect. The probe's
+  // outcome is checked by the timer tick in StartPaintLoop.
+  if (keyboard_shown_uptime_ms_.load(std::memory_order_relaxed)) {
+    if (any_b_down && !keyboard_pad_b_down_prev_ &&
+        !keyboard_close_probe_deadline_ms_.load(std::memory_order_relaxed)) {
+      keyboard_close_probe_char_count_.store(
+          keyboard_char_count_.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+      keyboard_close_probe_deadline_ms_.store(
+          int64_t(Clock::QueryHostUptimeMillis()) + kKeyboardCloseProbeMs,
+          std::memory_order_relaxed);
+    }
+  }
+  keyboard_pad_b_down_prev_ = any_b_down;
   return changed;
 }
 
@@ -295,6 +344,27 @@ bool UWPWindow::IsPaintParkedForOnScreenKeyboard() const {
       std::max(shown_ms, int64_t(last_typed_character_uptime_ms()));
   int64_t now_ms = int64_t(Clock::QueryHostUptimeMillis());
   return now_ms - last_activity_ms <= kKeyboardPaintParkMaxMs;
+}
+
+void UWPWindow::EndOnScreenKeyboardSession(const char* reason) {
+  if (!keyboard_shown_uptime_ms_.exchange(0, std::memory_order_relaxed)) {
+    return;
+  }
+  XELOGI(
+      "UWPWindow: on-screen keyboard session ended ({}) - {} characters "
+      "arrived, resuming painting",
+      reason, keyboard_char_count_.load(std::memory_order_relaxed));
+  keyboard_close_probe_deadline_ms_.store(0, std::memory_order_relaxed);
+  // Same semantics as the (dead) system Hiding event: the keyboard went away
+  // while something still wanted it - that stands until the dialog or field
+  // gives the keyboard up, so it isn't immediately re-shown.
+  keyboard_visible_.store(false, std::memory_order_relaxed);
+  if (keyboard_wanted_.load(std::memory_order_relaxed)) {
+    keyboard_dismissed_by_user_ = true;
+  }
+  paint_parked_for_keyboard_.store(false, std::memory_order_relaxed);
+  // Repaint immediately - the collected characters land on screen now.
+  RequestPaint();
 }
 
 void UWPWindow::RequestPaintImpl() {
@@ -429,26 +499,7 @@ void UWPWindow::WireCoreWindowInput() {
       return;
     }
     NoteInputActivity();
-    if (!keyboard_shown_uptime_ms_.load(std::memory_order_relaxed)) {
-      // No typing session in progress - reactivation from something else
-      // (e.g. the guide overlay closing).
-      return;
-    }
-    XELOGI(
-        "UWPWindow: window reactivated - ending the on-screen keyboard "
-        "typing session ({} characters arrived)",
-        keyboard_char_count_.load(std::memory_order_relaxed));
-    keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
-    // Same semantics as the (never-arriving) Hiding event: the keyboard went
-    // away while something still wanted it - the user closed it, and that
-    // stands until the dialog/field gives the keyboard up.
-    keyboard_visible_ = false;
-    if (keyboard_wanted_.load(std::memory_order_relaxed)) {
-      keyboard_dismissed_by_user_ = true;
-    }
-    paint_parked_for_keyboard_.store(false, std::memory_order_relaxed);
-    // Repaint immediately so the collected characters land on screen now.
-    RequestPaint();
+    EndOnScreenKeyboardSession("window reactivated");
   });
 
   // Typed characters - delivered for physical keys and for the on-screen
@@ -456,6 +507,26 @@ void UWPWindow::WireCoreWindowInput() {
   core_window_.CharacterReceived(
       [this](const wuc::CoreWindow&, const wuc::CharacterReceivedEventArgs& e) {
         NoteInputActivity();
+        // A character proves the keyboard is still up: cancel any pending
+        // close-probe (see PollGamepadActivity). And if a probe just ended
+        // the session on a wrong guess (a B press that didn't close the
+        // keyboard - e.g. a layout switch), re-park: the re-park window keeps
+        // physical-keyboard typing, which also lands here, from ever parking
+        // anything.
+        keyboard_close_probe_deadline_ms_.store(0, std::memory_order_relaxed);
+        int64_t char_now_ms = int64_t(Clock::QueryHostUptimeMillis());
+        if (!keyboard_shown_uptime_ms_.load(std::memory_order_relaxed) &&
+            char_now_ms -
+                    keyboard_probe_end_ms_.load(std::memory_order_relaxed) <
+                kKeyboardReparkWindowMs) {
+          XELOGI(
+              "UWPWindow: a character arrived right after the close-probe "
+              "ended the session - the keyboard is still up, re-parking");
+          keyboard_dismissed_by_user_ = false;
+          keyboard_visible_.store(true, std::memory_order_relaxed);
+          keyboard_shown_uptime_ms_.store(char_now_ms,
+                                          std::memory_order_relaxed);
+        }
         // Typed text only reaches an ImGui field if a frame runs while the
         // field is active - and the system keyboard is an overlay that may
         // take the UI thread for itself. Report the character together with
@@ -482,6 +553,16 @@ void UWPWindow::WireCoreWindowInput() {
               uint32_t(e.KeyCode()),
               paints_since_keyboard_shown_.load(std::memory_order_relaxed),
               since_show_ms, imgui_wants_text_input() ? "yes" : "no");
+        }
+        if (e.KeyCode() == 0x000D &&
+            keyboard_shown_uptime_ms_.load(std::memory_order_relaxed)) {
+          // Enter both types 0x0D and normally closes the keyboard - if
+          // nothing else is typed shortly after, the session is over.
+          keyboard_close_probe_char_count_.store(
+              keyboard_char_count_.load(std::memory_order_relaxed),
+              std::memory_order_relaxed);
+          keyboard_close_probe_deadline_ms_.store(
+              char_now_ms + kKeyboardEnterProbeMs, std::memory_order_relaxed);
         }
         KeyEvent ke(this, static_cast<VirtualKey>(e.KeyCode()),
                     int(e.KeyStatus().RepeatCount), e.KeyStatus().WasKeyDown,

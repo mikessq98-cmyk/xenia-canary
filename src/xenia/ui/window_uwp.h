@@ -160,6 +160,31 @@ class UWPWindow final : public Window {
   // A paint was skipped while parked - repaint as soon as the keyboard hides.
   std::atomic<bool> paint_parked_for_keyboard_{false};
   static constexpr int64_t kKeyboardPaintParkMaxMs = 20000;
+  // Layered end-of-typing-session detection. On this runtime EVERY system
+  // notification that could end the session is dead (CoreInputView's Showing
+  // and Hiding never fire, and neither does CoreWindow.Activated when the
+  // overlay dismisses), so the end is detected from signals that provably
+  // exist: the pad itself - XInput sees it even under the overlay, and the
+  // press that CLOSES the keyboard is a B that no character follows (every
+  // typing press produces a character within tens of ms) - and the characters
+  // (Enter types 0x0D and closes the keyboard). A pending probe holds its
+  // deadline and the character count at arming; any character cancels it.
+  std::atomic<int64_t> keyboard_close_probe_deadline_ms_{0};
+  std::atomic<uint32_t> keyboard_close_probe_char_count_{0};
+  // When a probe last ended the session: a character arriving shortly after
+  // proves the guess wrong (the keyboard is still up) and the session is
+  // re-parked. The window gate keeps physical-keyboard typing, which also
+  // lands in CharacterReceived, from ever parking anything.
+  std::atomic<int64_t> keyboard_probe_end_ms_{0};
+  static constexpr int64_t kKeyboardCloseProbeMs = 400;
+  static constexpr int64_t kKeyboardEnterProbeMs = 600;
+  static constexpr int64_t kKeyboardReparkWindowMs = 5000;
+  // Previous B-button state seen by the pad poll (timer thread only).
+  bool keyboard_pad_b_down_prev_ = false;
+  // Ends the typing session from any trigger: resumes painting, marks the
+  // keyboard hidden and dismissed-while-wanted. Safe from any thread; no-op
+  // when no session is active.
+  void EndOnScreenKeyboardSession(const char* reason);
   // Whether painting is currently parked for the on-screen keyboard (visible,
   // shown timestamp set, safety cap not yet exceeded).
   bool IsPaintParkedForOnScreenKeyboard() const;
