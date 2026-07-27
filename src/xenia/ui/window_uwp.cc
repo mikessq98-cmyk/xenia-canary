@@ -191,9 +191,25 @@ void UWPWindow::StartPaintLoop() {
             keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
         if (session_shown_ms) {
           int64_t now_ms = int64_t(Clock::QueryHostUptimeMillis());
+          // Ask the UI thread what the keyboard is actually doing - it is
+          // free while painting is parked, and this is a light query. The
+          // heuristics below are the fallback for runtimes where none of the
+          // polled signals is reported.
+          if (now_ms - keyboard_last_poll_ms_.load(std::memory_order_relaxed) >=
+                  kKeyboardPollIntervalMs &&
+              !keyboard_poll_pending_.exchange(true,
+                                               std::memory_order_relaxed)) {
+            keyboard_last_poll_ms_.store(now_ms, std::memory_order_relaxed);
+            if (!static_cast<UWPWindowedAppContext&>(app_context())
+                     .CallInUIThreadAtHighPriority(
+                         [this]() { PollOnScreenKeyboardState(); })) {
+              keyboard_poll_pending_.store(false, std::memory_order_relaxed);
+            }
+          }
           int64_t probe_deadline = keyboard_close_probe_deadline_ms_.load(
               std::memory_order_relaxed);
-          if (probe_deadline && now_ms >= probe_deadline) {
+          if (probe_deadline && now_ms >= probe_deadline &&
+              now_ms - session_shown_ms >= kKeyboardSessionGraceMs) {
             keyboard_close_probe_deadline_ms_.store(0,
                                                     std::memory_order_relaxed);
             if (keyboard_char_count_.load(std::memory_order_relaxed) ==
@@ -312,7 +328,11 @@ bool UWPWindow::PollGamepadActivity() {
   // enter) produces a character within tens of ms, and D-pad navigation
   // between keys is deliberately not treated as a close suspect. The probe's
   // outcome is checked by the timer tick in StartPaintLoop.
-  if (keyboard_shown_uptime_ms_.load(std::memory_order_relaxed)) {
+  int64_t pad_session_shown_ms =
+      keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+  if (pad_session_shown_ms &&
+      int64_t(Clock::QueryHostUptimeMillis()) - pad_session_shown_ms >=
+          kKeyboardSessionGraceMs) {
     if (any_b_down && !keyboard_pad_b_down_prev_ &&
         !keyboard_close_probe_deadline_ms_.load(std::memory_order_relaxed)) {
       keyboard_close_probe_char_count_.store(
@@ -344,6 +364,72 @@ bool UWPWindow::IsPaintParkedForOnScreenKeyboard() const {
       std::max(shown_ms, int64_t(last_typed_character_uptime_ms()));
   int64_t now_ms = int64_t(Clock::QueryHostUptimeMillis());
   return now_ms - last_activity_ms <= kKeyboardPaintParkMaxMs;
+}
+
+void UWPWindow::PollOnScreenKeyboardState() {
+  keyboard_poll_pending_.store(false, std::memory_order_relaxed);
+  int64_t shown_ms = keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+  if (!shown_ms) {
+    return;
+  }
+  if (int64_t(Clock::QueryHostUptimeMillis()) - shown_ms <
+      kKeyboardSessionGraceMs) {
+    // The overlay may not be up yet - anything read now describes the state
+    // before it appeared.
+    return;
+  }
+
+  namespace wuc = winrt::Windows::UI::Core;
+  bool activation_foreground = true;
+  bool activation_queried = false;
+  try {
+    if (core_window_) {
+      activation_foreground =
+          core_window_.ActivationMode() ==
+          wuc::CoreWindowActivationMode::ActivatedInForeground;
+      activation_queried = true;
+    }
+  } catch (...) {
+  }
+
+  bool pane_occluding = false;
+  bool pane_queried = false;
+  try {
+    auto input_pane =
+        winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView();
+    if (input_pane) {
+      pane_occluding = input_pane.OccludedRect().Height > 0.0f;
+      pane_queried = true;
+    }
+  } catch (...) {
+  }
+
+  if (!keyboard_poll_baseline_taken_) {
+    keyboard_poll_baseline_taken_ = true;
+    // Calibrate: a signal is only usable if it reports the overlay as up NOW,
+    // while it demonstrably is. One that already says "foreground" / "not
+    // occluding" is not reported on this runtime and must be ignored, or it
+    // would end every session on the first poll.
+    keyboard_poll_activation_usable_ =
+        activation_queried && !activation_foreground;
+    keyboard_poll_pane_usable_ = pane_queried && pane_occluding;
+    XELOGI(
+        "UWPWindow: keyboard state poll calibrated - activation mode "
+        "queried={} foreground={}, input pane queried={} occluding={}; usable "
+        "end-of-session signals: activation={}, pane={}",
+        int(activation_queried), int(activation_foreground), int(pane_queried),
+        int(pane_occluding), int(keyboard_poll_activation_usable_),
+        int(keyboard_poll_pane_usable_));
+    return;
+  }
+
+  if (keyboard_poll_activation_usable_ && activation_foreground) {
+    EndOnScreenKeyboardSession("the window is in the foreground again");
+    return;
+  }
+  if (keyboard_poll_pane_usable_ && !pane_occluding) {
+    EndOnScreenKeyboardSession("the input pane stopped occluding the window");
+  }
 }
 
 void UWPWindow::EndOnScreenKeyboardSession(const char* reason) {
@@ -499,7 +585,16 @@ void UWPWindow::WireCoreWindowInput() {
       return;
     }
     NoteInputActivity();
-    EndOnScreenKeyboardSession("window reactivated");
+    // Only past the grace period: this same event fires when the overlay
+    // APPEARS (the window loses and regains focus), and ending the session
+    // there unparks painting for the rest of the typing - which is exactly
+    // how the characters ended up delivered in a burst afterwards.
+    int64_t shown_ms =
+        keyboard_shown_uptime_ms_.load(std::memory_order_relaxed);
+    if (shown_ms && int64_t(Clock::QueryHostUptimeMillis()) - shown_ms >=
+                        kKeyboardSessionGraceMs) {
+      EndOnScreenKeyboardSession("window reactivated");
+    }
   });
 
   // Typed characters - delivered for physical keys and for the on-screen
@@ -918,6 +1013,10 @@ void UWPWindow::ApplyOnScreenKeyboardState(bool show) {
       // stay free to dispatch the typed characters.
       keyboard_shown_uptime_ms_.store(int64_t(Clock::QueryHostUptimeMillis()),
                                       std::memory_order_relaxed);
+      // Re-calibrate the state poll for this session (this runs on the UI
+      // thread, same as the poll itself).
+      keyboard_poll_baseline_taken_ = false;
+      keyboard_last_poll_ms_.store(0, std::memory_order_relaxed);
     } else {
       keyboard_shown_uptime_ms_.store(0, std::memory_order_relaxed);
       if (paint_parked_for_keyboard_.exchange(false,

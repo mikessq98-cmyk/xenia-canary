@@ -179,8 +179,32 @@ class UWPWindow final : public Window {
   static constexpr int64_t kKeyboardCloseProbeMs = 400;
   static constexpr int64_t kKeyboardEnterProbeMs = 600;
   static constexpr int64_t kKeyboardReparkWindowMs = 5000;
+  // Nothing may end a session before this long after the show: the overlay
+  // takes a moment to actually come up, and every trigger fires spuriously in
+  // that window - the reactivation event arrives when the overlay APPEARS
+  // (the window loses and regains focus), and a B still held from whatever
+  // opened the dialog looks like a close press. Ending the session there
+  // unparks painting, so the UI thread wedges in the present again and the
+  // characters pile up to be delivered in a burst later.
+  static constexpr int64_t kKeyboardSessionGraceMs = 800;
   // Previous B-button state seen by the pad poll (timer thread only).
   bool keyboard_pad_b_down_prev_ = false;
+  // Direct polling of the real keyboard state, which is what the heuristics
+  // above only approximate. Runs as a light high-priority UI-thread work item
+  // (the UI thread is free precisely because painting is parked), reading
+  // CoreWindow's activation mode and the input pane's occluded rect. Each
+  // signal is calibrated on the first poll of a session: it is only trusted
+  // if it actually reports the overlay as up at that point, so a signal that
+  // is dead on this runtime can never end the session immediately.
+  void PollOnScreenKeyboardState();
+  std::atomic<bool> keyboard_poll_pending_{false};
+  std::atomic<int64_t> keyboard_last_poll_ms_{0};
+  static constexpr int64_t kKeyboardPollIntervalMs = 120;
+  // Touched only on the UI thread (PollOnScreenKeyboardState / the applied
+  // show), so plain bools.
+  bool keyboard_poll_baseline_taken_ = false;
+  bool keyboard_poll_activation_usable_ = false;
+  bool keyboard_poll_pane_usable_ = false;
   // Ends the typing session from any trigger: resumes painting, marks the
   // keyboard hidden and dismissed-while-wanted. Safe from any thread; no-op
   // when no session is active.
