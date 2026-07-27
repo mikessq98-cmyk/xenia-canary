@@ -51,6 +51,9 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "D3D12");
 
 DECLARE_bool(clear_memory_page_state);
+#if XE_PLATFORM_WINRT
+DECLARE_bool(d3d12_substitute_pending_pipelines);
+#endif  // XE_PLATFORM_WINRT
 
 #if XE_PLATFORM_WINRT
 DEFINE_string(
@@ -3186,19 +3189,44 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
   if (cvars::async_shader_compilation) {
     if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-      // Perfectly normal while pipelines compile in the background, and can
-      // happen thousands of times per second - throttle the log heavily.
-      static std::atomic<uint32_t> skipped_draw_log_count{0};
-      uint32_t n = skipped_draw_log_count.fetch_add(1);
-      if (n < 10 || (n % 1000) == 0) {
-        XELOGI(
-            "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, PS "
-            "{:016X} mod {:016X} (occurrence {})",
-            vertex_shader->ucode_data_hash(), vertex_shader_modification.value,
-            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-            pixel_shader_modification.value, n + 1);
+#if XE_PLATFORM_WINRT
+      // Draw with a ready same-VS/same-state pipeline (only the pixel shader
+      // differs) instead of skipping: skipped draws are the "black objects"
+      // of a permutation burst - a briefly wrong shader is far less
+      // noticeable, and the real pipeline takes over once compiled. The
+      // substitute has the same root signature by construction.
+      void* substitute_handle =
+          cvars::d3d12_substitute_pending_pipelines
+              ? pipeline_cache_->GetReadySubstituteByHandle(pipeline_handle)
+              : nullptr;
+      if (substitute_handle) {
+        static std::atomic<uint32_t> substituted_draw_count{0};
+        uint32_t n = substituted_draw_count.fetch_add(1);
+        if (n < 10 || (n % 4096) == 0) {
+          XELOGI(
+              "Drawing with a substituted pipeline while the real one "
+              "compiles (occurrence {})",
+              n + 1);
+        }
+        pipeline_handle = substitute_handle;
+      } else
+#endif  // XE_PLATFORM_WINRT
+      {
+        // Perfectly normal while pipelines compile in the background, and can
+        // happen thousands of times per second - throttle the log heavily.
+        static std::atomic<uint32_t> skipped_draw_log_count{0};
+        uint32_t n = skipped_draw_log_count.fetch_add(1);
+        if (n < 10 || (n % 1000) == 0) {
+          XELOGI(
+              "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, "
+              "PS {:016X} mod {:016X} (occurrence {})",
+              vertex_shader->ucode_data_hash(),
+              vertex_shader_modification.value,
+              pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+              pixel_shader_modification.value, n + 1);
+        }
+        return true;
       }
-      return true;
     }
     // Re-fetch root signature now that pipeline is ready.
     root_signature = pipeline_cache_->GetRootSignatureByHandle(pipeline_handle);

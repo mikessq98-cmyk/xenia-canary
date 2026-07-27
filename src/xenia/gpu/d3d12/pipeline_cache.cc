@@ -72,6 +72,17 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
 
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
+    d3d12_substitute_pending_pipelines, true,
+    "Xbox UWP: while a pipeline is still being compiled by the (slow) console "
+    "driver, draw with a READY pipeline that differs only in the pixel shader "
+    "(same root signature, vertex shader and render state) instead of "
+    "skipping the draw. Skipped draws show up as black objects in multi-pass "
+    "renderers (the depth pass is there, the material pass is not); a "
+    "briefly wrong shader is much less noticeable. The real pipeline takes "
+    "over as soon as it is ready.",
+    "D3D12");
+
+DEFINE_bool(
     d3d12_toxic_shader_solver, true,
     "Xbox UWP: automatically detect and permanently skip graphics pipelines "
     "whose creation hard-crashes the GPU driver. Each pipeline creation is "
@@ -205,11 +216,13 @@ bool PipelineCache::Initialize() {
       // runs the guest CPU threads, the GPU command processor, audio and the
       // XMA decoder on them. 75% of cores compiling pipelines mid-game is
       // oversubscription that shows up as frame drops whenever a burst of new
-      // pipelines arrives, even at below-normal priority. Two background
-      // compilers are enough to hide compilation behind gameplay; the blocking
-      // storage prewarm spawns its own temporary extra threads anyway (when
-      // nothing else is running), so initial load speed is unaffected.
-      creation_thread_count = std::min(creation_thread_count, size_t(2));
+      // pipelines arrives, even at below-normal priority. Three below-normal
+      // compilers: two could not keep up with permutation-heavy titles (Black
+      // Ops: 200+ pipelines backlogged and GROWING, every affected draw
+      // skipped = black objects on screen); the blocking storage prewarm
+      // spawns its own temporary extra threads anyway (when nothing else is
+      // running), so initial load speed is unaffected.
+      creation_thread_count = std::min(creation_thread_count, size_t(3));
 #endif  // XE_PLATFORM_WINRT
     } else {
       creation_thread_count =
@@ -1249,6 +1262,16 @@ bool PipelineCache::ConfigurePipeline(
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
   if (use_async) {
+#if XE_PLATFORM_WINRT
+    if (cvars::d3d12_substitute_pending_pipelines) {
+      // Find a READY pipeline this one can borrow while the driver compiles
+      // it - drawing with a same-VS/same-state pipeline whose only difference
+      // is the pixel shader beats skipping the draw outright (skips are the
+      // "black objects" during permutation bursts).
+      new_pipeline->substitute.store(FindReadySubstitute(runtime_description),
+                                     std::memory_order_release);
+    }
+#endif  // XE_PLATFORM_WINRT
     // Queue for background thread.
     new_pipeline->pending_vertex_shader = vertex_shader;
     new_pipeline->pending_pixel_shader = pixel_shader;
@@ -1286,6 +1309,38 @@ bool PipelineCache::ConfigurePipeline(
   *root_signature_out = runtime_description.root_signature;
   return true;
 }
+
+#if XE_PLATFORM_WINRT
+PipelineCache::Pipeline* PipelineCache::FindReadySubstitute(
+    const PipelineRuntimeDescription& runtime_description) const {
+  // The candidate must be interchangeable at the API level: the SAME root
+  // signature object (a substituted bind under a different root signature is
+  // a device loss - the binding layout recorded for the draw wouldn't match),
+  // the same vertex shader translation and geometry shader, and an identical
+  // fixed-function description. Only the pixel shader identity may differ.
+  for (const auto& entry : pipelines_) {
+    Pipeline* candidate = entry.second;
+    if (!candidate->state.load(std::memory_order_acquire)) {
+      continue;
+    }
+    const PipelineRuntimeDescription& c = candidate->description;
+    if (c.root_signature != runtime_description.root_signature ||
+        c.vertex_shader != runtime_description.vertex_shader ||
+        c.geometry_shader != runtime_description.geometry_shader) {
+      continue;
+    }
+    PipelineDescription a = c.description;
+    PipelineDescription b = runtime_description.description;
+    a.pixel_shader_hash = b.pixel_shader_hash = 0;
+    a.pixel_shader_modification = b.pixel_shader_modification = 0;
+    if (std::memcmp(&a, &b, sizeof(a)) != 0) {
+      continue;
+    }
+    return candidate;
+  }
+  return nullptr;
+}
+#endif  // XE_PLATFORM_WINRT
 
 bool PipelineCache::TranslateAnalyzedShader(
     DxbcShaderTranslator& translator,

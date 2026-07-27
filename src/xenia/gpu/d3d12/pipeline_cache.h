@@ -131,6 +131,24 @@ class PipelineCache {
         ->description.root_signature;
   }
 
+#if XE_PLATFORM_WINRT
+  // A READY pipeline interchangeable with the given still-being-built one -
+  // same root signature, vertex shader and fixed-function state, only the
+  // pixel shader differs - or nullptr. Drawing with it instead of skipping
+  // the draw is what prevents "black objects" (a multi-pass renderer keeps
+  // its depth pass but loses the material pass) while the console driver
+  // chews through a permutation burst.
+  void* GetReadySubstituteByHandle(void* handle) const {
+    Pipeline* substitute =
+        reinterpret_cast<const Pipeline*>(handle)->substitute.load(
+            std::memory_order_acquire);
+    if (!substitute || !substitute->state.load(std::memory_order_acquire)) {
+      return nullptr;
+    }
+    return substitute;
+  }
+#endif  // XE_PLATFORM_WINRT
+
   // Total resident translated shader bytecode (DXBC), for telemetry. Atomic
   // scalar, safe to read from any thread.
   // Pipelines in the cache and how many of them have no state object yet
@@ -528,6 +546,12 @@ class PipelineCache {
     // nullptr if creation has failed or still pending.
     std::atomic<ID3D12PipelineState*> state{nullptr};
     PipelineRuntimeDescription description;
+#if XE_PLATFORM_WINRT
+    // See GetReadySubstituteByHandle. Set once at enqueue time on the
+    // processor thread; pipelines live until ClearCache, so the pointer stays
+    // valid for this pipeline's whole life.
+    std::atomic<Pipeline*> substitute{nullptr};
+#endif  // XE_PLATFORM_WINRT
     // For background creation: stores the untranslated shaders.
     // Background thread translates both VS and PS together, then creates the
     // pipeline. Set to nullptr after translation is done.
@@ -545,6 +569,15 @@ class PipelineCache {
   // ends (successful or not).
   static void AcquirePipelineTranslationsForCreation(Pipeline* pipeline);
   static void ReleasePipelineTranslationsFromCreation(Pipeline* pipeline);
+
+#if XE_PLATFORM_WINRT
+  // Finds a READY pipeline differing from the given description only in the
+  // pixel shader (the root signature must be the same object - a substituted
+  // bind under a different root signature is a device loss). Processor thread
+  // only (walks pipelines_). O(pipeline count), called once per NEW pipeline.
+  Pipeline* FindReadySubstitute(
+      const PipelineRuntimeDescription& runtime_description) const;
+#endif  // XE_PLATFORM_WINRT
 
   // Comparator for priority queue - higher priority first.
   struct PipelineCreationPriorityCompare {
