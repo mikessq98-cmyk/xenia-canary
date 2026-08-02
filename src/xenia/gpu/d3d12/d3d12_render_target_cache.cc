@@ -1258,34 +1258,18 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
   if (!resident_bytes) {
     return;
   }
+  // Only the explicit cap is enforced here. Reacting to host memory pressure
+  // is the memory arbiter's job now (see GpuMemoryArbiter): this cache used to
+  // poll the host itself at its own threshold, alongside four others doing the
+  // same at different ones, which is what made them take turns releasing and
+  // re-claiming memory.
   uint64_t bytes_to_free = 0;
-  uint64_t host_memory_left = 0;
   if (cvars::d3d12_render_target_cache_max_mb > 0) {
     uint64_t budget_bytes =
         uint64_t(cvars::d3d12_render_target_cache_max_mb) << 20;
     if (resident_bytes > budget_bytes) {
       bytes_to_free = resident_bytes - budget_bytes;
     }
-  } else {
-#if XE_PLATFORM_WIN32
-    // Automatic: keep host memory available rather than enforcing a fixed
-    // size. The commit limit is what actually fails allocations here - both
-    // the guest's own memory and the driver's shader compilation arenas come
-    // out of it, and running dry kills the emulator, while releasing a render
-    // target only costs a recreation later.
-    MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
-    if (!GlobalMemoryStatusEx(&memory_status)) {
-      return;
-    }
-    host_memory_left = memory_status.ullAvailPageFile;
-    if (host_memory_left < kHostMemoryTrimThreshold) {
-      // Free the deficit plus a margin, so this doesn't run every submission.
-      bytes_to_free = kHostMemoryTrimThreshold - host_memory_left +
-                      kHostMemoryTrimExtra;
-    }
-#else
-    return;
-#endif  // XE_PLATFORM_WIN32
   }
   if (!bytes_to_free) {
     return;
@@ -1313,13 +1297,9 @@ void D3D12RenderTargetCache::TrimRenderTargetsForHostMemory() {
     render_target_trim_interval_ = kRenderTargetTrimIntervalSubmissions;
     XELOGI(
         "D3D12RenderTargetCache: released {} MB of unused host render targets "
-        "({} MB left resident{})",
+        "to stay under d3d12_render_target_cache_max_mb ({} MB left resident)",
         freed_bytes >> 20,
-        render_target_host_memory_bytes_.load(std::memory_order_relaxed) >> 20,
-        host_memory_left
-            ? fmt::format(", {} MB of host memory was left",
-                          host_memory_left >> 20)
-            : std::string());
+        render_target_host_memory_bytes_.load(std::memory_order_relaxed) >> 20);
   } else {
     // Nothing worth releasing - back off so the next attempts are cheap.
     render_target_trim_interval_ =

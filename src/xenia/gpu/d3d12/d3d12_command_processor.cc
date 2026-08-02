@@ -4486,27 +4486,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       view_bindful_heap_pool_->Reclaim(frame_completed_);
       sampler_bindful_heap_pool_->Reclaim(frame_completed_);
     }
-#if XE_PLATFORM_WINRT
-    // Reclaiming only moves pages back to the free list - the pool keeps
+    // Reclaiming above only moves pages back to the free list - the pool keeps
     // whatever the busiest frame of the session needed for the rest of it.
-    // When the host is short on memory, hand the spare ones back; a few are
-    // kept so the next frame doesn't immediately allocate again.
-    if (++constant_buffer_pool_trim_counter_ >= kConstantBufferPoolTrimFrames) {
-      constant_buffer_pool_trim_counter_ = 0;
-      MEMORYSTATUSEX pool_trim_status = {sizeof(pool_trim_status)};
-      if (GlobalMemoryStatusEx(&pool_trim_status) &&
-          pool_trim_status.ullAvailPageFile < kPoolTrimMemoryThreshold) {
-        size_t released =
-            constant_buffer_pool_->TrimWritablePages(kConstantBufferPoolKeep);
-        if (released) {
-          XELOGI(
-              "D3D12CommandProcessor: released {} KB of spare constant buffer "
-              "pool pages ({} MB of host memory left)",
-              released >> 10, pool_trim_status.ullAvailPageFile >> 20);
-        }
-      }
-    }
-#endif  // XE_PLATFORM_WINRT
+    // Handing the spare ones back to the host is the memory arbiter's call now
+    // (see GpuMemoryArbiter), which asks for them before anything more
+    // expensive to rebuild.
 
     pix_capturing_ =
         pix_capture_requested_.exchange(false, std::memory_order_relaxed);

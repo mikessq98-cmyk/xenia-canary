@@ -639,14 +639,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint32_t bindful_zpd_rov_counter_capacity_ = 0;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
-#if XE_PLATFORM_WINRT
-  // Frames between attempts to hand spare constant buffer pool pages back,
-  // how many to keep, and the host memory below which it's worth doing at all.
-  uint32_t constant_buffer_pool_trim_counter_ = 0;
-  static constexpr uint32_t kConstantBufferPoolTrimFrames = 64;
+  // Spare pool pages the arbiter keeps when it asks for the rest back, so the
+  // next frame doesn't immediately allocate again.
   static constexpr size_t kConstantBufferPoolKeep = 4;
-  static constexpr uint64_t kPoolTrimMemoryThreshold = UINT64_C(768) << 20;
-#endif  // XE_PLATFORM_WINRT
 
   static constexpr uint32_t kViewBindfulHeapSize = 32768;
   static_assert(kViewBindfulHeapSize <=

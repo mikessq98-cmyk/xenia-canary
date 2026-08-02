@@ -214,18 +214,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   //  interaction with depth / stencil testing, host depth will need to be
   //  copied to a different buffer - the same range may have ROV-owned color and
   //  host float32 depth at the same time).
-  // Releases cached host render targets the game has moved on from when the
-  // host is running short of memory (or over d3d12_render_target_cache_max_mb).
+  // Enforces d3d12_render_target_cache_max_mb, if one is set. Releasing under
+  // host memory pressure is the memory arbiter's decision (see
+  // GpuMemoryArbiter), which asks this cache through TrimUnusedRenderTargets.
   // Only safe at a submission boundary - see the call site.
   void TrimRenderTargetsForHostMemory();
-  // Host memory below which render targets start being released in automatic
-  // mode, and how much beyond the deficit to free.
-  // A game whose live render targets alone keep the host under the threshold
-  // can never get back above it, so these are deliberately close to the edge:
-  // trimming that can't win should be rare and small, not a permanent churn of
-  // releasing and recreating tens of megabytes every submission.
-  static constexpr uint64_t kHostMemoryTrimThreshold = 640ULL << 20;
-  static constexpr uint64_t kHostMemoryTrimExtra = 64ULL << 20;
   // Submissions a render target must have gone unused before it may be
   // released (it is recreated if the game comes back to it, so this only needs
   // to be long enough to not thrash on alternating frames).
