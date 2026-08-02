@@ -1922,7 +1922,7 @@ void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
   if (pipeline->state.load(std::memory_order_acquire)) {
     return;
   }
-  if (pipeline->priority >= kPriorityPendingDraw) {
+  if (pipeline->priority >= pipeline_util::kPriorityPendingDraw) {
     // Already at the front - re-queueing it every skipped draw would fill the
     // queue with duplicates of the same pipeline.
     return;
@@ -1930,10 +1930,10 @@ void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
   {
     std::lock_guard<xe_mutex> lock(creation_request_lock_);
     if (pipeline->state.load(std::memory_order_acquire) ||
-        pipeline->priority >= kPriorityPendingDraw) {
+        pipeline->priority >= pipeline_util::kPriorityPendingDraw) {
       return;
     }
-    pipeline->priority = kPriorityPendingDraw;
+    pipeline->priority = pipeline_util::kPriorityPendingDraw;
     // std::priority_queue cannot re-sort in place, so the pipeline is pushed
     // again with its new priority. The duplicate is harmless: whichever copy
     // is popped first builds it, and the creation path skips a pipeline that
@@ -1982,16 +1982,13 @@ void PipelineCache::ReleaseTranslationsForArbiter() {
   if (released_translations) {
     translated_shader_bytes_.fetch_sub(released_bytes,
                                        std::memory_order_relaxed);
-    XELOGW(
-        "Pipeline cache: MEMORY PRESSURE ({} MB left) - released {} MB of "
-        "translated shader bytecode ({} translations, {} kept as they are "
-        "being compiled); shaders will be retranslated on demand (expect "
-        "brief pop-in)",
-        available_bytes >> 20, released_bytes >> 20, released_translations,
-        kept_in_creation);
+    XELOGI(
+        "Pipeline cache: released {} MB of translated shader bytecode ({} "
+        "translations, {} kept as they are being compiled); shaders will be "
+        "retranslated on demand (expect brief pop-in)",
+        released_bytes >> 20, released_translations, kept_in_creation);
   }
 }
-#endif  // XE_PLATFORM_WINRT
 
 void PipelineCache::AcquirePipelineTranslationsForCreation(Pipeline* pipeline) {
   if (pipeline->description.vertex_shader) {
