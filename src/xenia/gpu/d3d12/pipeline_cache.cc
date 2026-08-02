@@ -289,6 +289,8 @@ bool PipelineCache::Initialize() {
           std::min(uint32_t(cvars::d3d12_pipeline_creation_threads),
                    logical_processor_count);
     }
+    // What to come back to once a compilation burst is over.
+    creation_thread_base_count_ = creation_thread_count;
     for (size_t i = 0; i < creation_thread_count; ++i) {
       std::unique_ptr<xe::threading::Thread> creation_thread =
           xe::threading::Thread::Create({}, [this, i]() { CreationThread(i); });
@@ -1920,6 +1922,18 @@ uint32_t PipelineCache::GetSharedInterpolatorMask(
                                             SharedInterpolatorMask{wanted, 0})
              .first;
   } else if ((wanted & ~it->second.mask) != 0) {
+    // Widening costs far more than a normal miss: it changes the vertex
+    // shader's modification, so every pipeline already built with this vertex
+    // shader has to be rebuilt, while just answering `wanted` (what stock
+    // Xenia does, and equally correct) costs the single pipeline this draw
+    // needs. Never pay the multiplied cost while a backlog is being compiled -
+    // that is precisely when the frames are already late. The widening is not
+    // lost, only deferred: the next draw that needs those interpolators asks
+    // again, and once the queue is quiet it goes through.
+    if (creation_queue_depth_hint_.load(std::memory_order_relaxed) >=
+        kSharedInterpolatorDeferWidenQueueDepth) {
+      return wanted;
+    }
     // Something reads an interpolator not exported yet, so the mask has to
     // widen - and widening RETRANSLATES the vertex shader and rebuilds every
     // pipeline using it. Doing that repeatedly, a few bits at a time, would
@@ -1952,6 +1966,8 @@ bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
     std::lock_guard<xe_mutex> lock(creation_request_lock_);
     queue_depth = creation_queue_.size();
   }
+  creation_queue_depth_hint_.store(uint32_t(std::min<size_t>(queue_depth, ~0u)),
+                                   std::memory_order_relaxed);
   bool backlog_deep = queue_depth >= kCreationQueueBurstDepth;
   if (cvars::d3d12_pipeline_creation_threads >= 0) {
     // An explicit count is the user's decision - don't override it.
@@ -1960,6 +1976,43 @@ bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
   size_t wanted_threads = creation_threads_.size();
   if (backlog_deep) {
     wanted_threads = creation_thread_burst_count_;
+    creation_threads_idle_submissions_ = 0;
+  } else if (creation_threads_.size() > creation_thread_base_count_) {
+    // The burst is over. Threads spawned for it must not stay: they are extra
+    // runnable threads on a console with ~6-7 usable cores already carrying
+    // 30+ emulator threads, and keeping them costs the guest even while they
+    // have nothing to build. Wait a while first so a stuttering backlog
+    // doesn't make them come and go every few submissions, and require a
+    // completely empty queue - joining a thread that is inside the driver's
+    // compiler would block the submission for the whole compilation.
+    if (queue_depth != 0) {
+      creation_threads_idle_submissions_ = 0;
+      return false;
+    }
+    if (++creation_threads_idle_submissions_ >=
+        kCreationThreadIdleSubmissions) {
+      creation_threads_idle_submissions_ = 0;
+      size_t shut_down_from = creation_thread_base_count_;
+      {
+        std::lock_guard<xe_mutex> lock(creation_request_lock_);
+        creation_threads_shutdown_from_ = shut_down_from;
+      }
+      creation_request_cond_.notify_all();
+      for (size_t i = shut_down_from; i < creation_threads_.size(); ++i) {
+        // They are waiting on the condition variable with nothing queued, so
+        // this returns as soon as each observes the shutdown index.
+        xe::threading::Wait(creation_threads_[i].get(), false);
+      }
+      creation_threads_.resize(shut_down_from);
+      {
+        std::lock_guard<xe_mutex> lock(creation_request_lock_);
+        creation_threads_shutdown_from_ = SIZE_MAX;
+      }
+      XELOGI(
+          "Pipeline cache: back to {} creation threads, the backlog is gone",
+          creation_threads_.size());
+    }
+    return false;
   }
   if (wanted_threads <= creation_threads_.size()) {
     return backlog_deep;
@@ -2012,11 +2065,11 @@ void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
   creation_request_cond_.notify_one();
 }
 
-void PipelineCache::ReleaseTranslationsForArbiter() {
+uint64_t PipelineCache::ReleaseTranslationsForArbiter(uint64_t bytes_to_free) {
   // The storage loader translates without going through the creation queue, so
   // its translations can't be tracked - stay out of its way entirely.
   if (storage_translations_in_progress_.load(std::memory_order_acquire)) {
-    return;
+    return 0;
   }
   // Everything else is safe with creation_request_lock_ held: translations
   // queued for or being used by a creation hold a reference (taken and dropped
@@ -2045,17 +2098,28 @@ void PipelineCache::ReleaseTranslationsForArbiter() {
       translation->ReleaseTranslationForMemoryPressure();
       ++released_translations;
       released_bytes += binary_size;
+      if (released_bytes >= bytes_to_free) {
+        // Enough. Dropping everything - which this used to do - is what makes
+        // the trim a loop: the title retranslates every shader it still draws
+        // with over the next frames, memory climbs back to where it was, and
+        // the next trim drops it all again. Free the shortfall and no more.
+        break;
+      }
+    }
+    if (released_bytes >= bytes_to_free) {
+      break;
     }
   }
   if (released_translations) {
     translated_shader_bytes_.fetch_sub(released_bytes,
                                        std::memory_order_relaxed);
     XELOGI(
-        "Pipeline cache: released {} MB of translated shader bytecode ({} "
+        "Pipeline cache: released {} KB of translated shader bytecode ({} "
         "translations, {} kept as they are being compiled); shaders will be "
         "retranslated on demand (expect brief pop-in)",
-        released_bytes >> 20, released_translations, kept_in_creation);
+        released_bytes >> 10, released_translations, kept_in_creation);
   }
+  return released_bytes;
 }
 
 void PipelineCache::AcquirePipelineTranslationsForCreation(Pipeline* pipeline) {

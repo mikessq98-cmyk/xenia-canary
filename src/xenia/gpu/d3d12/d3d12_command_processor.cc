@@ -52,7 +52,7 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "D3D12");
 
 DEFINE_bool(
-    shared_vertex_shader_interpolators, true,
+    shared_vertex_shader_interpolators, false,
     "Translate a vertex shader for the union of the interpolators every pixel "
     "shader used with it reads, instead of the intersection with whichever one "
     "it is currently paired with.\n"
@@ -64,7 +64,13 @@ DEFINE_bool(
     "is used with a handful of interpolator layouts, not a new one every "
     "time) and never exports an interpolator that no pixel shader asked for, "
     "so the saving does not come out of GPU time in a heavy scene.\n"
-    "Turn off to translate strictly per pair, as upstream does.",
+    "Off by default because settling is not free: every time the union widens, "
+    "the vertex shader's modification changes, so the pipelines already built "
+    "with it no longer match and have to be built again - and until they are, "
+    "their draws are skipped and the objects using them disappear and come "
+    "back. That trade is wrong on a first launch with a cold cache, which is "
+    "where the time actually hurts. Turn on once the pipeline cache is warm to "
+    "save the translation time and bytecode memory.",
     "GPU");
 
 DECLARE_bool(clear_memory_page_state);
@@ -4288,10 +4294,7 @@ void D3D12CommandProcessor::RegisterMemoryArbiterConsumers() {
       ConsumerKind::kShaderBytecode,
       [this]() { return pipeline_cache_->GetTranslatedShaderBytes(); },
       [this](uint64_t bytes_to_free) -> uint64_t {
-        uint64_t before = pipeline_cache_->GetTranslatedShaderBytes();
-        pipeline_cache_->ReleaseTranslationsForArbiter();
-        uint64_t after = pipeline_cache_->GetTranslatedShaderBytes();
-        return before > after ? before - after : 0;
+        return pipeline_cache_->ReleaseTranslationsForArbiter(bytes_to_free);
       });
 
   // Pure scratch - pages come straight back when needed.

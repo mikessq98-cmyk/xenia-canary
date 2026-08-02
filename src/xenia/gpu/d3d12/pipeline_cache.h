@@ -242,7 +242,9 @@ class PipelineCache {
   // Releases translated bytecode at the memory arbiter's request. The arbiter
   // has already established that the host is short, so unlike the pressure
   // path this does not re-check the budget itself.
-  void ReleaseTranslationsForArbiter();
+  // Releases translated bytecode until bytes_to_free has been freed, returning
+  // how much was actually freed. Bounded on purpose - see the definition.
+  uint64_t ReleaseTranslationsForArbiter(uint64_t bytes_to_free);
 
   uint64_t GetTranslatedShaderBytes() const {
     return translated_shader_bytes_.load(std::memory_order_relaxed);
@@ -738,6 +740,17 @@ class PipelineCache {
   // computed from the core count at initialization.
   static constexpr size_t kCreationQueueBurstDepth = 64;
   size_t creation_thread_burst_count_ = 0;
+  // Threads to keep once a burst is over, and how long the queue has to stay
+  // shallow before the extras are shut down (so a stuttering backlog doesn't
+  // make them come and go constantly).
+  size_t creation_thread_base_count_ = 0;
+  uint32_t creation_threads_idle_submissions_ = 0;
+  static constexpr uint32_t kCreationThreadIdleSubmissions = 240;
+  // Queue depth as of the last submission, so per-draw code can tell whether a
+  // backlog is being compiled without taking creation_request_lock_.
+  std::atomic<uint32_t> creation_queue_depth_hint_{0};
+  // Above this, interpolator mask widening waits - see GetSharedInterpolatorMask.
+  static constexpr uint32_t kSharedInterpolatorDeferWidenQueueDepth = 16;
 
   // Accumulated interpolator masks per vertex shader - see
   // GetSharedInterpolatorMask. Widening the mask retranslates the shader and
