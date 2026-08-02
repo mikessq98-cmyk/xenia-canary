@@ -207,6 +207,11 @@ class PipelineCache {
     vertex_shader_hash_out = worst_vs;
   }
 
+  // Releases translated bytecode at the memory arbiter's request. The arbiter
+  // has already established that the host is short, so unlike the pressure
+  // path this does not re-check the budget itself.
+  void ReleaseTranslationsForArbiter();
+
   uint64_t GetTranslatedShaderBytes() const {
     return translated_shader_bytes_.load(std::memory_order_relaxed);
   }
@@ -451,14 +456,6 @@ class PipelineCache {
   // likely out-of-memory victims, not genuinely toxic pairs).
   void SolverRetractThisRunToxic();
 
-#if XE_PLATFORM_WINRT
-  // Frees the translated DXBC of all shaders (keeping the guest ucode) when
-  // the title is close to its memory budget; shaders are retranslated on
-  // demand through the normal pending/sync paths. Called from EndSubmission
-  // on the GPU thread; bails out if any pipeline creation or storage
-  // translation is in flight.
-  void ReleaseTranslationsUnderMemoryPressure(uint64_t available_bytes);
-#endif  // XE_PLATFORM_WINRT
 
   bool solver_enabled_ = false;
   // Whether to write the per-creation crash journal this session. To avoid the
@@ -704,22 +701,10 @@ class PipelineCache {
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
 
-#if XE_PLATFORM_WINRT
-  // Counts how many EndSubmission calls until the next memory-pressure check
-  // (the GlobalMemoryStatusEx query is not worth doing every submission).
-  uint32_t memory_pressure_check_counter_ = 0;
-  // Host memory below which translated shader bytecode is given up, and the
-  // amount that has to be resident for doing so to be worth the retranslation
-  // it costs. Both are deliberately far from where a title that fits settles -
-  // releasing a couple of megabytes over and over is all cost and no headroom.
-  static constexpr uint64_t kMemoryPressureThreshold = UINT64_C(512) << 20;
-  static constexpr uint64_t kMemoryPressureWorthReleasingBytes = UINT64_C(32)
-                                                                << 20;
   // Nonzero while TranslateShadersForStorage is running on the loader
-  // thread(s) - the memory-pressure release must not free binaries out from
-  // under an in-progress storage translation.
+  // thread(s) - the arbiter's release must not free binaries out from under an
+  // in-progress storage translation.
   std::atomic<uint32_t> storage_translations_in_progress_{0};
-#endif  // XE_PLATFORM_WINRT
 };
 inline bool PipelineCache::PipelineDescription::operator==(
     const PipelineDescription& other) const {

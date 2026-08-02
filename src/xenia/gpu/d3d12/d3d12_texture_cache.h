@@ -555,6 +555,12 @@ class D3D12TextureCache final : public TextureCache {
   // the committed (non-tiled, Xbox UWP) path, the sum of the on-demand
   // regions; 0 when scaling is off or nothing has been resolved yet. A scalar,
   // safe to read racily for telemetry.
+  // Releases scaled resolve regions the game has stopped resolving into, at
+  // the memory arbiter's request. Their contents are lost - a region untouched
+  // for hundreds of submissions is a finished effect, and if the game does
+  // come back to it, it re-resolves into a freshly committed region.
+  uint64_t ReleaseIdleScaledResolveRegionsForArbiter(uint64_t bytes_to_free);
+
   uint64_t GetScaledResolveCommittedBytes() const {
     return scaled_resolve_committed_bytes_;
   }

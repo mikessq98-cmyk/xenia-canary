@@ -252,6 +252,40 @@ void TextureCache::CompletedSubmissionUpdated(
   }
 }
 
+uint64_t TextureCache::TrimTexturesForHostMemory(
+    uint64_t bytes_to_free, uint64_t completed_submission_index) {
+  uint64_t released = 0;
+  bool destroyed_any = false;
+  while (texture_used_first_ != nullptr && released < bytes_to_free) {
+    Texture* texture = texture_used_first_;
+    // Only textures the GPU is done with - the LRU list is in use order, so
+    // once the oldest is still pending, so is everything after it.
+    if (texture->last_usage_submission_index() > completed_submission_index) {
+      break;
+    }
+    uint64_t texture_bytes = texture->GetHostMemoryUsage();
+    if (!destroyed_any) {
+      destroyed_any = true;
+      // A texture being destroyed may still be bound from an earlier
+      // submission with nothing having overwritten the binding yet.
+      ResetTextureBindings();
+    }
+    auto found_texture_it = textures_.find(texture->key());
+    assert_true(found_texture_it != textures_.end());
+    if (found_texture_it == textures_.end()) {
+      break;
+    }
+    assert_true(found_texture_it->second.get() == texture);
+    textures_.erase(found_texture_it);
+    // `texture` is invalid now.
+    released += texture_bytes;
+  }
+  if (destroyed_any) {
+    COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  }
+  return released;
+}
+
 void TextureCache::BeginSubmission(uint64_t new_submission_index) {
   assert_true(new_submission_index > current_submission_index_);
   current_submission_index_ = new_submission_index;

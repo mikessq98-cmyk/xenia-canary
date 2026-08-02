@@ -132,18 +132,6 @@ DEFINE_bool(
     "D3D12");
 #endif  // XE_PLATFORM_WINRT
 
-#if XE_PLATFORM_WINRT
-DEFINE_bool(
-    d3d12_release_shader_translations_on_memory_pressure, true,
-    "Xbox UWP: when the title gets close to its memory budget, free the "
-    "translated D3D12 bytecode of all shaders (the original guest microcode "
-    "is kept). Already-created pipelines keep working; a pipeline needed "
-    "again later retranslates its shaders in the background - a brief pop-in "
-    "instead of the emulator running out of memory and crashing during long "
-    "sessions.",
-    "D3D12");
-#endif  // XE_PLATFORM_WINRT
-
 // Shader translation differs with resolution scaling, so the solver keeps
 // scale-specific state (see SolverInitialize).
 DECLARE_int32(draw_resolution_scale_x);
@@ -1020,33 +1008,12 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
-#if XE_PLATFORM_WINRT
-  // Periodic memory-pressure check: with the title near its budget, trading
-  // resident translated shader bytecode (retranslatable from the ucode) for
-  // headroom prevents out-of-memory deaths in long sessions.
-  // The binding limit on Xbox is the COMMIT charge (ullAvailPageFile), NOT
-  // free physical RAM (ullAvailPhys): telemetry shows allocations fail with
-  // E_OUTOFMEMORY once commit-free drops to ~750 MB while ullAvailPhys still
-  // reports ~1.8 GB free, so watching ullAvailPhys never fired.
-  // Both conditions matter. The margin has to be BELOW where a title that fits
-  // settles, or the release runs forever: with the render target height capped,
-  // Forza sits at 750-900 MB free, and a 1 GB margin fired 18 times in a
-  // session, each time dropping over a hundred translations worth 0-2 MB and
-  // buying nothing but the retranslation stutter. And there is no point
-  // releasing at all unless enough is resident to matter.
-  if (cvars::d3d12_release_shader_translations_on_memory_pressure &&
-      ++memory_pressure_check_counter_ >= 64) {
-    memory_pressure_check_counter_ = 0;
-    MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
-    if (GlobalMemoryStatusEx(&memory_status) &&
-        memory_status.ullAvailPageFile < kMemoryPressureThreshold &&
-        translated_shader_bytes_.load(std::memory_order_relaxed) >=
-            kMemoryPressureWorthReleasingBytes) {
-      ReleaseTranslationsUnderMemoryPressure(
-          uint64_t(memory_status.ullAvailPageFile));
-    }
-  }
-#endif  // XE_PLATFORM_WINRT
+  // Releasing translated bytecode under memory pressure used to be decided
+  // here, against this cache's own threshold. It is now the memory arbiter's
+  // call (see GpuMemoryArbiter): five caches each polling the host and each
+  // reacting at a different threshold is what made them take turns releasing
+  // and re-claiming memory, and this one - the cheapest to rebuild - has to
+  // be asked FIRST, which only something that sees all of them can do.
   if (!creation_threads_.empty()) {
     // Don't wait for pipeline creation - let background threads work
     // asynchronously. Draws will be skipped until pipelines are ready.
@@ -1893,9 +1860,7 @@ bool PipelineCache::TranslateAnalyzedShader(
   return translation.is_valid();
 }
 
-#if XE_PLATFORM_WINRT
-void PipelineCache::ReleaseTranslationsUnderMemoryPressure(
-    uint64_t available_bytes) {
+void PipelineCache::ReleaseTranslationsForArbiter() {
   // The storage loader translates without going through the creation queue, so
   // its translations can't be tracked - stay out of its way entirely.
   if (storage_translations_in_progress_.load(std::memory_order_acquire)) {

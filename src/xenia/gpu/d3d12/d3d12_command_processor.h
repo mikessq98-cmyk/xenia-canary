@@ -30,6 +30,7 @@
 #include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
+#include "xenia/gpu/gpu_memory_arbiter.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
@@ -443,6 +444,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
   // whether a submission is open currently and the device is not removed.
+  // Registers every GPU cache with the memory arbiter, in the order they
+  // should be given up when the host runs short.
+  void RegisterMemoryArbiterConsumers();
+
   bool BeginSubmission(bool is_guest_command);
   // If is_swap is true, a full frame is closed - with, if needed, cache
   // clearing and stopping capturing. Returns whether the submission was done
@@ -706,6 +711,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
 
   std::unique_ptr<PipelineCache> pipeline_cache_;
+
+  // The single place that decides what the GPU caches give back when the host
+  // runs short - see GpuMemoryArbiter for why they must not decide alone.
+  GpuMemoryArbiter memory_arbiter_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

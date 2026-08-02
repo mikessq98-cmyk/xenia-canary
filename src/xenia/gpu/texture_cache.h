@@ -99,6 +99,14 @@ class TextureCache {
     return textures_total_host_memory_usage_;
   }
 
+  // Destroys least recently used textures the GPU has finished with until at
+  // least bytes_to_free has been released, ignoring the soft/hard size limits
+  // - for the memory arbiter, which decides on the host's behalf rather than
+  // on the cache's own budget. Returns the bytes actually released (less than
+  // asked when everything left is still in use by pending submissions).
+  uint64_t TrimTexturesForHostMemory(uint64_t bytes_to_free,
+                                     uint64_t completed_submission_index);
+
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();

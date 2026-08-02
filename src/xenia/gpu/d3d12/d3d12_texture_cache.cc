@@ -991,6 +991,37 @@ void D3D12TextureCache::ReleaseCompletedRetiredScaledResolveBuffers() {
       scaled_resolve_retired_buffers_.end());
 }
 
+uint64_t D3D12TextureCache::ReleaseIdleScaledResolveRegionsForArbiter(
+    uint64_t bytes_to_free) {
+  if (UseTiledScaledResolveBuffers() || scaled_resolve_regions_.empty()) {
+    return 0;
+  }
+  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  uint64_t released_bytes = 0;
+  for (auto it = scaled_resolve_regions_.begin();
+       it != scaled_resolve_regions_.end() && released_bytes < bytes_to_free;) {
+    if (it->last_use_submission + kScaledResolveRegionIdleSubmissions >
+        completed_submission) {
+      ++it;
+      continue;
+    }
+    released_bytes += it->size;
+    scaled_resolve_committed_bytes_ -= it->size;
+    if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
+      scaled_resolve_committed_current_region_ = nullptr;
+    }
+    // Retired with its LAST USE, which for an idle region is long completed,
+    // so the sweep below frees it immediately rather than a frame later.
+    scaled_resolve_retired_buffers_.push_back(
+        {it->last_use_submission, std::move(it->buffer)});
+    it = scaled_resolve_regions_.erase(it);
+  }
+  if (released_bytes) {
+    ReleaseCompletedRetiredScaledResolveBuffers();
+  }
+  return released_bytes;
+}
+
 bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
   // An explicit cap, if the user set one, is absolute.
   if (cvars::d3d12_scaled_resolve_max_mb > 0) {
