@@ -97,9 +97,13 @@ DEFINE_bool(
     "translations of it and two pipelines - and the draws needing the second "
     "one are skipped until it has been built. In the guest logs this is the "
     "largest single source of duplicate pixel shader modifications.\n"
-    "The cost of turning this on is the early depth rejection the hint would "
-    "have enabled, which is GPU time. Worth trying when the GPU has headroom "
-    "and the stalls are pipeline creation, not shading.",
+    "The cost is the early depth rejection the hint would have enabled: every "
+    "fragment runs its pixel shader, including the ones a nearer surface will "
+    "cover. MEASURE BEFORE KEEPING IT ON. In Dark Souls it saved 24 pipelines "
+    "out of 526 and 3% of the skipped draws, and cost so much GPU time in a "
+    "scene with heavy overdraw that frames took one to two SECONDS - the "
+    "saving is small and bounded (a shader has at most a couple of depth "
+    "modes), the cost is not.",
     "D3D12");
 
 #if XE_PLATFORM_WINRT
