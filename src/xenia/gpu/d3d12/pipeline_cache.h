@@ -534,6 +534,15 @@ class PipelineCache {
   std::filesystem::path solver_journal_path_;
   // Presence at startup means the last run crashed (deleted on clean exit).
   std::filesystem::path solver_running_path_;
+  // As the pixel shader of a toxic entry: matches every pixel shader, i.e.
+  // the vertex shader itself is quarantined. A guest shader can't hash to
+  // this, and the manual d3d12_skip_shaders syntax has the same idea as
+  // "[hash,sol]".
+  static constexpr uint64_t kSolverToxicAnyPixelShader = UINT64_MAX;
+  // Distinct pixel shaders one vertex shader must hang with before it is
+  // blamed as a whole. Two is enough to tell "this pair is broken" from "this
+  // vertex shader is broken", and waiting for more costs a crash each.
+  static constexpr size_t kSolverToxicPairsPerVertexShader = 2;
   std::set<std::pair<uint64_t, uint64_t>> solver_toxic_shaders_;
   std::mutex solver_journal_mutex_;
   std::set<std::pair<uint64_t, uint64_t>> solver_inflight_;

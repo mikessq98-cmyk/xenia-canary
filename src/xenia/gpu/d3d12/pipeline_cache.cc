@@ -1164,6 +1164,16 @@ bool PipelineCache::IsShaderToxic(uint64_t vertex_shader_hash,
   if (solver_toxic_shaders_.empty()) {
     return false;
   }
+  // A whole-vertex-shader entry (any pixel shader). Written once the same
+  // vertex shader has hung with kSolverToxicPairsPerVertexShader different
+  // pixel shaders - at that point it is the vertex shader that is broken, and
+  // quarantining pairs one at a time would need a restart per pixel shader it
+  // is ever paired with. Black Ops has one that appears with at least four.
+  if (solver_toxic_shaders_.find(std::make_pair(
+          vertex_shader_hash, kSolverToxicAnyPixelShader)) !=
+      solver_toxic_shaders_.end()) {
+    return true;
+  }
   return solver_toxic_shaders_.find(
              std::make_pair(vertex_shader_hash, pixel_shader_hash)) !=
          solver_toxic_shaders_.end();
@@ -1206,14 +1216,50 @@ void PipelineCache::SolverJournalEnd(uint64_t vertex_shader_hash,
 
 void PipelineCache::SolverAppendToxic(uint64_t vertex_shader_hash,
                                       uint64_t pixel_shader_hash) {
-  // May be called from multiple creation threads (crash-catch path).
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  std::ofstream toxic_file(solver_toxic_path_, std::ios::app);
-  if (!toxic_file) {
+  {
+    // May be called from multiple creation threads (crash-catch path).
+    std::lock_guard<std::mutex> lock(solver_journal_mutex_);
+    std::ofstream toxic_file(solver_toxic_path_, std::ios::app);
+    if (!toxic_file) {
+      return;
+    }
+    toxic_file << fmt::format("{:016X} {:016X}\n", vertex_shader_hash,
+                              pixel_shader_hash);
+  }
+  if (pixel_shader_hash == kSolverToxicAnyPixelShader) {
     return;
   }
-  toxic_file << fmt::format("{:016X} {:016X}\n", vertex_shader_hash,
-                            pixel_shader_hash);
+  // If this vertex shader has now hung with several different pixel shaders,
+  // it is the vertex shader that is at fault, not any of the pairs. Left as
+  // pairs, the game would need a crash-and-restart cycle for every pixel
+  // shader it is ever drawn with - Black Ops has one such vertex shader
+  // appearing with at least four. Promote it to a whole-shader entry.
+  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
+  size_t pairs_with_vertex_shader = 0;
+  for (const std::pair<uint64_t, uint64_t>& toxic : solver_toxic_shaders_) {
+    if (toxic.first == vertex_shader_hash &&
+        toxic.second != kSolverToxicAnyPixelShader) {
+      ++pairs_with_vertex_shader;
+    }
+  }
+  if (pairs_with_vertex_shader < kSolverToxicPairsPerVertexShader) {
+    return;
+  }
+  if (!solver_toxic_shaders_.emplace(vertex_shader_hash,
+                                     kSolverToxicAnyPixelShader)
+           .second) {
+    return;
+  }
+  std::ofstream toxic_file(solver_toxic_path_, std::ios::app);
+  if (toxic_file) {
+    toxic_file << fmt::format("{:016X} {:016X}\n", vertex_shader_hash,
+                              kSolverToxicAnyPixelShader);
+  }
+  XELOGW(
+      "Toxic-shader solver: VS {:016X} has now hung the GPU with {} different "
+      "pixel shaders - quarantining every draw that uses it, rather than one "
+      "pair per crash",
+      vertex_shader_hash, pairs_with_vertex_shader);
 }
 
 void PipelineCache::SolverRetractThisRunToxic() {
