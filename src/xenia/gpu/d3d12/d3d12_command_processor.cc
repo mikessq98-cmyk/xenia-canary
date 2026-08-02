@@ -137,6 +137,9 @@ DEFINE_int32(
     "D3D12");
 #endif
 DECLARE_bool(readback_resolve_half_pixel_offset);
+#if XE_PLATFORM_WINRT
+DECLARE_bool(d3d12_serialize_draws_for_hang_diagnosis);
+#endif  // XE_PLATFORM_WINRT
 
 namespace xe {
 namespace gpu {
@@ -3896,6 +3899,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       }
     }
   }
+
+#if XE_PLATFORM_WINRT
+  if (cvars::d3d12_serialize_draws_for_hang_diagnosis) {
+    // Submit this draw on its own and wait for the GPU to finish it. The list
+    // of "last bound pipelines" printed on device loss cannot identify the
+    // draw that hung - the GPU runs behind, so the newest entry is merely the
+    // newest, not the guilty one. Here the log line is written and flushed
+    // BEFORE the wait, so whichever draw never reports "survived" is exactly
+    // the one that killed the device. Turns the game into a slideshow; it is
+    // for reproducing a hang, not for playing.
+    static std::atomic<uint64_t> serialized_draw_index{0};
+    uint64_t draw_index =
+        serialized_draw_index.fetch_add(1, std::memory_order_relaxed);
+    XELOGW("HANGDIAG: submitting draw #{} VS {:016X} PS {:016X}", draw_index,
+           vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+           pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    xe::FlushLog();
+    EndSubmission(false);
+    if (!AwaitAllQueueOperationsCompletion()) {
+      XELOGE("HANGDIAG: draw #{} DID NOT COMPLETE - this is the one", draw_index);
+      xe::FlushLog();
+      return false;
+    }
+    XELOGW("HANGDIAG: draw #{} survived", draw_index);
+  }
+#endif  // XE_PLATFORM_WINRT
 
   return true;
 }

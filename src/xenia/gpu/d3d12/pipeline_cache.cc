@@ -73,6 +73,20 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
             "D3D12");
 
+#if XE_PLATFORM_WINRT
+DEFINE_bool(
+    d3d12_serialize_draws_for_hang_diagnosis, false,
+    "Xbox UWP: submit every draw on its own and wait for the GPU to finish it, "
+    "logging each one before the wait.\n"
+    "When the device is lost with DXGI_ERROR_DEVICE_HUNG, the list of last "
+    "bound pipelines cannot name the draw that hung - the GPU runs behind the "
+    "command processor, so the newest entry is only the newest. With this on, "
+    "the draw that never reports 'survived' IS the one, exactly.\n"
+    "The game becomes a slideshow. Turn it on to reproduce a hang once, read "
+    "the hash from the log, put it in d3d12_skip_shaders, and turn it off.",
+    "D3D12");
+#endif  // XE_PLATFORM_WINRT
+
 DEFINE_bool(
     d3d12_no_early_depth_stencil_hint, false,
     "Never mark a pixel shader [earlydepthstencil], so it is translated once "
