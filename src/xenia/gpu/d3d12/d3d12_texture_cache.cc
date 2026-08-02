@@ -23,6 +23,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -445,6 +446,11 @@ void D3D12TextureCache::ClearCache() {
   srv_descriptor_cache_free_.clear();
   srv_descriptor_cache_allocated_ = 0;
   srv_descriptor_cache_.clear();
+
+  // Destroying the textures above fills the reuse pool with everything they
+  // held; none of it is wanted after a full cache clear.
+  texture_resource_pool_.clear();
+  texture_resource_pool_bytes_ = 0;
 }
 
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
@@ -1725,6 +1731,99 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+  // Hand the resource to the pool rather than destroying it - creating its
+  // replacement costs tens of milliseconds on the command processor thread.
+  if (resource_) {
+    D3D12_RESOURCE_DESC desc = resource_->GetDesc();
+    d3d12_texture_cache.ReturnTextureResourceToPool(
+        std::move(resource_), desc, resource_state_, GetHostMemoryUsage());
+  }
+}
+
+uint64_t D3D12TextureCache::GetTextureResourcePoolKey(
+    const D3D12_RESOURCE_DESC& desc) {
+  struct {
+    uint64_t width;
+    uint32_t height;
+    uint16_t depth_or_array_size;
+    uint16_t mip_levels;
+    uint32_t format;
+    uint32_t dimension;
+    uint32_t flags;
+    uint32_t sample_count;
+  } key_data;
+  std::memset(&key_data, 0, sizeof(key_data));
+  key_data.width = desc.Width;
+  key_data.height = desc.Height;
+  key_data.depth_or_array_size = desc.DepthOrArraySize;
+  key_data.mip_levels = desc.MipLevels;
+  key_data.format = uint32_t(desc.Format);
+  key_data.dimension = uint32_t(desc.Dimension);
+  key_data.flags = uint32_t(desc.Flags);
+  key_data.sample_count = desc.SampleDesc.Count;
+  return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
+void D3D12TextureCache::ReturnTextureResourceToPool(
+    Microsoft::WRL::ComPtr<ID3D12Resource>&& resource,
+    const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state,
+    uint64_t size_bytes) {
+  if (!resource) {
+    return;
+  }
+  if (texture_resource_pool_bytes_ + size_bytes > kTextureResourcePoolMaxBytes) {
+    TrimTextureResourcePool();
+    if (texture_resource_pool_bytes_ + size_bytes >
+        kTextureResourcePoolMaxBytes) {
+      // No room even after trimming - let it go, as before.
+      return;
+    }
+  }
+  PooledTextureResource pooled;
+  pooled.resource = std::move(resource);
+  pooled.state = state;
+  // Submitted work may still reference it; the reuse path waits for this.
+  pooled.released_submission = command_processor_.GetCurrentSubmission();
+  pooled.size_bytes = size_bytes;
+  texture_resource_pool_bytes_ += size_bytes;
+  texture_resource_pool_.emplace(GetTextureResourcePoolKey(desc),
+                                 std::move(pooled));
+}
+
+uint64_t D3D12TextureCache::ReleaseTextureResourcePoolForArbiter(
+    uint64_t bytes_to_free) {
+  uint64_t released = 0;
+  while (released < bytes_to_free && !texture_resource_pool_.empty()) {
+    auto oldest = texture_resource_pool_.begin();
+    for (auto it = texture_resource_pool_.begin();
+         it != texture_resource_pool_.end(); ++it) {
+      if (it->second.released_submission <
+          oldest->second.released_submission) {
+        oldest = it;
+      }
+    }
+    released += oldest->second.size_bytes;
+    texture_resource_pool_bytes_ -= oldest->second.size_bytes;
+    texture_resource_pool_.erase(oldest);
+  }
+  return released;
+}
+
+void D3D12TextureCache::TrimTextureResourcePool() {
+  // Oldest first - the ones least likely to be asked for again.
+  while (texture_resource_pool_bytes_ > kTextureResourcePoolMaxBytes / 2 &&
+         !texture_resource_pool_.empty()) {
+    auto oldest = texture_resource_pool_.begin();
+    for (auto it = texture_resource_pool_.begin();
+         it != texture_resource_pool_.end(); ++it) {
+      if (it->second.released_submission <
+          oldest->second.released_submission) {
+        oldest = it;
+      }
+    }
+    texture_resource_pool_bytes_ -= oldest->second.size_bytes;
+    texture_resource_pool_.erase(oldest);
+  }
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format,
@@ -1850,11 +1949,32 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
   // Assuming untiling will be the next operation.
   D3D12_RESOURCE_STATES resource_state = D3D12_RESOURCE_STATE_COPY_DEST;
   Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault,
-          provider.GetHeapFlagCreateNotZeroed(), &desc, resource_state, nullptr,
-          IID_PPV_ARGS(&resource)))) {
-    return nullptr;
+
+  // A resource of this exact shape may have been released earlier and kept.
+  // Reusing it skips CreateCommittedResource, which on this driver costs
+  // 10-38 ms on this thread, in the middle of a frame.
+  uint64_t pool_key = GetTextureResourcePoolKey(desc);
+  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  auto pool_range = texture_resource_pool_.equal_range(pool_key);
+  for (auto it = pool_range.first; it != pool_range.second; ++it) {
+    if (it->second.released_submission > completed_submission) {
+      // Still possibly referenced by work the GPU hasn't finished.
+      continue;
+    }
+    resource = std::move(it->second.resource);
+    resource_state = it->second.state;
+    texture_resource_pool_bytes_ -= it->second.size_bytes;
+    texture_resource_pool_.erase(it);
+    break;
+  }
+
+  if (!resource) {
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault,
+            provider.GetHeapFlagCreateNotZeroed(), &desc, resource_state,
+            nullptr, IID_PPV_ARGS(&resource)))) {
+      return nullptr;
+    }
   }
   return std::unique_ptr<Texture>(
       new D3D12Texture(*this, key, resource.Get(), resource_state));

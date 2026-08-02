@@ -416,9 +416,13 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   // fine for telemetry (see CommandProcessor::LogHostMemoryStatistics).
   uint64_t textures_mb = 0;
   uint64_t scaled_resolve_mb = 0;
+  uint64_t texture_pool_mb = 0;
   if (texture_cache_) {
     textures_mb = texture_cache_->GetTexturesTotalHostMemoryUsage() >> 20;
     scaled_resolve_mb = texture_cache_->GetScaledResolveCommittedBytes() >> 20;
+    // Released resources kept for reuse - real GPU memory, so it has to appear
+    // here or the report doesn't add up against the budget.
+    texture_pool_mb = texture_cache_->GetTextureResourcePoolBytes() >> 20;
   }
   uint64_t shaders_mb = 0;
   size_t pipelines_total = 0, pipelines_pending = 0;
@@ -471,29 +475,30 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     // outside the caches.
     uint64_t accounted_bytes = (uint64_t(shared_memory_mb) << 20) +
                                (uint64_t(textures_mb) << 20) +
+                               (uint64_t(texture_pool_mb) << 20) +
                                (uint64_t(scaled_resolve_mb) << 20) +
                                render_targets_bytes + pools_bytes;
     uint64_t other_mb =
         gpu_usage > accounted_bytes ? (gpu_usage - accounted_bytes) >> 20 : 0;
     XELOGI(
-        "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
-        "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
-        "shaders(dxbc) {} MB, pipelines {} ({} still being built; busiest VS "
-        "{:016X} has {} pixel shaders) | GPU budget {}/{} MB used, {} MB "
-        "elsewhere (presenter, PSOs, driver)",
-        shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, pools_bytes >> 20, shaders_mb, pipelines_total,
-        pipelines_pending, worst_vs_hash, max_ps_per_vs, gpu_usage >> 20,
-        gpu_budget >> 20, other_mb);
+        "[MEM] gpu host caches: shared memory {} MB, textures {} MB (+{} MB "
+        "pooled for reuse), scaled resolve {} MB, render targets {} MB ({} "
+        "cached), upload pools {} MB, shaders(dxbc) {} MB, pipelines {} ({} "
+        "still being built; busiest VS {:016X} has {} pixel shaders) | GPU "
+        "budget {}/{} MB used, {} MB elsewhere (presenter, PSOs, driver)",
+        shared_memory_mb, textures_mb, texture_pool_mb, scaled_resolve_mb,
+        render_targets_mb, render_target_count, pools_bytes >> 20, shaders_mb,
+        pipelines_total, pipelines_pending, worst_vs_hash, max_ps_per_vs,
+        gpu_usage >> 20, gpu_budget >> 20, other_mb);
   } else {
     XELOGI(
-        "[MEM] gpu host caches: shared memory {} MB, textures {} MB, scaled "
-        "resolve {} MB, render targets {} MB ({} cached), upload pools {} MB, "
-        "shaders(dxbc) {} MB, pipelines {} ({} still being built; busiest VS "
-        "{:016X} has {} pixel shaders)",
-        shared_memory_mb, textures_mb, scaled_resolve_mb, render_targets_mb,
-        render_target_count, pools_bytes >> 20, shaders_mb, pipelines_total,
-        pipelines_pending, worst_vs_hash, max_ps_per_vs);
+        "[MEM] gpu host caches: shared memory {} MB, textures {} MB (+{} MB "
+        "pooled for reuse), scaled resolve {} MB, render targets {} MB ({} "
+        "cached), upload pools {} MB, shaders(dxbc) {} MB, pipelines {} ({} "
+        "still being built; busiest VS {:016X} has {} pixel shaders)",
+        shared_memory_mb, textures_mb, texture_pool_mb, scaled_resolve_mb,
+        render_targets_mb, render_target_count, pools_bytes >> 20, shaders_mb,
+        pipelines_total, pipelines_pending, worst_vs_hash, max_ps_per_vs);
   }
 }
 
@@ -4428,10 +4433,22 @@ void D3D12CommandProcessor::RegisterMemoryArbiterConsumers() {
   // Expensive: a guest memory read plus format conversion.
   memory_arbiter_.RegisterConsumer(
       ConsumerKind::kTextures,
-      [this]() { return texture_cache_->GetTexturesTotalHostMemoryUsage(); },
+      [this]() {
+        return texture_cache_->GetTexturesTotalHostMemoryUsage() +
+               texture_cache_->GetTextureResourcePoolBytes();
+      },
       [this](uint64_t bytes_to_free) -> uint64_t {
-        return texture_cache_->TrimTexturesForHostMemory(
-            bytes_to_free, GetCompletedSubmission());
+        // The reuse pool first: it is real GPU memory that no texture is using,
+        // so giving it back costs only the resource creation it would have
+        // saved later, while every byte taken from a live texture costs a
+        // guest memory read and a format conversion mid-frame.
+        uint64_t released =
+            texture_cache_->ReleaseTextureResourcePoolForArbiter(bytes_to_free);
+        if (released < bytes_to_free) {
+          released += texture_cache_->TrimTexturesForHostMemory(
+              bytes_to_free - released, GetCompletedSubmission());
+        }
+        return released;
       });
 }
 

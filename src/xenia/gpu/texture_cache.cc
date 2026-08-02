@@ -69,7 +69,7 @@ DEFINE_uint32(
     "will be destroyed as soon as possible.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_idle_eviction_seconds, 120,
+    texture_cache_idle_eviction_seconds, 45,
     "Seconds a texture has to go unused before it is released even though "
     "there is no shortage of host memory and the cache is under its limits.\n"
     "Keeping a texture costs nothing while memory is plentiful, but a texture "

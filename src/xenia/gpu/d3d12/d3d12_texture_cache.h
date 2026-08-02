@@ -655,6 +655,53 @@ class D3D12TextureCache final : public TextureCache {
         srv_descriptors_;
   };
 
+  // Host texture resources kept after their texture is destroyed, so the next
+  // texture of the same shape reuses one instead of creating it. On this
+  // driver CreateCommittedResource costs 10-38 ms - measured, on the command
+  // processor thread, in the middle of a frame - which dwarfs everything else
+  // in a texture request: reading and converting the guest data next to it
+  // takes well under a millisecond. Streaming a scene creates and destroys the
+  // same shapes constantly, so most of that can simply not happen.
+  struct PooledTextureResource {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_STATES state;
+    // The resource may still be referenced by submitted work - it can only be
+    // handed out again once the GPU has passed this.
+    uint64_t released_submission;
+    uint64_t size_bytes;
+  };
+ public:
+  // Host memory held by released-but-kept resources. Real GPU memory that no
+  // texture is using, so the arbiter should take it before anything a texture
+  // still needs.
+  uint64_t GetTextureResourcePoolBytes() const {
+    return texture_resource_pool_bytes_;
+  }
+  // Gives back pooled resources, oldest first, until bytes_to_free has been
+  // released. Returns what was actually freed.
+  uint64_t ReleaseTextureResourcePoolForArbiter(uint64_t bytes_to_free);
+
+ private:
+  // Everything about a resource that has to match for it to be reusable.
+  static uint64_t GetTextureResourcePoolKey(const D3D12_RESOURCE_DESC& desc);
+  // Takes ownership of the resource if there is room; otherwise it is simply
+  // released as before.
+  void ReturnTextureResourceToPool(Microsoft::WRL::ComPtr<ID3D12Resource>&&
+                                       resource,
+                                   const D3D12_RESOURCE_DESC& desc,
+                                   D3D12_RESOURCE_STATES state,
+                                   uint64_t size_bytes);
+  // Drops pooled resources until the pool is under kTextureResourcePoolMaxBytes
+  // again, oldest first.
+  void TrimTextureResourcePool();
+  std::unordered_multimap<uint64_t, PooledTextureResource>
+      texture_resource_pool_;
+  uint64_t texture_resource_pool_bytes_ = 0;
+  // The pool is memory held for speed, so it is bounded. Textures the game is
+  // actively using are accounted separately; this is only what has been
+  // released and not yet reused.
+  static constexpr uint64_t kTextureResourcePoolMaxBytes = UINT64_C(320) << 20;
+
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 
   struct SRVDescriptorCachePage {
