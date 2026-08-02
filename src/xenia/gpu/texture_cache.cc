@@ -13,9 +13,26 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
+
+#if XE_PLATFORM_WINRT
+// The stock 384/768 MB budget is sized for a desktop where the texture cache
+// competes with everything else on the machine. Here the GPU budget is over
+// 4 GB and roughly 1.2 GB of it goes to everything that isn't textures, so
+// evicting at 768 MB throws away textures the title is still drawing with
+// while gigabytes sit unused - and refilling them blocks the command processor
+// for tens of milliseconds each time. Real memory pressure is the memory
+// arbiter's call (it can see the whole process, not just this cache); these
+// are only a backstop for the case where it never gets to run.
+#define XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT 1024
+#define XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT 1536
+#else
+#define XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT 384
+#define XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT 768
+#endif  // XE_PLATFORM_WINRT
 
 DEFINE_int32(
     draw_resolution_scale_x, 1,
@@ -37,7 +54,7 @@ DEFINE_int32(
     "See draw_resolution_scale_x for more information.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_memory_limit_soft, 384,
+    texture_cache_memory_limit_soft, XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT,
     "Maximum host texture memory usage (in megabytes) above which old textures "
     "will be destroyed.",
     "GPU");
@@ -47,7 +64,7 @@ DEFINE_uint32(
     "deleted if texture memory usage exceeds texture_cache_memory_limit_soft.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_memory_limit_hard, 768,
+    texture_cache_memory_limit_hard, XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT,
     "Maximum host texture memory usage (in megabytes) above which textures "
     "will be destroyed as soon as possible.",
     "GPU");
@@ -214,10 +231,14 @@ void TextureCache::CompletedSubmissionUpdated(
   uint32_t limit_soft_lifetime =
       cvars::texture_cache_memory_limit_soft_lifetime * 1000;
   bool destroyed_any = false;
+  uint64_t usage_before = textures_total_host_memory_usage_;
+  size_t destroyed_count = 0;
+  bool hit_hard_limit = false;
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
         (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
     bool limit_hard_exceeded = total_host_memory_usage_mb > limit_hard_mb;
+    hit_hard_limit |= limit_hard_exceeded;
     if (total_host_memory_usage_mb <= limit_soft_mb && !limit_hard_exceeded) {
       break;
     }
@@ -244,11 +265,23 @@ void TextureCache::CompletedSubmissionUpdated(
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
       textures_.erase(found_texture_it);
+      ++destroyed_count;
       // `texture` is invalid now.
     }
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+    // Whatever is destroyed here and needed again has to be read out of guest
+    // memory and converted again, on the command processor thread, in the
+    // middle of a frame - so an eviction that keeps repeating is visible as
+    // stuttering. Log it: the size alone in the memory report doesn't say
+    // whether the cache grew into the limit or is cycling against it.
+    XELOGI(
+        "Texture cache: destroyed {} textures, {} MB -> {} MB ({} limit {} MB)",
+        destroyed_count, usage_before >> 20,
+        textures_total_host_memory_usage_ >> 20,
+        hit_hard_limit ? "hard" : "soft",
+        hit_hard_limit ? limit_hard_mb : limit_soft_mb);
   }
 }
 
@@ -815,6 +848,14 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     return;
   }
 
+  // This runs on the command processor thread in the middle of a draw, so
+  // whatever it costs is frame time. Measure it to tell a scene genuinely
+  // bringing in new material apart from the same textures being loaded over
+  // and over because something evicted them.
+  uint64_t load_start_ticks = xe::Clock::QueryHostTickCount();
+  uint64_t loaded_guest_bytes = 0;
+  uint32_t loaded_count = 0;
+
   for (uint32_t i = 0; i < n_textures; ++i) {
     Texture* p_texture = textures[i];
     if (!p_texture) {
@@ -822,6 +863,9 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     }
     textures[i] = nullptr;
     Texture& texture = *p_texture;
+    ++loaded_count;
+    loaded_guest_bytes +=
+        texture.GetGuestBaseSize() + texture.GetGuestMipsSize();
 
     TextureKey texture_key = texture.key();
     // Implementation may load multiple blocks at once via accesses of up to 128
@@ -894,6 +938,19 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       }
 
       texture->LogAction("Loaded");
+    }
+  }
+
+  if (loaded_count) {
+    static const double kTicksToMs =
+        1000.0 / double(xe::Clock::QueryHostTickFrequency());
+    double load_ms =
+        double(xe::Clock::QueryHostTickCount() - load_start_ticks) * kTicksToMs;
+    if (load_ms >= 8.0) {
+      XELOGW(
+          "Texture cache: loaded {} textures ({} KB of guest data) in {:.1f} ms "
+          "on the command processor thread",
+          loaded_count, loaded_guest_bytes >> 10, load_ms);
     }
   }
 }
