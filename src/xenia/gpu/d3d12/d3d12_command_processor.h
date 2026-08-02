@@ -642,6 +642,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Spare pool pages the arbiter keeps when it asks for the rest back, so the
   // next frame doesn't immediately allocate again.
   static constexpr size_t kConstantBufferPoolKeep = 4;
+  // Free host commit below which the texture cache is told to start honouring
+  // its soft size limit. Above the arbiter's own trim target (768 MB) on
+  // purpose: the cache giving back what it hasn't used for a while, early and
+  // a little at a time, is what keeps the arbiter from having to take
+  // textures that are still in use.
+  static constexpr uint64_t kTextureCachePressureFreeBytes = UINT64_C(1536)
+                                                             << 20;
 
   static constexpr uint32_t kViewBindfulHeapSize = 32768;
   static_assert(kViewBindfulHeapSize <=

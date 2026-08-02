@@ -107,6 +107,16 @@ class TextureCache {
   uint64_t TrimTexturesForHostMemory(uint64_t bytes_to_free,
                                      uint64_t completed_submission_index);
 
+  // Tells the cache whether the HOST is short on memory, which is a different
+  // question from whether this cache is large. Only when it is does the soft
+  // size limit evict anything; otherwise textures are kept until they go
+  // unused for long enough (texture_cache_idle_eviction_seconds), because
+  // releasing a texture the game still draws with only means reading and
+  // converting it again, on the command processor thread, mid-frame.
+  void SetHostMemoryPressure(bool under_pressure) {
+    host_memory_pressure_.store(under_pressure, std::memory_order_relaxed);
+  }
+
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
@@ -689,6 +699,11 @@ class TextureCache {
       textures_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
+  // Set by the command processor from the memory arbiter's view of the host.
+  std::atomic<bool> host_memory_pressure_{false};
+  // Nothing drawn this recently is evicted, even over the hard limit - it
+  // would be reloaded within a frame or two.
+  static constexpr uint64_t kMinEvictionAgeMs = 500;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

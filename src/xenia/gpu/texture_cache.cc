@@ -69,6 +69,18 @@ DEFINE_uint32(
     "will be destroyed as soon as possible.",
     "GPU");
 DEFINE_uint32(
+    texture_cache_idle_eviction_seconds, 120,
+    "Seconds a texture has to go unused before it is released even though "
+    "there is no shortage of host memory and the cache is under its limits.\n"
+    "Keeping a texture costs nothing while memory is plentiful, but a texture "
+    "the game stopped drawing with minutes ago is very unlikely to come back "
+    "before the scene changes, and releasing it early keeps the headroom that "
+    "stops the emergency eviction path - the one that blocks the command "
+    "processor reloading textures mid-frame - from ever running.\n"
+    "0 disables this and keeps everything until a limit or the memory arbiter "
+    "forces a release.",
+    "GPU");
+DEFINE_uint32(
     texture_cache_memory_limit_render_to_texture, 24,
     "Part of the host texture memory budget (in megabytes) that will be scaled "
     "by the current drawing resolution scale.\n"
@@ -230,24 +242,57 @@ void TextureCache::CompletedSubmissionUpdated(
       cvars::texture_cache_memory_limit_hard + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime =
       cvars::texture_cache_memory_limit_soft_lifetime * 1000;
+  // How long a texture has gone unused is what decides whether it is worth
+  // keeping - not how big the cache happens to be. Evicting on size alone is
+  // what made this cache sit on its own ceiling: it grew into the limit, was
+  // cut back, refilled from guest memory (blocking the command processor
+  // mid-frame each time) and grew into it again, hundreds of times per
+  // session, while gigabytes of host memory sat unused.
+  bool under_pressure = host_memory_pressure_.load(std::memory_order_relaxed);
+  uint64_t idle_eviction_ms =
+      uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
+
   bool destroyed_any = false;
   uint64_t usage_before = textures_total_host_memory_usage_;
   size_t destroyed_count = 0;
-  bool hit_hard_limit = false;
+  const char* reason = "idle";
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
         (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
     bool limit_hard_exceeded = total_host_memory_usage_mb > limit_hard_mb;
-    hit_hard_limit |= limit_hard_exceeded;
-    if (total_host_memory_usage_mb <= limit_soft_mb && !limit_hard_exceeded) {
-      break;
-    }
+    bool limit_soft_exceeded = total_host_memory_usage_mb > limit_soft_mb;
+
     Texture* texture = texture_used_first_;
     if (texture->last_usage_submission_index() > completed_submission_index) {
       break;
     }
-    if (!limit_hard_exceeded &&
-        (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
+    // The list is in use order, so if the oldest texture isn't old enough to
+    // go, nothing after it is either - every exit below can break.
+    uint64_t unused_for_ms = current_time - texture->last_usage_time();
+    if (limit_hard_exceeded) {
+      // Over the emergency ceiling. Still refuse to touch anything drawn in
+      // the last moments: throwing out what the current scene is actively
+      // using guarantees it is reloaded within a frame or two, which is the
+      // stutter this is supposed to prevent.
+      if (unused_for_ms < kMinEvictionAgeMs) {
+        break;
+      }
+      reason = "hard limit";
+    } else if (limit_soft_exceeded && under_pressure) {
+      // Over the soft limit AND the host is actually short on memory. Without
+      // the pressure check this fires purely because the cache is big, which
+      // on a console with gigabytes free is throwing away work for nothing.
+      if (unused_for_ms < limit_soft_lifetime) {
+        break;
+      }
+      reason = "soft limit under memory pressure";
+    } else if (idle_eviction_ms && unused_for_ms >= idle_eviction_ms) {
+      // Not short of memory and under every limit, but this texture hasn't
+      // been drawn with in a long time - it is very unlikely to come back
+      // before the scene changes, and releasing it early keeps the headroom
+      // that stops the emergency path from ever running.
+      reason = "unused for a long time";
+    } else {
       break;
     }
     if (!destroyed_any) {
@@ -276,12 +321,9 @@ void TextureCache::CompletedSubmissionUpdated(
     // middle of a frame - so an eviction that keeps repeating is visible as
     // stuttering. Log it: the size alone in the memory report doesn't say
     // whether the cache grew into the limit or is cycling against it.
-    XELOGI(
-        "Texture cache: destroyed {} textures, {} MB -> {} MB ({} limit {} MB)",
-        destroyed_count, usage_before >> 20,
-        textures_total_host_memory_usage_ >> 20,
-        hit_hard_limit ? "hard" : "soft",
-        hit_hard_limit ? limit_hard_mb : limit_soft_mb);
+    XELOGI("Texture cache: destroyed {} textures, {} MB -> {} MB ({})",
+           destroyed_count, usage_before >> 20,
+           textures_total_host_memory_usage_ >> 20, reason);
   }
 }
 

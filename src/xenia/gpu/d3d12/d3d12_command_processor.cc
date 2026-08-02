@@ -4405,6 +4405,21 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // cache is free to release resources.
     memory_arbiter_.Update(GetCurrentSubmission());
 
+    // The texture cache evicts on its own size, which says nothing about
+    // whether the host actually needs the memory back - and evicting a texture
+    // that is still being drawn with costs a guest memory read and a format
+    // conversion on this thread, mid-frame. Give it the arbiter's view so its
+    // soft limit only bites when the memory is genuinely wanted. The margin
+    // above the arbiter's own target is deliberate: releasing what has gone
+    // unused for a while, early and gradually, is how the arbiter avoids
+    // having to take textures that are still in use later.
+    if (texture_cache_) {
+      uint64_t free_bytes = memory_arbiter_.last_free_bytes();
+      texture_cache_->SetHostMemoryPressure(
+          free_bytes != UINT64_MAX &&
+          free_bytes < kTextureCachePressureFreeBytes);
+    }
+
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
