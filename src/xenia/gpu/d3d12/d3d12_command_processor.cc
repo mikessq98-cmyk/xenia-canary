@@ -53,16 +53,18 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
 
 DEFINE_bool(
     shared_vertex_shader_interpolators, true,
-    "Translate a vertex shader with every interpolator it writes, instead of "
-    "only those the pixel shader it is paired with reads.\n"
-    "The intersection makes the vertex shader's translation depend on which "
-    "pixel shader it is used with, so the same vertex shader is translated "
-    "again for every one of them - up to thirty times for a single shader in "
-    "some titles. Writing the full set costs a few interpolators that the "
-    "pixel shader ignores, which is free on any modern GPU (reading a subset "
-    "of what the previous stage wrote is explicitly allowed in Direct3D 12), "
-    "and saves the translation time, the bytecode memory and the cache "
-    "entries for all the duplicates.",
+    "Translate a vertex shader for the union of the interpolators every pixel "
+    "shader used with it reads, instead of the intersection with whichever one "
+    "it is currently paired with.\n"
+    "The intersection makes the vertex shader's translation depend on its "
+    "partner, so the same vertex shader is translated again for every pixel "
+    "shader it is used with - up to thirty times for a single shader in some "
+    "titles, each copy costing translation time, bytecode memory and a cache "
+    "entry. The union settles after the first few pipelines (a vertex shader "
+    "is used with a handful of interpolator layouts, not a new one every "
+    "time) and never exports an interpolator that no pixel shader asked for, "
+    "so the saving does not come out of GPU time in a heavy scene.\n"
+    "Turn off to translate strictly per pair, as upstream does.",
     "GPU");
 
 DECLARE_bool(clear_memory_page_state);
@@ -3328,16 +3330,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(),
         ps_param_gen_pos);
     if (cvars::shared_vertex_shader_interpolators) {
-      // Everything the vertex shader writes, rather than only what THIS pixel
-      // shader reads. The intersection makes the mask - and therefore the
-      // vertex shader's modification, and therefore its translation - depend
-      // on which pixel shader it happens to be paired with, so one vertex
-      // shader gets translated again for every pixel shader it is used with
-      // (up to 30 of them in Black Ops, per the pipeline telemetry). Writing
-      // the full set costs a few unread interpolators between the stages,
-      // which is nothing on this hardware; reading a subset of what the
-      // previous stage wrote is explicitly allowed in Direct3D 12.
-      interpolator_mask = vertex_shader->writes_interpolators();
+      // The union of what every pixel shader seen with this vertex shader
+      // reads, rather than the intersection with just this one. The
+      // intersection makes the vertex shader's translation depend on its
+      // partner, so it is translated again for each of them (up to 30 times
+      // in Black Ops, per the pipeline telemetry); the union settles after a
+      // few pipelines and never exports an interpolator no pixel shader
+      // wanted - which exporting everything the vertex shader writes did, at
+      // a real cost in a heavy scene.
+      interpolator_mask = pipeline_cache_->GetSharedInterpolatorMask(
+          vertex_shader->ucode_data_hash(),
+          vertex_shader->writes_interpolators(), ps_interpolator_mask);
     } else {
       interpolator_mask =
           vertex_shader->writes_interpolators() & ps_interpolator_mask;

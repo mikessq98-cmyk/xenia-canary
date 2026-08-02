@@ -1901,6 +1901,30 @@ bool PipelineCache::TranslateAnalyzedShader(
   return translation.is_valid();
 }
 
+uint32_t PipelineCache::GetSharedInterpolatorMask(
+    uint64_t vertex_shader_ucode_hash, uint32_t vertex_shader_writes,
+    uint32_t pixel_shader_reads) {
+  // Never export what the vertex shader doesn't produce.
+  uint32_t wanted = vertex_shader_writes & pixel_shader_reads;
+  auto it = shared_interpolator_masks_.find(vertex_shader_ucode_hash);
+  if (it == shared_interpolator_masks_.end()) {
+    shared_interpolator_masks_.emplace(vertex_shader_ucode_hash, wanted);
+    return wanted;
+  }
+  // A pixel shader that reads no more than what has been exported so far uses
+  // the existing translation as it is - this is the case that avoids the
+  // duplicate translations.
+  if ((wanted & ~it->second) == 0) {
+    return it->second;
+  }
+  // Something reads an interpolator not exported yet: widen. The vertex shader
+  // is translated once more, and from now on both layouts are served by the
+  // wider one. This converges - the number of distinct layouts a vertex shader
+  // is used with is small and bounded.
+  it->second |= wanted;
+  return it->second;
+}
+
 bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
   // Steady state uses few threads on purpose: the console has ~6-7 usable
   // cores carrying 30+ emulator threads, and compilation competing with them

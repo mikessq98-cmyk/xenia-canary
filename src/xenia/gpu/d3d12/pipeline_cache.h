@@ -165,6 +165,23 @@ class PipelineCache {
   // parallelism to be worth the cores. Command processor thread only.
   bool EnsureCreationThreadsForQueueDepth();
 
+  // The interpolator mask to translate a vertex shader (and the pixel shader
+  // paired with it) for: the union of what every pixel shader seen with this
+  // vertex shader so far actually reads.
+  //
+  // Using the intersection of the two shaders makes the vertex shader's
+  // translation depend on which pixel shader it is paired with, so it is
+  // translated again for each of them. Using everything the vertex shader
+  // writes removes that, but then it exports interpolators nobody reads, which
+  // costs real GPU time in a heavy scene. The union is the middle ground: it
+  // settles after the first few pipelines (a vertex shader is used with a
+  // handful of distinct interpolator layouts, not a new one every time), and
+  // it never exports more than some pixel shader genuinely wanted.
+  // Command processor thread only.
+  uint32_t GetSharedInterpolatorMask(uint64_t vertex_shader_ucode_hash,
+                                     uint32_t vertex_shader_writes,
+                                     uint32_t pixel_shader_reads);
+
 #if XE_PLATFORM_WINRT
   // How hard to look for stand-ins - see d3d12_substitute_pending_pipelines.
   enum class SubstituteMode {
@@ -721,6 +738,10 @@ class PipelineCache {
   // computed from the core count at initialization.
   static constexpr size_t kCreationQueueBurstDepth = 64;
   size_t creation_thread_burst_count_ = 0;
+
+  // Accumulated interpolator masks per vertex shader - see
+  // GetSharedInterpolatorMask.
+  std::unordered_map<uint64_t, uint32_t> shared_interpolator_masks_;
 
   // Nonzero while TranslateShadersForStorage is running on the loader
   // thread(s) - the arbiter's release must not free binaries out from under an
