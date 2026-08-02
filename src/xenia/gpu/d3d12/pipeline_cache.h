@@ -163,7 +163,7 @@ class PipelineCache {
 
   // Adds creation threads while the queue is deep enough for the extra
   // parallelism to be worth the cores. Command processor thread only.
-  void EnsureCreationThreadsForQueueDepth();
+  bool EnsureCreationThreadsForQueueDepth();
 
 #if XE_PLATFORM_WINRT
   // How hard to look for stand-ins - see d3d12_substitute_pending_pipelines.

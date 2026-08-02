@@ -1027,12 +1027,18 @@ void PipelineCache::EndSubmission() {
   // be asked FIRST, which only something that sees all of them can do.
   if (!creation_threads_.empty()) {
     // Add compilers while the backlog is deep - everything in that queue is a
-    // draw that gets skipped until it is built.
-    EnsureCreationThreadsForQueueDepth();
+    // draw that gets skipped until it is built. Also decides how many threads
+    // to wake: waking all of them on every submission is a thundering herd
+    // when there is nothing much to build.
+    bool backlog_deep = EnsureCreationThreadsForQueueDepth();
     // Don't wait for pipeline creation - let background threads work
     // asynchronously. Draws will be skipped until pipelines are ready.
     // This avoids frame-time spikes from blocking on pipeline creation.
-    creation_request_cond_.notify_all();
+    if (backlog_deep) {
+      creation_request_cond_.notify_all();
+    } else {
+      creation_request_cond_.notify_one();
+    }
   }
 }
 
@@ -1895,28 +1901,29 @@ bool PipelineCache::TranslateAnalyzedShader(
   return translation.is_valid();
 }
 
-void PipelineCache::EnsureCreationThreadsForQueueDepth() {
+bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
   // Steady state uses few threads on purpose: the console has ~6-7 usable
   // cores carrying 30+ emulator threads, and compilation competing with them
   // is felt as stutter. But when a level streams in, the queue goes hundreds
   // deep and every entry in it is a draw that will be skipped until it is
   // built - there, finishing sooner matters more, and the threads run at
   // below-normal priority so they still yield to the guest.
-  if (cvars::d3d12_pipeline_creation_threads >= 0) {
-    // An explicit count is the user's decision - don't override it.
-    return;
-  }
   size_t queue_depth;
   {
     std::lock_guard<xe_mutex> lock(creation_request_lock_);
     queue_depth = creation_queue_.size();
   }
+  bool backlog_deep = queue_depth >= kCreationQueueBurstDepth;
+  if (cvars::d3d12_pipeline_creation_threads >= 0) {
+    // An explicit count is the user's decision - don't override it.
+    return backlog_deep;
+  }
   size_t wanted_threads = creation_threads_.size();
-  if (queue_depth >= kCreationQueueBurstDepth) {
+  if (backlog_deep) {
     wanted_threads = creation_thread_burst_count_;
   }
   if (wanted_threads <= creation_threads_.size()) {
-    return;
+    return backlog_deep;
   }
   while (creation_threads_.size() < wanted_threads) {
     size_t creation_thread_index = creation_threads_.size();
@@ -1936,6 +1943,7 @@ void PipelineCache::EnsureCreationThreadsForQueueDepth() {
   XELOGI(
       "Pipeline cache: {} creation threads while {} pipelines are queued",
       creation_threads_.size(), queue_depth);
+  return backlog_deep;
 }
 
 void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
