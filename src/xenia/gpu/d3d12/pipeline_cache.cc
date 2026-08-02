@@ -273,6 +273,17 @@ bool PipelineCache::Initialize() {
       // running), so initial load speed is unaffected.
       creation_thread_count = std::min(creation_thread_count, size_t(3));
 #endif  // XE_PLATFORM_WINRT
+      // While a level streams in, the queue goes hundreds deep and everything
+      // in it is a draw waiting to be drawn - see
+      // EnsureCreationThreadsForQueueDepth.
+      creation_thread_burst_count_ =
+          std::max(creation_thread_count,
+                   size_t(std::max(logical_processor_count * 3 / 4,
+                                   uint32_t(1))));
+#if XE_PLATFORM_WINRT
+      creation_thread_burst_count_ =
+          std::min(creation_thread_burst_count_, size_t(5));
+#endif  // XE_PLATFORM_WINRT
     } else {
       creation_thread_count =
           std::min(uint32_t(cvars::d3d12_pipeline_creation_threads),
@@ -1015,10 +1026,13 @@ void PipelineCache::EndSubmission() {
   // and re-claiming memory, and this one - the cheapest to rebuild - has to
   // be asked FIRST, which only something that sees all of them can do.
   if (!creation_threads_.empty()) {
+    // Add compilers while the backlog is deep - everything in that queue is a
+    // draw that gets skipped until it is built.
+    EnsureCreationThreadsForQueueDepth();
     // Don't wait for pipeline creation - let background threads work
     // asynchronously. Draws will be skipped until pipelines are ready.
     // This avoids frame-time spikes from blocking on pipeline creation.
-    creation_request_cond_.notify_one();
+    creation_request_cond_.notify_all();
   }
 }
 
@@ -1858,6 +1872,49 @@ bool PipelineCache::TranslateAnalyzedShader(
                                        std::memory_order_relaxed);
   }
   return translation.is_valid();
+}
+
+void PipelineCache::EnsureCreationThreadsForQueueDepth() {
+  // Steady state uses few threads on purpose: the console has ~6-7 usable
+  // cores carrying 30+ emulator threads, and compilation competing with them
+  // is felt as stutter. But when a level streams in, the queue goes hundreds
+  // deep and every entry in it is a draw that will be skipped until it is
+  // built - there, finishing sooner matters more, and the threads run at
+  // below-normal priority so they still yield to the guest.
+  if (cvars::d3d12_pipeline_creation_threads >= 0) {
+    // An explicit count is the user's decision - don't override it.
+    return;
+  }
+  size_t queue_depth;
+  {
+    std::lock_guard<xe_mutex> lock(creation_request_lock_);
+    queue_depth = creation_queue_.size();
+  }
+  size_t wanted_threads = creation_threads_.size();
+  if (queue_depth >= kCreationQueueBurstDepth) {
+    wanted_threads = creation_thread_burst_count_;
+  }
+  if (wanted_threads <= creation_threads_.size()) {
+    return;
+  }
+  while (creation_threads_.size() < wanted_threads) {
+    size_t creation_thread_index = creation_threads_.size();
+    std::unique_ptr<xe::threading::Thread> creation_thread =
+        xe::threading::Thread::Create({}, [this, creation_thread_index]() {
+          CreationThread(creation_thread_index);
+        });
+    if (!creation_thread) {
+      break;
+    }
+    creation_thread->set_name("D3D12 Pipelines");
+#if XE_PLATFORM_WINRT
+    creation_thread->set_priority(-1);
+#endif  // XE_PLATFORM_WINRT
+    creation_threads_.push_back(std::move(creation_thread));
+  }
+  XELOGI(
+      "Pipeline cache: {} creation threads while {} pipelines are queued",
+      creation_threads_.size(), queue_depth);
 }
 
 void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {

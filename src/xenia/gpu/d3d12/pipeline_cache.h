@@ -161,6 +161,10 @@ class PipelineCache {
   // Command processor thread only.
   void PrioritizePipelineForPendingDraw(void* handle);
 
+  // Adds creation threads while the queue is deep enough for the extra
+  // parallelism to be worth the cores. Command processor thread only.
+  void EnsureCreationThreadsForQueueDepth();
+
 #if XE_PLATFORM_WINRT
   // How hard to look for stand-ins - see d3d12_substitute_pending_pipelines.
   enum class SubstituteMode {
@@ -711,6 +715,11 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
+  // Queue depth at which more creation threads are spun up, and how many to
+  // run then - see EnsureCreationThreadsForQueueDepth. The burst count is
+  // computed from the core count at initialization.
+  static constexpr size_t kCreationQueueBurstDepth = 64;
+  size_t creation_thread_burst_count_ = 0;
 
   // Nonzero while TranslateShadersForStorage is running on the loader
   // thread(s) - the arbiter's release must not free binaries out from under an
