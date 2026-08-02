@@ -171,30 +171,58 @@ LONG CALLBACK UnhandledExceptionLogger(PEXCEPTION_POINTERS ex_info) {
          ctx->Rsp, ctx->Rax, ctx->Rcx);
   XELOGE("RDX=0x{:016X} R8=0x{:016X} R9=0x{:016X} RBX=0x{:016X}", ctx->Rdx,
          ctx->R8, ctx->R9, ctx->Rbx);
-  // Poor man's stack trace: scan the live stack for return addresses that
-  // resolve into modules or the JIT cache (no dbghelp in the App Container).
+  XELOGE("RSI=0x{:016X} RDI=0x{:016X} RBP=0x{:016X} R10=0x{:016X}", ctx->Rsi,
+         ctx->Rdi, ctx->Rbp, ctx->R10);
+  XELOGE("R11=0x{:016X} R12=0x{:016X} R13=0x{:016X} R14=0x{:016X}", ctx->R11,
+         ctx->R12, ctx->R13, ctx->R14);
+
+  // Walk the stack properly, through the unwind data, rather than scanning it
+  // for anything that looks like a code address. The scan reported nothing at
+  // all for the Max Payne 3 crash - a crash with no call stack is a crash that
+  // can't be diagnosed - and even when it does hit, it can't tell a live
+  // return address from a stale one left in an old frame.
   {
-    MEMORY_BASIC_INFORMATION mbi = {};
-    const uint64_t* stack = reinterpret_cast<const uint64_t*>(ctx->Rsp);
-    int hits = 0;
-    for (size_t i = 0; i < 256 && hits < 12; ++i) {
-      const uint64_t* slot = stack + i;
-      if (!VirtualQuery(slot, &mbi, sizeof(mbi)) ||
-          mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
-          (mbi.Protect &
-           (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
-            PAGE_EXECUTE_READWRITE)) == 0) {
+    CONTEXT walk = *ctx;
+    int frames_logged = 0;
+    for (int frame = 0; frame < 32; ++frame) {
+      uint64_t pc = walk.Rip;
+      if (!pc) {
         break;
       }
-      uint64_t value = *slot;
-      if (value < 0x10000 || value > 0x7FFFFFFFFFFFull) {
+      XELOGE("  frame[{:02d}] 0x{:016X} ({})", frame, pc,
+             DescribeCrashAddress(pc));
+      ++frames_logged;
+      DWORD64 image_base = 0;
+      PRUNTIME_FUNCTION runtime_function =
+          RtlLookupFunctionEntry(pc, &image_base, nullptr);
+      if (runtime_function) {
+        PVOID handler_data = nullptr;
+        DWORD64 establisher_frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, pc, runtime_function,
+                         &walk, &handler_data, &establisher_frame, nullptr);
         continue;
       }
-      std::string desc = DescribeCrashAddress(value);
-      if (desc != "unknown") {
-        XELOGE("  stack[+0x{:03X}] = 0x{:016X} ({})", i * 8, value, desc);
-        ++hits;
+      // No unwind data - a leaf function, or JIT-generated guest code, which
+      // has none by design. Assume the standard frame and step over the return
+      // address by hand; if that isn't where it is, the walk ends here rather
+      // than inventing frames.
+      MEMORY_BASIC_INFORMATION mbi = {};
+      const uint64_t* return_slot = reinterpret_cast<const uint64_t*>(walk.Rsp);
+      if (!VirtualQuery(return_slot, &mbi, sizeof(mbi)) ||
+          mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) {
+        break;
       }
+      uint64_t return_address = *return_slot;
+      if (return_address < 0x10000) {
+        break;
+      }
+      walk.Rip = return_address;
+      walk.Rsp += 8;
+    }
+    if (frames_logged <= 1) {
+      XELOGE(
+          "  (no further frames - the stack is unwalkable from here, which "
+          "usually means the frame itself is corrupt)");
     }
   }
 #endif
