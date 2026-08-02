@@ -1978,8 +1978,47 @@ uint32_t PipelineCache::GetSharedInterpolatorMask(
     // again, and once the queue is quiet it goes through.
     if (creation_queue_depth_hint_.load(std::memory_order_relaxed) >=
         kSharedInterpolatorDeferWidenQueueDepth) {
+      ++shared_interpolator_widenings_deferred_;
       return wanted;
     }
+    // The price is paid in pipelines: every one already built with this vertex
+    // shader was built against the old modification and has to be built again,
+    // and its draws are skipped until it is. The saving is the translations of
+    // this vertex shader that the union avoids later. So count what it would
+    // cost before agreeing to it - past a handful of pipelines, living with a
+    // separate modification for this pixel shader is the cheaper answer.
+    size_t pipelines_with_vs = 0;
+    for (const auto& pipeline_pair : pipelines_) {
+      const PipelineRuntimeDescription& desc = pipeline_pair.second->description;
+      if (desc.vertex_shader &&
+          desc.vertex_shader->shader().ucode_data_hash() ==
+              vertex_shader_ucode_hash) {
+        ++pipelines_with_vs;
+      }
+    }
+    if (pipelines_with_vs > kSharedInterpolatorMaxPipelinesToRebuild) {
+      ++shared_interpolator_widenings_refused_;
+      if (shared_interpolator_widenings_refused_ <= 8 ||
+          (shared_interpolator_widenings_refused_ % 100) == 0) {
+        XELOGI(
+            "Interpolators: not widening VS {:016X} from {:08X} to {:08X} - it "
+            "would rebuild {} pipelines ({} refusals so far)",
+            vertex_shader_ucode_hash, it->second.mask,
+            it->second.mask | wanted, pipelines_with_vs,
+            shared_interpolator_widenings_refused_);
+      }
+      return wanted;
+    }
+    XELOGI(
+        "Interpolators: widening VS {:016X} from {:08X} to {:08X} (widening "
+        "{} of {}), rebuilding {} pipelines; {} widenings deferred so far for "
+        "a busy queue",
+        vertex_shader_ucode_hash, it->second.mask,
+        (it->second.widen_count + 1 >= kSharedInterpolatorMaxWidenings)
+            ? vertex_shader_writes
+            : (it->second.mask | wanted),
+        it->second.widen_count + 1, kSharedInterpolatorMaxWidenings,
+        pipelines_with_vs, shared_interpolator_widenings_deferred_);
     // Something reads an interpolator not exported yet, so the mask has to
     // widen - and widening RETRANSLATES the vertex shader and rebuilds every
     // pipeline using it. Doing that repeatedly, a few bits at a time, would

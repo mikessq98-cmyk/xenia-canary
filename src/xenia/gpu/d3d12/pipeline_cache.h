@@ -764,6 +764,12 @@ class PipelineCache {
     uint32_t widen_count;
   };
   static constexpr uint32_t kSharedInterpolatorMaxWidenings = 2;
+  // Refuse to widen when this many pipelines would have to be rebuilt for it -
+  // the mask is shared to save translations, and past this the rebuilds cost
+  // more than the translations ever saved.
+  static constexpr size_t kSharedInterpolatorMaxPipelinesToRebuild = 8;
+  uint32_t shared_interpolator_widenings_deferred_ = 0;
+  uint32_t shared_interpolator_widenings_refused_ = 0;
   std::unordered_map<uint64_t, SharedInterpolatorMask>
       shared_interpolator_masks_;
   // Answer for the previous draw - consecutive draws overwhelmingly share
