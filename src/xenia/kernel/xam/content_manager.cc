@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/content_manager.h"
 
 #include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
@@ -431,9 +432,25 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  // Open package.
+  // Open package. This builds a fresh device and scans the directory behind
+  // it - a game that opens and closes its save repeatedly (Dark Souls does so
+  // dozens of times a session) pays that every time, and on this platform
+  // every file operation goes through the App Container broker.
+  uint64_t open_start_ticks = Clock::QueryHostTickCount();
   auto package = ResolvePackage(root_name, xuid, data, disc_number);
   assert_not_null(package);
+  {
+    static const double kTicksToMs =
+        1000.0 / double(Clock::QueryHostTickFrequency());
+    double open_ms =
+        double(Clock::QueryHostTickCount() - open_start_ticks) * kTicksToMs;
+    if (open_ms >= 5.0) {
+      XELOGW(
+          "ContentManager::OpenContent: mounting '{}' took {:.1f} ms - the "
+          "guest thread was blocked for that long",
+          root_name, open_ms);
+    }
+  }
 
   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
