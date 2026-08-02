@@ -2269,6 +2269,11 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
 
+  // The arbiter's consumers hold raw pointers into the caches destroyed below,
+  // so they must go first - a submission that slipped through afterwards would
+  // call into freed objects.
+  memory_arbiter_.UnregisterConsumers();
+
   for (auto& pair : readback_buffers_) {
     ui::d3d12::util::ReleaseAndNull(pair.second.buffers[0]);
     ui::d3d12::util::ReleaseAndNull(pair.second.buffers[1]);
@@ -4314,9 +4319,13 @@ void D3D12CommandProcessor::RegisterMemoryArbiterConsumers() {
       ConsumerKind::kUnusedRenderTargets,
       [this]() { return render_target_cache_->GetHostMemoryUsage(); },
       [this](uint64_t bytes_to_free) -> uint64_t {
+        // Requiring some idle time matters here: a render target the game
+        // uses every frame would otherwise be released and recreated
+        // immediately, which is pure churn and was exactly the "constant
+        // stuttering" the old per-cache trimming produced.
         return render_target_cache_->TrimUnusedRenderTargets(
             bytes_to_free, GetCompletedSubmission(),
-            /*min_idle_submissions=*/0);
+            /*min_idle_submissions=*/60);
       });
 
   // Expensive: a guest memory read plus format conversion.
@@ -4386,7 +4395,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // when short, trims from the cheapest-to-rebuild cache upwards. Done here
     // because nothing has been recorded into the command list yet, so any
     // cache is free to release resources.
-    memory_arbiter_.Update(submission_current_);
+    memory_arbiter_.Update(GetCurrentSubmission());
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are

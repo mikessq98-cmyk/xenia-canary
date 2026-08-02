@@ -675,8 +675,9 @@ class PipelineCache {
   // ID3D12PipelineLibrary is not free-threaded, and pipelines are created on
   // the creation threads.
   std::mutex pipeline_library_mutex_;
-  // Whether anything was stored since the last serialization.
-  bool pipeline_library_dirty_ = false;
+  // Whether anything was stored since the last serialization. Set on the
+  // creation threads, polled by EndSubmission on the command processor one.
+  std::atomic<bool> pipeline_library_dirty_{false};
   // Submissions since the library was last written out (see EndSubmission).
   uint32_t submissions_since_library_save_ = 0;
   // Pipelines served by the library vs. compiled by the driver this run -

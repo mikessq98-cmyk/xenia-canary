@@ -36,7 +36,6 @@
 #include "xenia/ui/d3d12/d3d12_util.h"
 
 #if XE_PLATFORM_WIN32
-// GlobalMemoryStatusEx - the host memory the render target budget follows.
 #include "xenia/base/platform_win.h"
 #endif
 
