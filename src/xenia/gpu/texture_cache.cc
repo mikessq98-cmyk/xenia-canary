@@ -450,6 +450,8 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle,
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
+  uint64_t request_start_ticks = xe::Clock::QueryHostTickCount();
+  uint32_t textures_created = 0;
 
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
@@ -519,6 +521,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       if (any_sign_is_not_signed) {
         if (key_changed || !any_sign_was_not_signed) {
           binding.texture = FindOrCreateTexture(binding.key);
+          ++textures_created;
           load_unsigned_data = true;
         }
       } else {
@@ -529,6 +532,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
           TextureKey signed_key = binding.key;
           signed_key.signed_separate = 1;
           binding.texture_signed = FindOrCreateTexture(signed_key);
+          ++textures_created;
           load_signed_data = true;
         }
       } else {
@@ -539,6 +543,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // be different.
       if (key_changed) {
         binding.texture = FindOrCreateTexture(binding.key);
+        ++textures_created;
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -551,10 +556,31 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   }
 
+  // Creating the host textures above (FindOrCreateTexture) and writing the
+  // descriptors below are separate costs from reading the guest data, and the
+  // guest logs showed a 857 ms block in this phase with no time at all inside
+  // the data load - so the phase timer alone can't say which part to fix.
+  uint64_t load_start_ticks = xe::Clock::QueryHostTickCount();
   LoadTexturesData(textures_to_load, num_textures_to_load);
+  uint64_t bind_start_ticks = xe::Clock::QueryHostTickCount();
 
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
+  }
+
+  static const double kTicksToMs =
+      1000.0 / double(xe::Clock::QueryHostTickFrequency());
+  uint64_t end_ticks = xe::Clock::QueryHostTickCount();
+  double total_ms = double(end_ticks - request_start_ticks) * kTicksToMs;
+  if (total_ms >= 8.0) {
+    XELOGW(
+        "Texture cache: RequestTextures took {:.1f} ms on the command "
+        "processor thread - {:.1f} ms creating {} host textures, {:.1f} ms "
+        "loading data, {:.1f} ms writing descriptors",
+        total_ms, double(load_start_ticks - request_start_ticks) * kTicksToMs,
+        textures_created, double(bind_start_ticks - load_start_ticks) *
+                              kTicksToMs,
+        double(end_ticks - bind_start_ticks) * kTicksToMs);
   }
 }
 
