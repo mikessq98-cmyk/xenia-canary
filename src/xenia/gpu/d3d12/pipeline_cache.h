@@ -740,8 +740,21 @@ class PipelineCache {
   size_t creation_thread_burst_count_ = 0;
 
   // Accumulated interpolator masks per vertex shader - see
-  // GetSharedInterpolatorMask.
-  std::unordered_map<uint64_t, uint32_t> shared_interpolator_masks_;
+  // GetSharedInterpolatorMask. Widening the mask retranslates the shader and
+  // rebuilds its pipelines, so the number of times that may happen for one
+  // shader is capped; past it the mask jumps straight to everything the
+  // vertex shader writes and stops moving.
+  struct SharedInterpolatorMask {
+    uint32_t mask;
+    uint32_t widen_count;
+  };
+  static constexpr uint32_t kSharedInterpolatorMaxWidenings = 2;
+  std::unordered_map<uint64_t, SharedInterpolatorMask>
+      shared_interpolator_masks_;
+  // Answer for the previous draw - consecutive draws overwhelmingly share
+  // shaders, and this runs per draw.
+  uint64_t last_shared_interpolator_vs_hash_ = 0;
+  uint32_t last_shared_interpolator_mask_ = 0;
 
   // Nonzero while TranslateShadersForStorage is running on the loader
   // thread(s) - the arbiter's release must not free binaries out from under an

@@ -1906,23 +1906,38 @@ uint32_t PipelineCache::GetSharedInterpolatorMask(
     uint32_t pixel_shader_reads) {
   // Never export what the vertex shader doesn't produce.
   uint32_t wanted = vertex_shader_writes & pixel_shader_reads;
+
+  // Most draws in a row use the same shaders, so answer those without going
+  // near the map at all - this runs per draw.
+  if (vertex_shader_ucode_hash == last_shared_interpolator_vs_hash_ &&
+      (wanted & ~last_shared_interpolator_mask_) == 0) {
+    return last_shared_interpolator_mask_;
+  }
+
   auto it = shared_interpolator_masks_.find(vertex_shader_ucode_hash);
   if (it == shared_interpolator_masks_.end()) {
-    shared_interpolator_masks_.emplace(vertex_shader_ucode_hash, wanted);
-    return wanted;
+    it = shared_interpolator_masks_.emplace(vertex_shader_ucode_hash,
+                                            SharedInterpolatorMask{wanted, 0})
+             .first;
+  } else if ((wanted & ~it->second.mask) != 0) {
+    // Something reads an interpolator not exported yet, so the mask has to
+    // widen - and widening RETRANSLATES the vertex shader and rebuilds every
+    // pipeline using it. Doing that repeatedly, a few bits at a time, would
+    // put a burst of compilation right where the scene is already streaming.
+    // After a couple of widenings, settle on everything the vertex shader
+    // writes instead: it exports a few interpolators nobody reads, but this
+    // shader has demonstrably no stable layout, and it will never be
+    // retranslated for interpolators again.
+    if (++it->second.widen_count >= kSharedInterpolatorMaxWidenings) {
+      it->second.mask = vertex_shader_writes;
+    } else {
+      it->second.mask |= wanted;
+    }
   }
-  // A pixel shader that reads no more than what has been exported so far uses
-  // the existing translation as it is - this is the case that avoids the
-  // duplicate translations.
-  if ((wanted & ~it->second) == 0) {
-    return it->second;
-  }
-  // Something reads an interpolator not exported yet: widen. The vertex shader
-  // is translated once more, and from now on both layouts are served by the
-  // wider one. This converges - the number of distinct layouts a vertex shader
-  // is used with is small and bounded.
-  it->second |= wanted;
-  return it->second;
+
+  last_shared_interpolator_vs_hash_ = vertex_shader_ucode_hash;
+  last_shared_interpolator_mask_ = it->second.mask;
+  return it->second.mask;
 }
 
 bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
