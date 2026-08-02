@@ -73,6 +73,21 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
             "D3D12");
 
+DEFINE_bool(
+    d3d12_no_early_depth_stencil_hint, false,
+    "Never mark a pixel shader [earlydepthstencil], so it is translated once "
+    "instead of once per alpha-test state.\n"
+    "Whether the hint may be applied depends on the alpha test and "
+    "alpha-to-coverage state at the time of the draw rather than on the shader "
+    "itself, so a title that draws the same shader both ways gets two "
+    "translations of it and two pipelines - and the draws needing the second "
+    "one are skipped until it has been built. In the guest logs this is the "
+    "largest single source of duplicate pixel shader modifications.\n"
+    "The cost of turning this on is the early depth rejection the hint would "
+    "have enabled, which is GPU time. Worth trying when the GPU has headroom "
+    "and the stalls are pipeline creation, not shading.",
+    "D3D12");
+
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
     d3d12_pipeline_library, true,
@@ -1209,12 +1224,23 @@ PipelineCache::GetCurrentPixelShaderModification(
               ? DepthStencilMode::kFloat24Rounding
               : DepthStencilMode::kFloat24Truncating;
     } else {
-      if (shader.implicit_early_z_write_allowed() &&
+      if (!cvars::d3d12_no_early_depth_stencil_hint &&
+          shader.implicit_early_z_write_allowed() &&
           (!shader.writes_color_target(0) ||
            !draw_util::DoesCoverageDependOnAlpha(
                regs.Get<reg::RB_COLORCONTROL>()))) {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
+        // Whether this hint applies depends on the alpha test state at the
+        // time of the draw, not on the shader - so a title that draws the same
+        // shader with the test on and off gets two translations of it and two
+        // pipelines, and the draws using the second one are skipped until it
+        // is built. Measured on the guest logs this is the single largest
+        // source of duplicate pixel shader modifications: 8 of the 10 shaders
+        // that had more than one in Dark Souls, and both of them in Black Ops.
+        // Dropping the hint collapses those pairs into one pipeline, at the
+        // cost of the early depth rejection it would have enabled - see the
+        // cvar.
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
