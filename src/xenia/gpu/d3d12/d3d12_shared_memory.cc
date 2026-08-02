@@ -9,9 +9,11 @@
 
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -342,6 +344,14 @@ bool D3D12SharedMemory::UploadRanges(
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
+  // This copies guest memory into upload buffers with the CPU, on the command
+  // processor thread, while the GPU waits - when a game streams in new
+  // objects it is the largest block of CPU work in the frame, and the reason
+  // the host can be saturated while the GPU sits at a fraction of its
+  // capacity. Measured so the size of the problem is known rather than
+  // guessed at.
+  uint64_t upload_start_ticks = Clock::QueryHostTickCount();
+  uint64_t uploaded_bytes = 0;
   for (uint32_t i = 0; i < num_upload_page_ranges; ++i) {
     auto& upload_range = upload_page_ranges[i];
     uint32_t upload_range_start = upload_range.first;
@@ -403,10 +413,28 @@ bool D3D12SharedMemory::UploadRanges(
       command_list.D3DCopyBufferRegion(
           buffer_, upload_range_start << page_size_log2(), upload_buffer,
           UINT64(upload_buffer_offset), UINT64(upload_buffer_size));
+      uploaded_bytes += upload_buffer_size;
       uint32_t upload_buffer_pages =
           uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
+    }
+  }
+  if (uploaded_bytes) {
+    static const double kTicksToMs =
+        1000.0 / double(Clock::QueryHostTickFrequency());
+    double upload_ms =
+        double(Clock::QueryHostTickCount() - upload_start_ticks) * kTicksToMs;
+    if (upload_ms >= 5.0) {
+      static std::atomic<uint32_t> slow_upload_count{0};
+      uint32_t n = slow_upload_count.fetch_add(1, std::memory_order_relaxed);
+      if (n < 32 || (n % 128) == 0) {
+        XELOGW(
+            "Shared memory: copied {} KB of guest memory to the GPU in "
+            "{:.1f} ms on the command processor thread ({} range(s), "
+            "occurrence {})",
+            uploaded_bytes >> 10, upload_ms, num_upload_page_ranges, n + 1);
+      }
     }
   }
   return true;
