@@ -252,6 +252,18 @@ void TextureCache::CompletedSubmissionUpdated(
   uint64_t idle_eviction_ms =
       uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
 
+  // Releasing idle textures a handful at a time, every time a submission
+  // completes, is worse than releasing the same textures in one go: every
+  // eviction calls ResetTextureBindings, so the next draws have to re-bind
+  // everything, and that cost is paid per batch rather than per texture. It
+  // isn't urgent work either - nothing is waiting for this memory, or the
+  // pressure path would be running instead. So let idle textures accumulate
+  // and take them in one pass.
+  if (completed_submission_index <
+      last_idle_eviction_submission_ + kIdleEvictionIntervalSubmissions) {
+    idle_eviction_ms = 0;
+  }
+
   bool destroyed_any = false;
   uint64_t usage_before = textures_total_host_memory_usage_;
   size_t destroyed_count = 0;
@@ -287,6 +299,7 @@ void TextureCache::CompletedSubmissionUpdated(
       }
       reason = "soft limit under memory pressure";
     } else if (idle_eviction_ms && unused_for_ms >= idle_eviction_ms) {
+      last_idle_eviction_submission_ = completed_submission_index;
       // Not short of memory and under every limit, but this texture hasn't
       // been drawn with in a long time - it is very unlikely to come back
       // before the scene changes, and releasing it early keeps the headroom

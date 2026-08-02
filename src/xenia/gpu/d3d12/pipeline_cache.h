@@ -628,12 +628,26 @@ class PipelineCache {
   // pixel shader identity must be equal, and the root signature must be the
   // SAME object (a substituted bind under a different root signature is a
   // device loss).
-  static bool AreSubstitutable(const PipelineRuntimeDescription& a,
-                               const PipelineRuntimeDescription& b);
+  // How good a stand-in one pipeline is for another. Ordered best first - the
+  // search takes the best it finds rather than the first.
+  enum class SubstituteQuality {
+    // Same guest pixel shader, translated for a different modification. Reads
+    // and writes exactly the same resources (it is the same microcode), so the
+    // worst case is wrong shading. This is the common case in a title that
+    // draws one material under two states.
+    kSameShaderOtherModification,
+    // A different pixel shader that happens to sample the same textures
+    // through the same bindings. Shades the object with someone else's logic -
+    // visible, but it cannot read a descriptor the draw didn't bind.
+    kOtherShaderSameBindings,
+    kUnusable,
+  };
+  static SubstituteQuality GetSubstituteQuality(
+      const PipelineRuntimeDescription& a, const PipelineRuntimeDescription& b);
   // All pipelines by substitute key, ready or not (readiness is checked when
   // picking one). Processor thread only.
   std::unordered_multimap<uint64_t, Pipeline*> substitute_index_;
-  // Candidates turned down by AreSubstitutable - see GetReadySubstituteByHandle.
+  // Candidates turned down as unusable - see GetReadySubstituteByHandle.
   std::atomic<uint32_t> substitutes_rejected_{0};
   // Parsed once at initialization - this is read per skipped draw.
   SubstituteMode substitute_mode_ = SubstituteMode::kOnce;

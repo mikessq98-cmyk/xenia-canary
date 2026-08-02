@@ -704,6 +704,12 @@ class TextureCache {
   // Nothing drawn this recently is evicted, even over the hard limit - it
   // would be reloaded within a frame or two.
   static constexpr uint64_t kMinEvictionAgeMs = 500;
+  // Idle eviction is batched rather than run every submission: each eviction
+  // pass resets the texture bindings, so a few textures at a time costs far
+  // more re-binding than the same textures taken at once. Nothing waits on
+  // this memory - if anything did, the pressure path would be running.
+  static constexpr uint64_t kIdleEvictionIntervalSubmissions = 600;
+  uint64_t last_idle_eviction_submission_ = 0;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

@@ -617,6 +617,14 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
       if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
         const D3D12_AUTO_BREADCRUMB_NODE* node =
             breadcrumbs.pHeadAutoBreadcrumbNode;
+        if (!node) {
+          // Worth saying out loud - an empty list looked identical to "no
+          // breadcrumb code ran" in the logs, and it means the hang cannot be
+          // pinned to a command list from here.
+          XELOGE(
+              "DRED: no breadcrumb nodes - the device died outside a recorded "
+              "command list, or the driver kept none");
+        }
         uint32_t node_index = 0;
         while (node && node_index < 16) {
           uint32_t executed =
@@ -646,6 +654,29 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
       if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault))) {
         XELOGE("DRED: page fault VA=0x{:016X}",
                uint64_t(page_fault.PageFaultVA));
+        // The address alone says nothing about WHICH resource. These two lists
+        // do: "recently freed" in particular answers the question that matters
+        // here - whether something was released while the GPU was still
+        // reading it, which is exactly what the caches trimming under memory
+        // pressure could get wrong.
+        auto log_allocations = [](const char* what,
+                                  const D3D12_DRED_ALLOCATION_NODE* node) {
+          uint32_t index = 0;
+          while (node && index < 24) {
+            XELOGE("DRED: {}[{}] '{}' type {}", what, index,
+                   node->ObjectNameA ? node->ObjectNameA : "?",
+                   uint32_t(node->AllocationType));
+            node = node->pNext;
+            ++index;
+          }
+          if (!index) {
+            XELOGE("DRED: {} - none reported", what);
+          }
+        };
+        log_allocations("existing allocation",
+                        page_fault.pHeadExistingAllocationNode);
+        log_allocations("RECENTLY FREED allocation",
+                        page_fault.pHeadRecentFreedAllocationNode);
       }
       dred->Release();
     } else {

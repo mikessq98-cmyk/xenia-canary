@@ -1415,14 +1415,26 @@ bool PipelineCache::ConfigurePipeline(
     // the only search there will be.
     if (use_async) {
       auto range = substitute_index_.equal_range(new_pipeline->substitute_key);
+      Pipeline* best = nullptr;
+      SubstituteQuality best_quality = SubstituteQuality::kUnusable;
       for (auto it = range.first; it != range.second; ++it) {
         Pipeline* candidate = it->second;
-        if (candidate != new_pipeline &&
-            candidate->state.load(std::memory_order_acquire) &&
-            AreSubstitutable(candidate->description, runtime_description)) {
-          new_pipeline->substitute.store(candidate, std::memory_order_release);
-          break;
+        if (candidate == new_pipeline ||
+            !candidate->state.load(std::memory_order_acquire)) {
+          continue;
         }
+        SubstituteQuality quality =
+            GetSubstituteQuality(candidate->description, runtime_description);
+        if (quality < best_quality) {
+          best_quality = quality;
+          best = candidate;
+          if (quality == SubstituteQuality::kSameShaderOtherModification) {
+            break;
+          }
+        }
+      }
+      if (best) {
+        new_pipeline->substitute.store(best, std::memory_order_release);
       }
     }
   }
@@ -1653,37 +1665,52 @@ uint64_t PipelineCache::ComputeSubstituteKey(
   return XXH3_64bits(&key_data, sizeof(key_data));
 }
 
-bool PipelineCache::AreSubstitutable(const PipelineRuntimeDescription& a,
-                                     const PipelineRuntimeDescription& b) {
+PipelineCache::SubstituteQuality PipelineCache::GetSubstituteQuality(
+    const PipelineRuntimeDescription& a, const PipelineRuntimeDescription& b) {
   if (a.root_signature != b.root_signature ||
       a.vertex_shader != b.vertex_shader ||
       a.geometry_shader != b.geometry_shader) {
-    return false;
+    return SubstituteQuality::kUnusable;
   }
   PipelineDescription da = a.description;
   PipelineDescription db = b.description;
+  // Same guest pixel shader microcode, only translated for a different
+  // modification (a different interpolator layout, early-Z hint, param-gen or
+  // blend pre-multiply) is the substitution actually worth making. The shader
+  // samples the same textures through the same bindings, because it IS the
+  // same shader - so nothing can be read that the draw didn't bind, and the
+  // worst case is wrong shading, never a page fault. This is the case a title
+  // hits constantly: one material drawn under two states.
+  bool same_microcode =
+      da.pixel_shader_hash == db.pixel_shader_hash &&
+      da.pixel_shader_modification != db.pixel_shader_modification;
   da.pixel_shader_hash = db.pixel_shader_hash = 0;
   da.pixel_shader_modification = db.pixel_shader_modification = 0;
   if (std::memcmp(&da, &db, sizeof(da)) != 0) {
-    return false;
+    return SubstituteQuality::kUnusable;
   }
   // The stand-in must also WRITE the same things. Two pixel shaders can share
   // a root signature and render state and still differ in whether they output
   // colour or depth at all - substituting across that turns a subtle "wrong
   // shading" into geometry that is missing or wrongly occluding.
   if (!a.pixel_shader != !b.pixel_shader) {
-    return false;
+    return SubstituteQuality::kUnusable;
+  }
+  if (same_microcode) {
+    // Nothing below can disagree - it is one shader, so it reads and writes
+    // exactly the same things in both.
+    return SubstituteQuality::kSameShaderOtherModification;
   }
   if (a.pixel_shader && b.pixel_shader) {
     const Shader& sa = a.pixel_shader->shader();
     const Shader& sb = b.pixel_shader->shader();
     if (!sa.is_ucode_analyzed() || !sb.is_ucode_analyzed()) {
       // Without the analysis their outputs are unknown - don't guess.
-      return false;
+      return SubstituteQuality::kUnusable;
     }
     if (sa.writes_color_targets() != sb.writes_color_targets() ||
         sa.writes_depth() != sb.writes_depth()) {
-      return false;
+      return SubstituteQuality::kUnusable;
     }
     // And it must READ the same things. This is not a quality question - the
     // texture and sampler descriptors written for a draw are the ones the real
@@ -1698,24 +1725,24 @@ bool PipelineCache::AreSubstitutable(const PipelineRuntimeDescription& a,
     const D3D12Shader& db12 = static_cast<const D3D12Shader&>(sb);
     if (da12.GetUsedTextureMaskAfterTranslation() !=
         db12.GetUsedTextureMaskAfterTranslation()) {
-      return false;
+      return SubstituteQuality::kUnusable;
     }
     const auto& ta = da12.GetTextureBindingsAfterTranslation();
     const auto& tb = db12.GetTextureBindingsAfterTranslation();
     if (ta.size() != tb.size() ||
         (!ta.empty() && std::memcmp(ta.data(), tb.data(),
                                     ta.size() * sizeof(ta[0])) != 0)) {
-      return false;
+      return SubstituteQuality::kUnusable;
     }
     const auto& ssa = da12.GetSamplerBindingsAfterTranslation();
     const auto& ssb = db12.GetSamplerBindingsAfterTranslation();
     if (ssa.size() != ssb.size() ||
         (!ssa.empty() && std::memcmp(ssa.data(), ssb.data(),
                                      ssa.size() * sizeof(ssa[0])) != 0)) {
-      return false;
+      return SubstituteQuality::kUnusable;
     }
   }
-  return true;
+  return SubstituteQuality::kOtherShaderSameBindings;
 }
 
 void* PipelineCache::GetReadySubstituteByHandle(void* handle) {
@@ -1743,18 +1770,32 @@ void* PipelineCache::GetReadySubstituteByHandle(void* handle) {
   pipeline->substitute_search_submission = submission;
   auto range = substitute_index_.equal_range(pipeline->substitute_key);
   bool rejected_any = false;
+  Pipeline* best = nullptr;
+  SubstituteQuality best_quality = SubstituteQuality::kUnusable;
   for (auto it = range.first; it != range.second; ++it) {
     Pipeline* candidate = it->second;
     if (candidate == pipeline ||
         !candidate->state.load(std::memory_order_acquire)) {
       continue;
     }
-    if (!AreSubstitutable(candidate->description, pipeline->description)) {
+    SubstituteQuality quality =
+        GetSubstituteQuality(candidate->description, pipeline->description);
+    if (quality == SubstituteQuality::kUnusable) {
       rejected_any = true;
       continue;
     }
-    pipeline->substitute.store(candidate, std::memory_order_release);
-    return candidate;
+    if (quality < best_quality) {
+      best_quality = quality;
+      best = candidate;
+      if (quality == SubstituteQuality::kSameShaderOtherModification) {
+        // Can't do better - it's the same shader.
+        break;
+      }
+    }
+  }
+  if (best) {
+    pipeline->substitute.store(best, std::memory_order_release);
+    return best;
   }
   if (rejected_any) {
     // Worth knowing how often the safety rules turn a stand-in down: every one
