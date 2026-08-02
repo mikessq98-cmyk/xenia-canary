@@ -3430,6 +3430,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       } else
 #endif  // XE_PLATFORM_WINRT
       {
+        // The game is waiting on this pipeline right now - move it to the
+        // front of the creation queue, ahead of everything queued earlier that
+        // nothing is blocked on.
+        pipeline_cache_->PrioritizePipelineForPendingDraw(pipeline_handle);
         // Perfectly normal while pipelines compile in the background, and can
         // happen thousands of times per second - throttle the log heavily.
         static std::atomic<uint32_t> skipped_draw_log_count{0};

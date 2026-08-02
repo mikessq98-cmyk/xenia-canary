@@ -151,6 +151,17 @@ class PipelineCache {
   // been found, because a suitable pipeline is usually only finished AFTER
   // the pending one was first asked for.
   void* GetReadySubstituteByHandle(void* handle);
+#endif  // XE_PLATFORM_WINRT
+
+  // Tells the cache that a draw is being skipped for want of this pipeline, so
+  // it can be moved to the front of the creation queue. Priorities are
+  // assigned once, from what a pipeline writes - which says nothing about
+  // WHEN it is needed, so a pipeline the game is waiting on right now can sit
+  // behind hundreds that were queued earlier and are not needed yet.
+  // Command processor thread only.
+  void PrioritizePipelineForPendingDraw(void* handle);
+
+#if XE_PLATFORM_WINRT
   // How hard to look for stand-ins - see d3d12_substitute_pending_pipelines.
   enum class SubstituteMode {
     kOff,

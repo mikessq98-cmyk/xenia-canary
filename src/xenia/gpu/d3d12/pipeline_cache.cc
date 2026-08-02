@@ -1860,6 +1860,33 @@ bool PipelineCache::TranslateAnalyzedShader(
   return translation.is_valid();
 }
 
+void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
+  Pipeline* pipeline = reinterpret_cast<Pipeline*>(handle);
+  if (pipeline->state.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (pipeline->priority >= kPriorityPendingDraw) {
+    // Already at the front - re-queueing it every skipped draw would fill the
+    // queue with duplicates of the same pipeline.
+    return;
+  }
+  {
+    std::lock_guard<xe_mutex> lock(creation_request_lock_);
+    if (pipeline->state.load(std::memory_order_acquire) ||
+        pipeline->priority >= kPriorityPendingDraw) {
+      return;
+    }
+    pipeline->priority = kPriorityPendingDraw;
+    // std::priority_queue cannot re-sort in place, so the pipeline is pushed
+    // again with its new priority. The duplicate is harmless: whichever copy
+    // is popped first builds it, and the creation path skips a pipeline that
+    // already has a state object.
+    AcquirePipelineTranslationsForCreation(pipeline);
+    creation_queue_.push(pipeline);
+  }
+  creation_request_cond_.notify_one();
+}
+
 void PipelineCache::ReleaseTranslationsForArbiter() {
   // The storage loader translates without going through the creation queue, so
   // its translations can't be tracked - stay out of its way entirely.
@@ -4538,6 +4565,14 @@ void PipelineCache::CreationThread(size_t thread_index) {
       // fully created (rather than just started creating).
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
+      if (pipeline_to_create->state.load(std::memory_order_acquire)) {
+        // Already built. A pipeline can legitimately be in the queue twice:
+        // PrioritizePipelineForPendingDraw re-queues it with a higher priority
+        // because std::priority_queue cannot re-sort in place. Drop the
+        // duplicate, releasing the reference that queueing took.
+        ReleasePipelineTranslationsFromCreation(pipeline_to_create);
+        continue;
+      }
       ++creation_threads_busy_;
     }
 
@@ -4617,6 +4652,11 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       }
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
+      if (pipeline_to_create->state.load(std::memory_order_acquire)) {
+        // Duplicate left by a priority bump - see the creation thread.
+        ReleasePipelineTranslationsFromCreation(pipeline_to_create);
+        continue;
+      }
     }
 
     // Same host-OOM containment as on the creation threads - this runs on the

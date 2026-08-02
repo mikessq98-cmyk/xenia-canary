@@ -29,6 +29,10 @@ constexpr uint8_t kPriorityRT0 = 3;        // Writes to RT0 (main color buffer)
 // also the cheapest pipelines to build (no pixel shader to compile), so
 // putting them first costs the colour pipelines almost nothing.
 constexpr uint8_t kPriorityNoPixelShader = 4;
+// A draw is being skipped right now because this pipeline is missing. What a
+// pipeline writes says nothing about WHEN it is needed, so without this a
+// pipeline the game is waiting on sits behind everything queued before it.
+constexpr uint8_t kPriorityPendingDraw = 5;
 
 // Converts normalized_color_mask to a 4-bit bitmask of bound render targets.
 // normalized_color_mask uses 4 bits per RT (for RGBA components).
