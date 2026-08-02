@@ -1659,6 +1659,35 @@ bool PipelineCache::AreSubstitutable(const PipelineRuntimeDescription& a,
         sa.writes_depth() != sb.writes_depth()) {
       return false;
     }
+    // And it must READ the same things. This is not a quality question - the
+    // texture and sampler descriptors written for a draw are the ones the real
+    // pixel shader asked for, via RequestTextures and the binding update. A
+    // stand-in that samples anything else reads a descriptor that was never
+    // filled in, which on this driver is a GPU page fault at VA 0 and takes
+    // the device down (DXGI_ERROR_DEVICE_HUNG, seen in Black Ops).
+    // It is also what turns objects into flat purple/green/red: a shader that
+    // samples nothing standing in for a textured one shades with whatever its
+    // own constants say.
+    const D3D12Shader& da12 = static_cast<const D3D12Shader&>(sa);
+    const D3D12Shader& db12 = static_cast<const D3D12Shader&>(sb);
+    if (da12.GetUsedTextureMaskAfterTranslation() !=
+        db12.GetUsedTextureMaskAfterTranslation()) {
+      return false;
+    }
+    const auto& ta = da12.GetTextureBindingsAfterTranslation();
+    const auto& tb = db12.GetTextureBindingsAfterTranslation();
+    if (ta.size() != tb.size() ||
+        (!ta.empty() && std::memcmp(ta.data(), tb.data(),
+                                    ta.size() * sizeof(ta[0])) != 0)) {
+      return false;
+    }
+    const auto& ssa = da12.GetSamplerBindingsAfterTranslation();
+    const auto& ssb = db12.GetSamplerBindingsAfterTranslation();
+    if (ssa.size() != ssb.size() ||
+        (!ssa.empty() && std::memcmp(ssa.data(), ssb.data(),
+                                     ssa.size() * sizeof(ssa[0])) != 0)) {
+      return false;
+    }
   }
   return true;
 }
@@ -1687,15 +1716,32 @@ void* PipelineCache::GetReadySubstituteByHandle(void* handle) {
   }
   pipeline->substitute_search_submission = submission;
   auto range = substitute_index_.equal_range(pipeline->substitute_key);
+  bool rejected_any = false;
   for (auto it = range.first; it != range.second; ++it) {
     Pipeline* candidate = it->second;
     if (candidate == pipeline ||
-        !candidate->state.load(std::memory_order_acquire) ||
-        !AreSubstitutable(candidate->description, pipeline->description)) {
+        !candidate->state.load(std::memory_order_acquire)) {
+      continue;
+    }
+    if (!AreSubstitutable(candidate->description, pipeline->description)) {
+      rejected_any = true;
       continue;
     }
     pipeline->substitute.store(candidate, std::memory_order_release);
     return candidate;
+  }
+  if (rejected_any) {
+    // Worth knowing how often the safety rules turn a stand-in down: every one
+    // of these is a draw that gets skipped instead of being drawn wrongly (or
+    // taking the device down). If this dwarfs the substitution count, the
+    // feature is not earning its keep for that title.
+    uint32_t n = substitutes_rejected_.fetch_add(1, std::memory_order_relaxed);
+    if (n == 0 || ((n + 1) % 10000) == 0) {
+      XELOGI(
+          "Pipeline substitution: {} candidates rejected as unsafe (they read "
+          "or write different resources than the draw bound)",
+          n + 1);
+    }
   }
   return nullptr;
 }

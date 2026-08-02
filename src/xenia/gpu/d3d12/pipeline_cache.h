@@ -633,6 +633,8 @@ class PipelineCache {
   // All pipelines by substitute key, ready or not (readiness is checked when
   // picking one). Processor thread only.
   std::unordered_multimap<uint64_t, Pipeline*> substitute_index_;
+  // Candidates turned down by AreSubstitutable - see GetReadySubstituteByHandle.
+  std::atomic<uint32_t> substitutes_rejected_{0};
   // Parsed once at initialization - this is read per skipped draw.
   SubstituteMode substitute_mode_ = SubstituteMode::kOnce;
 #endif  // XE_PLATFORM_WINRT
