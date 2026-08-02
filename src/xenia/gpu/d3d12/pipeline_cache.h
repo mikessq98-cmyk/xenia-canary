@@ -85,6 +85,20 @@ class PipelineCache {
   // failure at all: nothing crashes while compiling, the GPU hangs executing
   // an already-built pipeline. The suspect may be innocent (the hang can lag
   // the guilty draw); the .toxic file is plain text and can be pruned.
+  // Records that the device died while EXECUTING draws rather than while
+  // creating a pipeline. The next launch then runs draws one at a time,
+  // journalling each, so the hang leaves exactly one suspect behind - see
+  // solver_execution_safe_mode().
+  void SolverMarkExecutionHang();
+  // While true, every draw is submitted alone, waited on, and written to the
+  // execution journal first. Costs a slideshow for one launch and finds the
+  // hanging draw with no guesswork; cleared automatically once it has.
+  bool solver_execution_safe_mode() const {
+    return solver_execution_safe_mode_;
+  }
+  // Called just before a draw is submitted in execution safe mode.
+  void SolverExecutionJournalDraw(uint64_t vertex_shader_hash,
+                                  uint64_t pixel_shader_hash);
   void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
                                         uint64_t pixel_shader_hash);
 #endif  // XE_PLATFORM_WINRT
@@ -525,6 +539,22 @@ class PipelineCache {
   std::atomic<bool> solver_oom_seen_{false};
   // Held while a pipeline is created in safe mode (only one at a time).
   std::mutex solver_serialize_mutex_;
+
+  // Execution-side solver. A pipeline that CREATES fine can still hang the GPU
+  // when it runs (Black Ops does, reproducibly, on one object), and the list of
+  // recently bound pipelines can't identify it - the GPU runs behind, so its
+  // newest entry is just the newest. So on the launch after an execution hang,
+  // draws are serialized and journalled, which leaves exactly one suspect.
+  bool solver_execution_safe_mode_ = false;
+  std::filesystem::path solver_execution_journal_path_;
+  // Written when the device is lost outside pipeline creation; its presence at
+  // the next launch is what turns execution safe mode on.
+  std::filesystem::path solver_execution_hang_path_;
+  std::FILE* solver_execution_journal_file_ = nullptr;
+  uint32_t solver_execution_draws_ = 0;
+  // Give up reproducing after this many draws rather than leaving the game a
+  // slideshow forever when the hang doesn't come back.
+  static constexpr uint32_t kSolverExecutionSafeModeMaxDraws = 300000;
 #endif  // XE_PLATFORM_WINRT
 
   // Sum of resident translated shader bytecode sizes (incremented on a

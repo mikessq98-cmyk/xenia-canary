@@ -601,6 +601,15 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
     HRESULT reason = device->GetDeviceRemovedReason();
     XELOGE("Device loss diagnosis: GetDeviceRemovedReason=0x{:08X}",
            uint32_t(reason));
+    if (reason == DXGI_ERROR_DEVICE_HUNG && pipeline_cache_) {
+      // Record that the hang happened while DRAWING, not while creating a
+      // pipeline. Nothing here can say which draw did it - the GPU runs behind
+      // the command processor - so the marker makes the next launch serialize
+      // draws, and that run's journal names the culprit exactly. This is the
+      // automatic path; d3d12_quarantine_exec_hang_suspects below is the old
+      // guess-the-newest one, which can quarantine an innocent shader.
+      pipeline_cache_->SolverMarkExecutionHang();
+    }
     if (reason == DXGI_ERROR_DEVICE_HUNG && pipeline_cache_ &&
         cvars::d3d12_quarantine_exec_hang_suspects) {
       // The GPU hung executing work, so the creation journal has nothing -
@@ -3901,7 +3910,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
 #if XE_PLATFORM_WINRT
-  if (cvars::d3d12_serialize_draws_for_hang_diagnosis) {
+  // Either the user asked for it, or the solver is recovering from a hang the
+  // previous run suffered and is finding out which draw caused it.
+  if (cvars::d3d12_serialize_draws_for_hang_diagnosis ||
+      pipeline_cache_->solver_execution_safe_mode()) {
+    // Written and flushed BEFORE the draw goes to the GPU, so if the device
+    // dies here the file still names this draw.
+    pipeline_cache_->SolverExecutionJournalDraw(
+        vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     // Submit this draw on its own and wait for the GPU to finish it. The list
     // of "last bound pipelines" printed on device loss cannot identify the
     // draw that hung - the GPU runs behind, so the newest entry is merely the
