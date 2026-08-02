@@ -645,6 +645,33 @@ class PipelineCache {
   // index).
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
 
+  // Driver-level pipeline cache. The shader storage above only records WHAT to
+  // build; without this the driver recompiles every pipeline from scratch on
+  // every launch, which is what fills the creation queue with hundreds of
+  // entries while a level streams in (and makes draws whose pipeline isn't
+  // ready yet get skipped). The library holds the driver's compiled result, so
+  // a second launch creates them almost instantly.
+  void InitializePipelineLibrary(const std::filesystem::path& root,
+                                 uint32_t title_id);
+  void SavePipelineLibrary();
+  void ShutdownPipelineLibrary();
+  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> pipeline_library_;
+  // The blob the library was created from MUST stay alive and unmodified for
+  // as long as the library exists - the runtime reads from it lazily.
+  std::vector<uint8_t> pipeline_library_blob_;
+  std::filesystem::path pipeline_library_path_;
+  // ID3D12PipelineLibrary is not free-threaded, and pipelines are created on
+  // the creation threads.
+  std::mutex pipeline_library_mutex_;
+  // Whether anything was stored since the last serialization.
+  bool pipeline_library_dirty_ = false;
+  // Submissions since the library was last written out (see EndSubmission).
+  uint32_t submissions_since_library_save_ = 0;
+  // Pipelines served by the library vs. compiled by the driver this run -
+  // telemetry that shows whether the cache is doing its job.
+  std::atomic<uint32_t> pipeline_library_hits_{0};
+  std::atomic<uint32_t> pipeline_library_misses_{0};
+
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();

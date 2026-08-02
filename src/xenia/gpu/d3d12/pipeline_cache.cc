@@ -75,6 +75,20 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
 
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
+    d3d12_pipeline_library, true,
+    "Keep the driver's COMPILED pipelines in a D3D12 pipeline library on disk, "
+    "next to the shader storage, and reuse them on later launches.\n"
+    "The shader storage alone only records which pipelines a game needs - the "
+    "driver still compiles every one of them from scratch on every launch, "
+    "which on a console fills the creation queue with hundreds of entries "
+    "while a level streams in and leaves draws without a pipeline to use. With "
+    "the library, a second launch of the same game creates them almost "
+    "instantly.\n"
+    "The library is rejected by the runtime after a driver update (its "
+    "contents are driver-specific); that is detected and it is simply rebuilt.",
+    "D3D12");
+
+DEFINE_bool(
     d3d12_async_vs_only_pipelines, true,
     "Xbox UWP: build VS-only pipelines (depth pre-pass, shadow maps, clears) "
     "on background threads, skipping their draws until they are ready.\n"
@@ -694,6 +708,10 @@ void PipelineCache::InitializeShaderStorage(
 }
 
 void PipelineCache::ShutdownShaderStorage() {
+  // Persist the driver's compiled pipelines before anything else - this is
+  // what spares the next launch the whole compilation.
+  ShutdownPipelineLibrary();
+
   // Shut down the storage writer (closes files, stops write thread).
   storage_writer_.ShutdownShaderStorage();
   shader_storage_file_flush_needed_ = false;
@@ -744,6 +762,8 @@ void PipelineCache::SolverInitialize(const std::filesystem::path& cache_root,
     solver_scale_suffix = fmt::format(".{}x{}", cvars::draw_resolution_scale_x,
                                       cvars::draw_resolution_scale_y);
   }
+  InitializePipelineLibrary(root, title_id);
+
   solver_toxic_path_ =
       root / fmt::format("{:08X}.d3d12{}.toxic", title_id, solver_scale_suffix);
   solver_journal_path_ = root / fmt::format("{:08X}.d3d12{}.inflight", title_id,
@@ -980,6 +1000,19 @@ void PipelineCache::SolverRetractThisRunToxic() {
 #endif  // XE_PLATFORM_WINRT
 
 void PipelineCache::EndSubmission() {
+  // Periodically persist the pipeline library. A console application is often
+  // terminated by the system rather than shut down cleanly, and everything
+  // compiled since the last save would be lost - which would put the next
+  // launch right back to compiling hundreds of pipelines. Serialization is not
+  // cheap, so this is rare and only happens when something new was stored.
+  if (pipeline_library_dirty_) {
+    static constexpr uint32_t kSubmissionsPerLibrarySave = 600;
+    if (++submissions_since_library_save_ >= kSubmissionsPerLibrarySave) {
+      submissions_since_library_save_ = 0;
+      SavePipelineLibrary();
+    }
+  }
+
   if (shader_storage_file_flush_needed_ ||
       pipeline_storage_file_flush_needed_) {
     storage_writer_.RequestFlush(shader_storage_file_flush_needed_,
@@ -1425,6 +1458,143 @@ bool PipelineCache::ConfigurePipeline(
   *pipeline_handle_out = new_pipeline;
   *root_signature_out = runtime_description.root_signature;
   return true;
+}
+
+void PipelineCache::InitializePipelineLibrary(
+    const std::filesystem::path& root, uint32_t title_id) {
+  ShutdownPipelineLibrary();
+  if (!cvars::d3d12_pipeline_library) {
+    return;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  Microsoft::WRL::ComPtr<ID3D12Device1> device1;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
+    XELOGW(
+        "Pipeline library: ID3D12Device1 unavailable - compiled pipelines "
+        "will not be cached between launches");
+    return;
+  }
+
+  // Driver-compiled contents are specific to the shader translation, so the
+  // resolution scale (which changes it) gets its own library, exactly like the
+  // toxic-shader solver's state.
+  std::string scale_suffix;
+  if (cvars::draw_resolution_scale_x > 1 || cvars::draw_resolution_scale_y > 1) {
+    scale_suffix = fmt::format(".{}x{}", cvars::draw_resolution_scale_x,
+                               cvars::draw_resolution_scale_y);
+  }
+  pipeline_library_path_ =
+      root / fmt::format("{:08X}.d3d12{}.pso_library", title_id, scale_suffix);
+
+  // The blob must outlive the library - the runtime reads from it lazily, so
+  // it is kept in pipeline_library_blob_ untouched until shutdown.
+  {
+    std::ifstream library_file(pipeline_library_path_,
+                               std::ios::binary | std::ios::ate);
+    if (library_file) {
+      std::streamsize size = library_file.tellg();
+      if (size > 0) {
+        pipeline_library_blob_.resize(size_t(size));
+        library_file.seekg(0);
+        if (!library_file.read(
+                reinterpret_cast<char*>(pipeline_library_blob_.data()), size)) {
+          pipeline_library_blob_.clear();
+        }
+      }
+    }
+  }
+
+  HRESULT hr = device1->CreatePipelineLibrary(
+      pipeline_library_blob_.data(), pipeline_library_blob_.size(),
+      IID_PPV_ARGS(&pipeline_library_));
+  if (FAILED(hr)) {
+    // E_INVALIDARG / D3D12_ERROR_DRIVER_VERSION_MISMATCH / ADAPTER_NOT_FOUND
+    // all mean the same thing in practice: this blob was written by a
+    // different driver or adapter and cannot be used. Start over rather than
+    // giving up on caching.
+    if (!pipeline_library_blob_.empty()) {
+      XELOGI(
+          "Pipeline library: the stored library is not usable by this driver "
+          "(0x{:08X}) - rebuilding it",
+          uint32_t(hr));
+      pipeline_library_blob_.clear();
+      hr = device1->CreatePipelineLibrary(nullptr, 0,
+                                          IID_PPV_ARGS(&pipeline_library_));
+    }
+    if (FAILED(hr)) {
+      XELOGW(
+          "Pipeline library: unavailable (0x{:08X}) - the driver will compile "
+          "every pipeline on every launch",
+          uint32_t(hr));
+      pipeline_library_.Reset();
+      pipeline_library_blob_.clear();
+      return;
+    }
+  }
+  XELOGI("Pipeline library: {} ({} KB restored from {})",
+         pipeline_library_blob_.empty() ? "started empty" : "loaded",
+         pipeline_library_blob_.size() >> 10,
+         xe::path_to_utf8(pipeline_library_path_));
+}
+
+void PipelineCache::SavePipelineLibrary() {
+  std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+  if (!pipeline_library_ || !pipeline_library_dirty_ ||
+      pipeline_library_path_.empty()) {
+    return;
+  }
+  pipeline_library_dirty_ = false;
+  size_t serialized_size = pipeline_library_->GetSerializedSize();
+  if (!serialized_size) {
+    return;
+  }
+  std::vector<uint8_t> serialized(serialized_size);
+  if (FAILED(pipeline_library_->Serialize(serialized.data(),
+                                          serialized_size))) {
+    XELOGW("Pipeline library: serialization failed - not saving");
+    return;
+  }
+  // Written through a temporary and moved into place: a partially written
+  // library would be rejected on the next launch, throwing away everything.
+  std::filesystem::path temp_path = pipeline_library_path_;
+  temp_path += ".tmp";
+  {
+    std::ofstream library_file(temp_path, std::ios::binary | std::ios::trunc);
+    if (!library_file ||
+        !library_file.write(reinterpret_cast<const char*>(serialized.data()),
+                            std::streamsize(serialized_size))) {
+      XELOGW("Pipeline library: could not write {}",
+             xe::path_to_utf8(temp_path));
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp_path, pipeline_library_path_, ec);
+  if (ec) {
+    std::filesystem::remove(pipeline_library_path_, ec);
+    std::filesystem::rename(temp_path, pipeline_library_path_, ec);
+  }
+  XELOGI(
+      "Pipeline library: saved {} KB ({} pipeline(s) served from it this run, "
+      "{} compiled by the driver)",
+      serialized_size >> 10,
+      pipeline_library_hits_.load(std::memory_order_relaxed),
+      pipeline_library_misses_.load(std::memory_order_relaxed));
+}
+
+void PipelineCache::ShutdownPipelineLibrary() {
+  SavePipelineLibrary();
+  {
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    pipeline_library_.Reset();
+    // Only safe to release once the library is gone.
+    pipeline_library_blob_.clear();
+    pipeline_library_blob_.shrink_to_fit();
+    pipeline_library_path_.clear();
+    pipeline_library_dirty_ = false;
+  }
+  pipeline_library_hits_.store(0, std::memory_order_relaxed);
+  pipeline_library_misses_.store(0, std::memory_order_relaxed);
 }
 
 #if XE_PLATFORM_WINRT
@@ -4054,6 +4224,20 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     SolverJournalBegin(vs_hash, ps_hash);
     solver_probe.active = true;
   }
+  // Ask the pipeline library first - a hit skips the driver's compiler
+  // entirely, which is the whole point of keeping it.
+  std::wstring library_name;
+  if (pipeline_library_) {
+    library_name =
+        fmt::format(L"{:016X}", XXH3_64bits(&description, sizeof(description)));
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    if (SUCCEEDED(pipeline_library_->LoadGraphicsPipeline(
+            library_name.c_str(), &state_desc, IID_PPV_ARGS(&state)))) {
+      pipeline_library_hits_.fetch_add(1, std::memory_order_relaxed);
+      return state;
+    }
+  }
+
   DWORD creation_exception_code = 0;
   HRESULT hr = CreateGraphicsPipelineStateGuarded(
       device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
@@ -4290,6 +4474,27 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.vertex_shader->shader().ucode_data_hash());
   }
   state->SetName(name.c_str());
+
+  // Hand the freshly compiled pipeline to the library so the next launch does
+  // not have to compile it again.
+  if (pipeline_library_ && !library_name.empty()) {
+    pipeline_library_misses_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
+    HRESULT store_hr =
+        pipeline_library_->StorePipeline(library_name.c_str(), state);
+    if (SUCCEEDED(store_hr)) {
+      pipeline_library_dirty_ = true;
+    } else if (store_hr != E_INVALIDARG) {
+      // E_INVALIDARG just means this name is already stored (a pipeline whose
+      // description hash collides with an existing entry, or a re-creation
+      // after a cache clear) - not worth reporting.
+      static std::atomic<bool> store_failure_logged{false};
+      if (!store_failure_logged.exchange(true)) {
+        XELOGW("Pipeline library: StorePipeline failed (0x{:08X})",
+               uint32_t(store_hr));
+      }
+    }
+  }
   return state;
 }
 
