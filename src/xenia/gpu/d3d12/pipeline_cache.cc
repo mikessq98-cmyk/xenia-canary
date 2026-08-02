@@ -1448,6 +1448,27 @@ void PipelineCache::InitializePipelineLibrary(
     return;
   }
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  // Ask whether the driver supports pipeline libraries AT ALL before touching
+  // one. Calling CreatePipelineLibrary on a driver that does not took the
+  // console's device down with DXGI_ERROR_DRIVER_INTERNAL_ERROR before a
+  // single draw - every later call, including the library creation itself,
+  // then returned DXGI_ERROR_DEVICE_REMOVED. A capability query cannot do
+  // that.
+  D3D12_FEATURE_DATA_SHADER_CACHE shader_cache_support = {};
+  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE,
+                                         &shader_cache_support,
+                                         sizeof(shader_cache_support))) ||
+      !(shader_cache_support.SupportFlags &
+        D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
+    XELOGI(
+        "Pipeline library: not supported by this driver (shader cache "
+        "support 0x{:X}) - compiled pipelines will not be cached between "
+        "launches",
+        uint32_t(shader_cache_support.SupportFlags));
+    return;
+  }
+
   Microsoft::WRL::ComPtr<ID3D12Device1> device1;
   if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
     XELOGW(

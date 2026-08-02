@@ -572,7 +572,9 @@ void D3D12CommandProcessor::OnHostGpuLossFromAnyThread() {
         top_vertex_shader_count = pair.second;
       }
     }
-    if (top_vertex_shader_count * 3 >= count) {
+    // Needs an actual majority of an actual ring - with nothing bound yet
+    // (a device lost before the first draw) there is no suspect to name.
+    if (top_vertex_shader_count && top_vertex_shader_count * 3 >= count) {
       XELOGE(
           "Device loss diagnosis: vertex shader {:016X} accounts for {} of "
           "the last {} bound pipelines - if the same one leads after another "
