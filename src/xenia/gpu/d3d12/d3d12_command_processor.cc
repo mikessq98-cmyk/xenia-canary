@@ -51,6 +51,20 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "possible to submit immediately to try to reduce frame latency.",
             "D3D12");
 
+DEFINE_bool(
+    shared_vertex_shader_interpolators, true,
+    "Translate a vertex shader with every interpolator it writes, instead of "
+    "only those the pixel shader it is paired with reads.\n"
+    "The intersection makes the vertex shader's translation depend on which "
+    "pixel shader it is used with, so the same vertex shader is translated "
+    "again for every one of them - up to thirty times for a single shader in "
+    "some titles. Writing the full set costs a few interpolators that the "
+    "pixel shader ignores, which is free on any modern GPU (reading a subset "
+    "of what the previous stage wrote is explicitly allowed in Direct3D 12), "
+    "and saves the translation time, the bytecode memory and the cache "
+    "entries for all the duplicates.",
+    "GPU");
+
 DECLARE_bool(clear_memory_page_state);
 #if XE_PLATFORM_WINRT
 
@@ -3301,12 +3315,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
-  uint32_t interpolator_mask =
-      pixel_shader ? (vertex_shader->writes_interpolators() &
-                      pixel_shader->GetInterpolatorInputMask(
-                          regs.Get<reg::SQ_PROGRAM_CNTL>(),
-                          regs.Get<reg::SQ_CONTEXT_MISC>(), ps_param_gen_pos))
-                   : 0;
+  uint32_t interpolator_mask = 0;
+  if (pixel_shader) {
+    uint32_t ps_interpolator_mask = pixel_shader->GetInterpolatorInputMask(
+        regs.Get<reg::SQ_PROGRAM_CNTL>(), regs.Get<reg::SQ_CONTEXT_MISC>(),
+        ps_param_gen_pos);
+    if (cvars::shared_vertex_shader_interpolators) {
+      // Everything the vertex shader writes, rather than only what THIS pixel
+      // shader reads. The intersection makes the mask - and therefore the
+      // vertex shader's modification, and therefore its translation - depend
+      // on which pixel shader it happens to be paired with, so one vertex
+      // shader gets translated again for every pixel shader it is used with
+      // (up to 30 of them in Black Ops, per the pipeline telemetry). Writing
+      // the full set costs a few unread interpolators between the stages,
+      // which is nothing on this hardware; reading a subset of what the
+      // previous stage wrote is explicitly allowed in Direct3D 12.
+      interpolator_mask = vertex_shader->writes_interpolators();
+    } else {
+      interpolator_mask =
+          vertex_shader->writes_interpolators() & ps_interpolator_mask;
+    }
+  }
   DxbcShaderTranslator::Modification vertex_shader_modification =
       pipeline_cache_->GetCurrentVertexShaderModification(
           *vertex_shader, primitive_processing_result.host_vertex_shader_type,
