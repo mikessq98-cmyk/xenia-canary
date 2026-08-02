@@ -99,6 +99,16 @@ class PipelineCache {
   // Called just before a draw is submitted in execution safe mode.
   void SolverExecutionJournalDraw(uint64_t vertex_shader_hash,
                                   uint64_t pixel_shader_hash);
+  // Whether this pair has never been seen to survive execution. The FIRST draw
+  // using it is submitted alone and waited on, so if it hangs the GPU the
+  // journal holds it alone and the next launch quarantines it. Pairs that
+  // survive are remembered on disk and never checked again - so the cost is
+  // one synchronization per distinct pair per game, not per draw.
+  bool SolverNeedsExecutionVerification(uint64_t vertex_shader_hash,
+                                        uint64_t pixel_shader_hash);
+  // The pair drew without hanging the GPU. Remembered across launches.
+  void SolverMarkExecutionVerified(uint64_t vertex_shader_hash,
+                                   uint64_t pixel_shader_hash);
   void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
                                         uint64_t pixel_shader_hash);
 #endif  // XE_PLATFORM_WINRT
@@ -552,6 +562,12 @@ class PipelineCache {
   std::filesystem::path solver_execution_hang_path_;
   std::FILE* solver_execution_journal_file_ = nullptr;
   uint32_t solver_execution_draws_ = 0;
+  // Pairs already observed to execute without hanging the GPU, kept across
+  // launches so a game is only ever checked once per pair. Command processor
+  // thread only.
+  std::set<std::pair<uint64_t, uint64_t>> solver_verified_;
+  std::filesystem::path solver_verified_path_;
+  std::FILE* solver_verified_file_ = nullptr;
   // Give up reproducing after this many draws rather than leaving the game a
   // slideshow forever when the hang doesn't come back.
   static constexpr uint32_t kSolverExecutionSafeModeMaxDraws = 300000;

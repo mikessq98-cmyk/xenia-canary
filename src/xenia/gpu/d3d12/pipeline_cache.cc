@@ -75,6 +75,23 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
 
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
+    d3d12_verify_new_draws, true,
+    "Xbox UWP: the first time a given vertex/pixel shader pair is drawn, "
+    "submit that draw on its own and wait for the GPU to finish it.\n"
+    "Some pipelines create perfectly and hang the GPU when they RUN, taking "
+    "the whole device (and sometimes the console) down. Nothing can predict "
+    "that without running the shader - but a draw that runs ALONE, journalled "
+    "before it is submitted, identifies itself when it hangs, so the next "
+    "launch quarantines that one pair and the game works. Without this, the "
+    "hang happens with dozens of draws in flight and there is nothing to "
+    "blame it on.\n"
+    "The cost is one GPU synchronization per DISTINCT pair, not per draw - a "
+    "few hundred over a session, and none at all on later launches, since "
+    "pairs proven safe are remembered in a .verified file next to the shader "
+    "cache. Delete that file to re-check a game.",
+    "D3D12");
+
+DEFINE_bool(
     d3d12_serialize_draws_for_hang_diagnosis, false,
     "Xbox UWP: submit every draw on its own and wait for the GPU to finish it, "
     "logging each one before the wait.\n"
@@ -809,6 +826,8 @@ void PipelineCache::SolverInitialize(const std::filesystem::path& cache_root,
   solver_execution_hang_path_ = root / fmt::format("{:08X}.d3d12{}.exec-hang",
                                                    title_id,
                                                    solver_scale_suffix);
+  solver_verified_path_ = root / fmt::format("{:08X}.d3d12{}.verified", title_id,
+                                             solver_scale_suffix);
 
   // Load the persistent per-game skip list (confirmed-toxic pairs).
   {
@@ -906,23 +925,49 @@ void PipelineCache::SolverInitialize(const std::filesystem::path& cache_root,
       std::filesystem::remove(solver_execution_journal_path_, ec);
       std::filesystem::remove(solver_execution_hang_path_, ec);
     } else if (std::filesystem::exists(solver_execution_hang_path_, ec)) {
-      // The GPU hung last run but nothing was journalled, because that run
-      // wasn't serializing yet. This one will be, which makes the next hang
-      // name its own culprit.
+      // The GPU hung last run but nothing was journalled. Serialize EVERY draw
+      // this run, not just unverified pairs - the culprit is evidently
+      // something already on the verified list, or something that only hangs
+      // in a particular state.
       solver_execution_safe_mode_ = true;
       XELOGW(
-          "Toxic-shader solver: the GPU hung last run while drawing - "
-          "serializing draws this run to catch the culprit. Expect it to be "
-          "very slow until it does.");
-      solver_execution_journal_file_ =
-          xe::filesystem::OpenFile(solver_execution_journal_path_, "wb+");
-      if (!solver_execution_journal_file_) {
-        XELOGW(
-            "Toxic-shader solver: couldn't open the execution journal {}; "
-            "execution hang detection disabled this run",
-            xe::path_to_utf8(solver_execution_journal_path_));
-        solver_execution_safe_mode_ = false;
+          "Toxic-shader solver: the GPU hung last run while drawing and the "
+          "journal was empty - serializing every draw this run to catch it. "
+          "Expect it to be very slow until it does.");
+    }
+  }
+
+  // Load the pairs already proven to execute without hanging, and keep the
+  // file open to append to it. Verification is what makes a hang survivable
+  // on the FIRST run: an unproven pair is drawn on its own and waited on, so
+  // if it takes the GPU down it is alone in the journal and the next launch
+  // knows exactly what to quarantine. Proven pairs cost nothing ever again.
+  if (cvars::d3d12_verify_new_draws || solver_execution_safe_mode_) {
+    if (cvars::d3d12_verify_new_draws) {
+      std::ifstream verified_file(solver_verified_path_);
+      std::string line;
+      while (std::getline(verified_file, line)) {
+        uint64_t vs = 0, ps = 0;
+        if (ParseSolverLine(line, vs, ps)) {
+          solver_verified_.emplace(vs, ps);
+        }
       }
+      solver_verified_file_ =
+          xe::filesystem::OpenFile(solver_verified_path_, "ab");
+    }
+    solver_execution_journal_file_ =
+        xe::filesystem::OpenFile(solver_execution_journal_path_, "wb+");
+    if (!solver_execution_journal_file_) {
+      XELOGW(
+          "Toxic-shader solver: couldn't open the execution journal {}; draws "
+          "will not be checked this run",
+          xe::path_to_utf8(solver_execution_journal_path_));
+      solver_execution_safe_mode_ = false;
+    } else if (cvars::d3d12_verify_new_draws) {
+      XELOGI(
+          "Toxic-shader solver: {} shader pair(s) already proven safe to "
+          "execute; new ones will be checked one at a time",
+          solver_verified_.size());
     }
   }
 
@@ -980,12 +1025,42 @@ void PipelineCache::SolverMarkExecutionHang() {
       "launch will serialize draws to find which one did it");
 }
 
+bool PipelineCache::SolverNeedsExecutionVerification(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+  if (!solver_enabled_ || !cvars::d3d12_verify_new_draws ||
+      !solver_execution_journal_file_) {
+    return false;
+  }
+  return solver_verified_.find({vertex_shader_hash, pixel_shader_hash}) ==
+         solver_verified_.end();
+}
+
+void PipelineCache::SolverMarkExecutionVerified(uint64_t vertex_shader_hash,
+                                                uint64_t pixel_shader_hash) {
+  if (!solver_verified_
+           .emplace(vertex_shader_hash, pixel_shader_hash)
+           .second) {
+    return;
+  }
+  if (!solver_verified_file_) {
+    return;
+  }
+  // Appended as it is learned, not written at shutdown: a run that ends in a
+  // hang must still keep everything it proved safe beforehand, otherwise the
+  // next launch re-checks the whole game.
+  std::string line =
+      fmt::format("{:016X} {:016X}\n", vertex_shader_hash, pixel_shader_hash);
+  std::fwrite(line.data(), 1, line.size(), solver_verified_file_);
+  std::fflush(solver_verified_file_);
+}
+
 void PipelineCache::SolverExecutionJournalDraw(uint64_t vertex_shader_hash,
                                                uint64_t pixel_shader_hash) {
   if (!solver_execution_journal_file_) {
     return;
   }
-  if (++solver_execution_draws_ > kSolverExecutionSafeModeMaxDraws) {
+  if (solver_execution_safe_mode_ &&
+      ++solver_execution_draws_ > kSolverExecutionSafeModeMaxDraws) {
     // The hang isn't coming back. Stop punishing the session for it - and
     // clear the marker, so the next launch is normal too.
     XELOGW(
@@ -1052,6 +1127,11 @@ void PipelineCache::SolverShutdown(bool clean_exit) {
     std::fclose(solver_execution_journal_file_);
     solver_execution_journal_file_ = nullptr;
   }
+  if (solver_verified_file_) {
+    std::fclose(solver_verified_file_);
+    solver_verified_file_ = nullptr;
+  }
+  solver_verified_.clear();
   if (clean_exit) {
     // No crash occurred - drop the in-progress marker and the journal so this
     // normal shutdown isn't treated as a crash next launch.

@@ -139,6 +139,7 @@ DEFINE_int32(
 DECLARE_bool(readback_resolve_half_pixel_offset);
 #if XE_PLATFORM_WINRT
 DECLARE_bool(d3d12_serialize_draws_for_hang_diagnosis);
+DECLARE_bool(d3d12_verify_new_draws);
 #endif  // XE_PLATFORM_WINRT
 
 namespace xe {
@@ -3910,36 +3911,47 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
 #if XE_PLATFORM_WINRT
-  // Either the user asked for it, or the solver is recovering from a hang the
-  // previous run suffered and is finding out which draw caused it.
-  if (cvars::d3d12_serialize_draws_for_hang_diagnosis ||
+  uint64_t draw_vs_hash = vertex_shader ? vertex_shader->ucode_data_hash() : 0;
+  uint64_t draw_ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+  // Three reasons to run this draw on its own and wait for it: the user asked
+  // to diagnose a hang, the solver is recovering from one, or this pair has
+  // never been proven to survive execution. The last is the common one and
+  // costs a synchronization per DISTINCT pair - once per game, not per draw.
+  bool verifying_new_pair =
+      pipeline_cache_->SolverNeedsExecutionVerification(draw_vs_hash,
+                                                        draw_ps_hash);
+  if (cvars::d3d12_serialize_draws_for_hang_diagnosis || verifying_new_pair ||
       pipeline_cache_->solver_execution_safe_mode()) {
     // Written and flushed BEFORE the draw goes to the GPU, so if the device
     // dies here the file still names this draw.
-    pipeline_cache_->SolverExecutionJournalDraw(
-        vertex_shader ? vertex_shader->ucode_data_hash() : 0,
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    pipeline_cache_->SolverExecutionJournalDraw(draw_vs_hash, draw_ps_hash);
     // Submit this draw on its own and wait for the GPU to finish it. The list
     // of "last bound pipelines" printed on device loss cannot identify the
     // draw that hung - the GPU runs behind, so the newest entry is merely the
-    // newest, not the guilty one. Here the log line is written and flushed
-    // BEFORE the wait, so whichever draw never reports "survived" is exactly
-    // the one that killed the device. Turns the game into a slideshow; it is
-    // for reproducing a hang, not for playing.
-    static std::atomic<uint64_t> serialized_draw_index{0};
-    uint64_t draw_index =
-        serialized_draw_index.fetch_add(1, std::memory_order_relaxed);
-    XELOGW("HANGDIAG: submitting draw #{} VS {:016X} PS {:016X}", draw_index,
-           vertex_shader ? vertex_shader->ucode_data_hash() : 0,
-           pixel_shader ? pixel_shader->ucode_data_hash() : 0);
-    xe::FlushLog();
+    // newest, not the guilty one. The journal entry above is on disk before
+    // the wait starts, so a draw that never returns has already named itself.
+    if (!verifying_new_pair) {
+      // Diagnosis modes are loud on purpose - they are read by a human.
+      XELOGW("HANGDIAG: submitting draw VS {:016X} PS {:016X}", draw_vs_hash,
+             draw_ps_hash);
+      xe::FlushLog();
+    }
     EndSubmission(false);
     if (!AwaitAllQueueOperationsCompletion()) {
-      XELOGE("HANGDIAG: draw #{} DID NOT COMPLETE - this is the one", draw_index);
+      XELOGE(
+          "GPU did not complete a draw with VS {:016X}, PS {:016X} - it is "
+          "recorded, and the next launch will skip it",
+          draw_vs_hash, draw_ps_hash);
       xe::FlushLog();
       return false;
     }
-    XELOGW("HANGDIAG: draw #{} survived", draw_index);
+    if (verifying_new_pair) {
+      // Survived. Remembered on disk, so this pair is never checked again -
+      // here or on any later launch.
+      pipeline_cache_->SolverMarkExecutionVerified(draw_vs_hash, draw_ps_hash);
+    } else {
+      XELOGW("HANGDIAG: draw VS {:016X} survived", draw_vs_hash);
+    }
   }
 #endif  // XE_PLATFORM_WINRT
 
