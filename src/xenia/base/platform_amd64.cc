@@ -8,6 +8,7 @@
  */
 
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #define XBYAK_NO_OP_NAMES
 #include "third_party/xbyak/xbyak/xbyak.h"
@@ -45,8 +46,13 @@ XE_COLD
 XE_NOINLINE
 void InitFeatureFlags() {
   uint64_t feature_flags_ = 0U;
+  uint32_t cpu_family = 0, cpu_model = 0;
+  bool is_amd = false;
   {
     Xbyak::util::Cpu cpu_;
+    cpu_family = cpu_.displayFamily;
+    cpu_model = cpu_.displayModel;
+    is_amd = cpu_.has(Xbyak::util::Cpu::tAMD);
 #define TEST_EMIT_FEATURE(emit, ext)                \
   if ((cvars::x64_extension_mask & emit) == emit) { \
     feature_flags_ |= (cpu_.has(ext) ? emit : 0);   \
@@ -132,6 +138,29 @@ void InitFeatureFlags() {
   }
   g_feature_flags = feature_flags_;
   g_did_initialize_feature_flags = true;
+
+  // What the JIT is actually allowed to emit on this machine. Worth stating
+  // once: the guest is recompiled against these, so a feature silently missing
+  // (or a mask left set in the config) changes every translated function, and
+  // there was no way to tell from a log which path a console build took.
+  XELOGI(
+      "CPU: family {:X} model {:X}{} | AVX2 {} FMA {} BMI1 {} BMI2 {} LZCNT {} "
+      "MOVBE {} PREFETCHW {} AVX512F {} | fast: jrcx {} loop {} repmovs {} "
+      "movdir64b {} | mask 0x{:X}",
+      cpu_family, cpu_model, is_amd ? " (AMD)" : "",
+      (feature_flags_ & kX64EmitAVX2) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitFMA) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitBMI1) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitBMI2) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitLZCNT) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitMovbe) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitPrefetchW) ? "yes" : "NO",
+      (feature_flags_ & kX64EmitAVX512F) ? "yes" : "NO",
+      (feature_flags_ & kX64FastJrcx) ? "yes" : "no",
+      (feature_flags_ & kX64FastLoop) ? "yes" : "no",
+      (feature_flags_ & kX64FastRepMovs) ? "yes" : "no",
+      (feature_flags_ & kX64EmitMovdir64M) ? "yes" : "no",
+      uint64_t(feature_flags_));
 }
 }  // namespace amd64
 }  // namespace xe
