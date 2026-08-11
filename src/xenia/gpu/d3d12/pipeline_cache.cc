@@ -402,7 +402,7 @@ void PipelineCache::Shutdown() {
 #if XE_PLATFORM_WINRT
   // Clean teardown (threads already joined above, so no creation is in flight):
   // discard the crash journal so a normal exit isn't mistaken for a crash.
-  SolverShutdown(/*clean_exit=*/true);
+  solver_.Shutdown(/*clean_exit=*/true);
 #endif  // XE_PLATFORM_WINRT
 
   // Destroy all pipelines.
@@ -499,7 +499,11 @@ void PipelineCache::InitializeShaderStorage(
   // previous run BEFORE any pipeline is created below, so learned-toxic pairs
   // are skipped during prewarming and safe mode (if needed) is armed.
   if (cvars::d3d12_toxic_shader_solver) {
-    SolverInitialize(cache_root, title_id);
+    std::filesystem::path solver_root = GetShaderStorageRoot(cache_root);
+    std::error_code solver_ec;
+    std::filesystem::create_directories(solver_root, solver_ec);
+    InitializePipelineLibrary(solver_root, title_id);
+    solver_.Initialize(solver_root, title_id);
   }
 #endif  // XE_PLATFORM_WINRT
 
@@ -790,518 +794,6 @@ void PipelineCache::ShutdownShaderStorage() {
   pipeline_storage_file_flush_needed_ = false;
   shader_storage_title_id_ = 0;
 }
-
-#if XE_PLATFORM_WINRT
-namespace {
-// Parses one "<vs_hex> <ps_hex>" line of a solver file. Blank/`#` lines fail.
-bool ParseSolverLine(const std::string& line, uint64_t& vs, uint64_t& ps) {
-  if (line.empty() || line[0] == '#') {
-    return false;
-  }
-  std::istringstream stream(line);
-  stream >> std::hex >> vs >> ps;
-  return !stream.fail();
-}
-}  // namespace
-
-void PipelineCache::SolverInitialize(const std::filesystem::path& cache_root,
-                                     uint32_t title_id) {
-  // Re-entrant safe: close any journal handle left open by a prior game.
-  {
-    std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-    if (solver_journal_file_) {
-      std::fclose(solver_journal_file_);
-      solver_journal_file_ = nullptr;
-    }
-    solver_inflight_.clear();
-  }
-  solver_enabled_ = false;
-  solver_journaling_ = false;
-  solver_safe_mode_ = false;
-  solver_device_lost_.store(false, std::memory_order_release);
-  solver_oom_seen_.store(false, std::memory_order_release);
-  solver_toxic_shaders_.clear();
-
-  std::filesystem::path root = GetShaderStorageRoot(cache_root);
-  std::error_code ec;
-  std::filesystem::create_directories(root, ec);
-  // The solver state is per resolution scale: shaders are TRANSLATED
-  // differently when scaling is active, so a pair whose translation crashes
-  // the driver's compiler at 2x2 is usually perfectly fine at 1x1 (and vice
-  // versa) - quarantines must not leak between scales.
-  std::string solver_scale_suffix;
-  if (cvars::draw_resolution_scale_x > 1 || cvars::draw_resolution_scale_y > 1) {
-    solver_scale_suffix = fmt::format(".{}x{}", cvars::draw_resolution_scale_x,
-                                      cvars::draw_resolution_scale_y);
-  }
-  InitializePipelineLibrary(root, title_id);
-
-  solver_toxic_path_ =
-      root / fmt::format("{:08X}.d3d12{}.toxic", title_id, solver_scale_suffix);
-  solver_journal_path_ = root / fmt::format("{:08X}.d3d12{}.inflight", title_id,
-                                            solver_scale_suffix);
-  solver_running_path_ = root / fmt::format("{:08X}.d3d12{}.running", title_id,
-                                            solver_scale_suffix);
-  solver_execution_journal_path_ = root / fmt::format(
-      "{:08X}.d3d12{}.exec-inflight", title_id, solver_scale_suffix);
-  solver_execution_hang_path_ = root / fmt::format("{:08X}.d3d12{}.exec-hang",
-                                                   title_id,
-                                                   solver_scale_suffix);
-  solver_verified_path_ = root / fmt::format("{:08X}.d3d12{}.verified", title_id,
-                                             solver_scale_suffix);
-
-  // Load the persistent per-game skip list (confirmed-toxic pairs).
-  {
-    std::ifstream toxic_file(solver_toxic_path_);
-    std::string line;
-    while (std::getline(toxic_file, line)) {
-      uint64_t vs = 0, ps = 0;
-      if (ParseSolverLine(line, vs, ps)) {
-        solver_toxic_shaders_.emplace(vs, ps);
-      }
-    }
-  }
-
-  // A leftover ".running" marker means the previous run did NOT exit cleanly -
-  // i.e. it crashed. We only pay for the per-creation crash journal while
-  // recovering from such a crash; a normal run does no journaling at all (no
-  // per-pipeline file I/O under a lock, so no contention on the creation
-  // threads), only the cheap in-memory toxic lookup.
-  const bool crashed_last_run = std::filesystem::exists(solver_running_path_, ec);
-  solver_journaling_ = crashed_last_run;
-
-  // Read any journal left behind by that crash (only meaningful if we crashed).
-  std::vector<std::pair<uint64_t, uint64_t>> suspects;
-  if (crashed_last_run) {
-    std::ifstream journal_file(solver_journal_path_);
-    std::string line;
-    while (std::getline(journal_file, line)) {
-      uint64_t vs = 0, ps = 0;
-      if (ParseSolverLine(line, vs, ps)) {
-        suspects.emplace_back(vs, ps);
-      }
-    }
-  }
-
-  // Promote ALL leftover suspects to the skip list. With creation serialized
-  // in recovery runs there is exactly one; even in a fully parallel run there
-  // can only be as many as there are creation threads (2 on the Xbox build).
-  // Quarantining a possibly-innocent shader (invisible geometry for one
-  // material) is a far better deal than another crash-restart cycle per
-  // culprit - games with several toxic shaders were taking many restarts to
-  // converge one-at-a-time. The .toxic file is plain text and can be edited to
-  // un-quarantine a pair.
-  if (!suspects.empty()) {
-    XELOGW(
-        "Toxic-shader solver: {} pipeline(s) were mid-creation when the "
-        "device/process died last run - quarantining all of them in {}:",
-        suspects.size(), xe::path_to_utf8(solver_toxic_path_));
-    for (const std::pair<uint64_t, uint64_t>& s : suspects) {
-      if (solver_toxic_shaders_.emplace(s.first, s.second).second) {
-        SolverAppendToxic(s.first, s.second);
-      }
-      XELOGW("  quarantined VS {:016X}, PS {:016X}", s.first, s.second);
-    }
-  } else if (crashed_last_run) {
-    // Crashed, but that run wasn't journaling yet (the first crash) - nothing
-    // was recorded; this run will journal every creation.
-    XELOGW(
-        "Toxic-shader solver: previous run crashed with no journal - "
-        "journaling and serializing pipeline creation this run to catch the "
-        "culprit.");
-  }
-  // Any recovery run runs fully serialized, not just the ambiguous case: a
-  // game can have SEVERAL toxic shaders, and serialization guarantees the next
-  // death leaves exactly one suspect (no innocent bystanders), converging one
-  // culprit per crash instead of needing extra runs to disambiguate.
-  solver_safe_mode_ = solver_journaling_;
-
-  // The same treatment for pipelines that create fine and hang the GPU when
-  // they RUN. Whatever the last run left in the execution journal was
-  // in flight when the device died, and in a serialized run that is exactly
-  // one draw.
-  {
-    std::vector<std::pair<uint64_t, uint64_t>> execution_suspects;
-    std::ifstream execution_journal(solver_execution_journal_path_);
-    std::string line;
-    while (std::getline(execution_journal, line)) {
-      uint64_t vs = 0, ps = 0;
-      if (ParseSolverLine(line, vs, ps)) {
-        execution_suspects.emplace_back(vs, ps);
-      }
-    }
-    if (!execution_suspects.empty()) {
-      XELOGW(
-          "Toxic-shader solver: {} draw(s) were in flight when the GPU hung "
-          "last run - quarantining:",
-          execution_suspects.size());
-      for (const std::pair<uint64_t, uint64_t>& s : execution_suspects) {
-        if (solver_toxic_shaders_.emplace(s.first, s.second).second) {
-          SolverAppendToxic(s.first, s.second);
-        }
-        XELOGW("  quarantined VS {:016X}, PS {:016X} (execution hang)",
-               s.first, s.second);
-      }
-      // Solved - the next run is a normal one.
-      std::filesystem::remove(solver_execution_journal_path_, ec);
-      std::filesystem::remove(solver_execution_hang_path_, ec);
-    } else if (std::filesystem::exists(solver_execution_hang_path_, ec)) {
-      // The GPU hung last run but nothing was journalled. Serialize EVERY draw
-      // this run, not just unverified pairs - the culprit is evidently
-      // something already on the verified list, or something that only hangs
-      // in a particular state.
-      solver_execution_safe_mode_ = true;
-      XELOGW(
-          "Toxic-shader solver: the GPU hung last run while drawing and the "
-          "journal was empty - serializing every draw this run to catch it. "
-          "Expect it to be very slow until it does.");
-    }
-  }
-
-  // Load the pairs already proven to execute without hanging, and keep the
-  // file open to append to it. Verification is what makes a hang survivable
-  // on the FIRST run: an unproven pair is drawn on its own and waited on, so
-  // if it takes the GPU down it is alone in the journal and the next launch
-  // knows exactly what to quarantine. Proven pairs cost nothing ever again.
-  if (cvars::d3d12_verify_new_draws || solver_execution_safe_mode_) {
-    if (cvars::d3d12_verify_new_draws) {
-      std::ifstream verified_file(solver_verified_path_);
-      std::string line;
-      while (std::getline(verified_file, line)) {
-        uint64_t vs = 0, ps = 0;
-        if (ParseSolverLine(line, vs, ps)) {
-          solver_verified_.emplace(vs, ps);
-        }
-      }
-      solver_verified_file_ =
-          xe::filesystem::OpenFile(solver_verified_path_, "ab");
-    }
-    solver_execution_journal_file_ =
-        xe::filesystem::OpenFile(solver_execution_journal_path_, "wb+");
-    if (!solver_execution_journal_file_) {
-      XELOGW(
-          "Toxic-shader solver: couldn't open the execution journal {}; draws "
-          "will not be checked this run",
-          xe::path_to_utf8(solver_execution_journal_path_));
-      solver_execution_safe_mode_ = false;
-    } else if (cvars::d3d12_verify_new_draws) {
-      XELOGI(
-          "Toxic-shader solver: {} shader pair(s) already proven safe to "
-          "execute; new ones will be checked one at a time",
-          solver_verified_.size());
-    }
-  }
-
-  // Mark this run as in progress; deleted on clean shutdown, so its presence at
-  // the next launch is what signals a crash.
-  { std::ofstream running_marker(solver_running_path_, std::ios::trunc); }
-
-  // Only open the crash journal (which costs per-creation file I/O under a lock)
-  // while actually recovering from a crash - a normal run journals nothing.
-  if (solver_journaling_) {
-    std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-    solver_journal_file_ = xe::filesystem::OpenFile(solver_journal_path_, "wb+");
-    if (!solver_journal_file_) {
-      XELOGW("Toxic-shader solver: couldn't open crash journal {}; detection "
-             "disabled this run (known-toxic skipping still active)",
-             xe::path_to_utf8(solver_journal_path_));
-      solver_journaling_ = false;
-    }
-  }
-
-  solver_enabled_ = true;
-  XELOGI(
-      "Toxic-shader solver active: {} known-toxic pair(s) will be skipped{}{}",
-      solver_toxic_shaders_.size(),
-      solver_journaling_ ? ", crash journaling ON (recovering)" : "",
-      solver_safe_mode_ ? ", serialized safe mode ON" : "");
-}
-
-void PipelineCache::SolverOnDeviceLost() {
-  if (!solver_device_lost_.exchange(true, std::memory_order_acq_rel)) {
-    XELOGW(
-        "Toxic-shader solver: device loss reported - the crash journal will "
-        "be kept on shutdown");
-  }
-}
-
-void PipelineCache::SolverMarkExecutionHang() {
-  if (!solver_enabled_) {
-    return;
-  }
-  // A marker, not a suspect list: this run wasn't serializing, so nothing here
-  // knows which draw did it. Its presence makes the NEXT run serialize, and
-  // that run's journal names the culprit.
-  std::error_code ec;
-  if (std::filesystem::exists(solver_execution_hang_path_, ec)) {
-    return;
-  }
-  { std::ofstream marker(solver_execution_hang_path_, std::ios::trunc); }
-  // The user usually quits through the "device lost" message box, which is a
-  // graceful shutdown - and a graceful shutdown deletes the solver's evidence.
-  // Mark the device as lost so it is kept instead.
-  solver_device_lost_.store(true, std::memory_order_release);
-  XELOGW(
-      "Toxic-shader solver: recorded a GPU hang during drawing - the next "
-      "launch will serialize draws to find which one did it");
-}
-
-bool PipelineCache::SolverNeedsExecutionVerification(
-    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
-  if (!solver_enabled_ || !cvars::d3d12_verify_new_draws ||
-      !solver_execution_journal_file_) {
-    return false;
-  }
-  return solver_verified_.find({vertex_shader_hash, pixel_shader_hash}) ==
-         solver_verified_.end();
-}
-
-void PipelineCache::SolverMarkExecutionVerified(uint64_t vertex_shader_hash,
-                                                uint64_t pixel_shader_hash) {
-  if (!solver_verified_
-           .emplace(vertex_shader_hash, pixel_shader_hash)
-           .second) {
-    return;
-  }
-  if (!solver_verified_file_) {
-    return;
-  }
-  // Appended as it is learned, not written at shutdown: a run that ends in a
-  // hang must still keep everything it proved safe beforehand, otherwise the
-  // next launch re-checks the whole game.
-  std::string line =
-      fmt::format("{:016X} {:016X}\n", vertex_shader_hash, pixel_shader_hash);
-  std::fwrite(line.data(), 1, line.size(), solver_verified_file_);
-  std::fflush(solver_verified_file_);
-}
-
-void PipelineCache::SolverExecutionJournalDraw(uint64_t vertex_shader_hash,
-                                               uint64_t pixel_shader_hash) {
-  if (!solver_execution_journal_file_) {
-    return;
-  }
-  if (solver_execution_safe_mode_ &&
-      ++solver_execution_draws_ > kSolverExecutionSafeModeMaxDraws) {
-    // The hang isn't coming back. Stop punishing the session for it - and
-    // clear the marker, so the next launch is normal too.
-    XELOGW(
-        "Toxic-shader solver: {} draws serialized without a hang - it isn't "
-        "reproducing, resuming normal drawing",
-        solver_execution_draws_ - 1);
-    std::fclose(solver_execution_journal_file_);
-    solver_execution_journal_file_ = nullptr;
-    solver_execution_safe_mode_ = false;
-    std::error_code ec;
-    std::filesystem::remove(solver_execution_journal_path_, ec);
-    std::filesystem::remove(solver_execution_hang_path_, ec);
-    return;
-  }
-  // One line, rewritten each draw and pushed to the OS before the draw is
-  // submitted - so whatever is in the file when the device dies is the draw
-  // that was running. The OS flushes its own cache even though our process
-  // died, which is what makes this survive.
-  std::string line =
-      fmt::format("{:016X} {:016X}\n", vertex_shader_hash, pixel_shader_hash);
-  std::rewind(solver_execution_journal_file_);
-  std::fwrite(line.data(), 1, line.size(), solver_execution_journal_file_);
-  std::fflush(solver_execution_journal_file_);
-  _chsize_s(_fileno(solver_execution_journal_file_),
-            static_cast<__int64>(line.size()));
-}
-
-void PipelineCache::SolverQuarantineExecutionSuspect(
-    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
-  if (!solver_enabled_) {
-    return;
-  }
-  SolverAppendToxic(vertex_shader_hash, pixel_shader_hash);
-  XELOGW(
-      "Toxic-shader solver: quarantined EXECUTION hang suspect VS {:016X}, "
-      "PS {:016X} (the most recently bound pipeline when the device hung) - "
-      "it will be skipped from the next launch; if the hang persists, the "
-      "next suspect will be quarantined on the next death. Remove the pair "
-      "from {} if it turns out innocent.",
-      vertex_shader_hash, pixel_shader_hash,
-      xe::path_to_utf8(solver_toxic_path_));
-}
-
-void PipelineCache::SolverShutdown(bool clean_exit) {
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  if (solver_journal_file_) {
-    std::fclose(solver_journal_file_);
-    solver_journal_file_ = nullptr;
-  }
-  // A GRACEFUL device removal (process survives, the user quits via the
-  // "device lost" message box) must still count as a crash for the solver:
-  // the culprit's journal entry - possibly from a creation call that HUNG the
-  // driver's shader compiler and never returned - is the only evidence, and a
-  // "clean" shutdown would destroy it. Observed with dxbc_switch=true: a
-  // specific in-game shader hangs newbe_xs.dll, the device is eventually
-  // removed, and without this the suspect was erased on exit.
-  if (clean_exit && solver_device_lost_.load(std::memory_order_acquire)) {
-    XELOGW(
-        "Toxic-shader solver: shutdown after device loss - keeping the crash "
-        "journal so the culprit can be confirmed on the next launch");
-    clean_exit = false;
-  }
-  if (solver_execution_journal_file_) {
-    std::fclose(solver_execution_journal_file_);
-    solver_execution_journal_file_ = nullptr;
-  }
-  if (solver_verified_file_) {
-    std::fclose(solver_verified_file_);
-    solver_verified_file_ = nullptr;
-  }
-  solver_verified_.clear();
-  if (clean_exit) {
-    // No crash occurred - drop the in-progress marker and the journal so this
-    // normal shutdown isn't treated as a crash next launch.
-    std::error_code ec;
-    if (!solver_running_path_.empty()) {
-      std::filesystem::remove(solver_running_path_, ec);
-    }
-    if (!solver_journal_path_.empty()) {
-      std::filesystem::remove(solver_journal_path_, ec);
-    }
-    // Same for the execution side: the game was quit normally, so whatever
-    // draw was journalled last is simply the last one drawn, not a suspect.
-    if (!solver_execution_journal_path_.empty()) {
-      std::filesystem::remove(solver_execution_journal_path_, ec);
-    }
-    if (!solver_execution_hang_path_.empty()) {
-      std::filesystem::remove(solver_execution_hang_path_, ec);
-    }
-  }
-  solver_inflight_.clear();
-  solver_enabled_ = false;
-  solver_journaling_ = false;
-  solver_safe_mode_ = false;
-  solver_execution_safe_mode_ = false;
-  solver_execution_draws_ = 0;
-}
-
-bool PipelineCache::IsShaderToxic(uint64_t vertex_shader_hash,
-                                  uint64_t pixel_shader_hash) const {
-  if (solver_toxic_shaders_.empty()) {
-    return false;
-  }
-  // A whole-vertex-shader entry (any pixel shader). Written once the same
-  // vertex shader has hung with kSolverToxicPairsPerVertexShader different
-  // pixel shaders - at that point it is the vertex shader that is broken, and
-  // quarantining pairs one at a time would need a restart per pixel shader it
-  // is ever paired with. Black Ops has one that appears with at least four.
-  if (solver_toxic_shaders_.find(std::make_pair(
-          vertex_shader_hash, kSolverToxicAnyPixelShader)) !=
-      solver_toxic_shaders_.end()) {
-    return true;
-  }
-  return solver_toxic_shaders_.find(
-             std::make_pair(vertex_shader_hash, pixel_shader_hash)) !=
-         solver_toxic_shaders_.end();
-}
-
-void PipelineCache::SolverRewriteJournalLocked() {
-  if (!solver_journal_file_) {
-    return;
-  }
-  std::string buffer;
-  for (const std::pair<uint64_t, uint64_t>& s : solver_inflight_) {
-    buffer += fmt::format("{:016X} {:016X}\n", s.first, s.second);
-  }
-  std::rewind(solver_journal_file_);
-  if (!buffer.empty()) {
-    std::fwrite(buffer.data(), 1, buffer.size(), solver_journal_file_);
-  }
-  // Push the CRT buffer to the OS so the data survives a process crash (the OS
-  // still writes its cache to disk even though our process died); then shrink
-  // the file to exactly what we wrote so stale trailing bytes aren't parsed.
-  std::fflush(solver_journal_file_);
-  _chsize_s(_fileno(solver_journal_file_),
-            static_cast<__int64>(buffer.size()));
-}
-
-void PipelineCache::SolverJournalBegin(uint64_t vertex_shader_hash,
-                                       uint64_t pixel_shader_hash) {
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  solver_inflight_.emplace(vertex_shader_hash, pixel_shader_hash);
-  SolverRewriteJournalLocked();
-}
-
-void PipelineCache::SolverJournalEnd(uint64_t vertex_shader_hash,
-                                     uint64_t pixel_shader_hash) {
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  solver_inflight_.erase(
-      std::make_pair(vertex_shader_hash, pixel_shader_hash));
-  SolverRewriteJournalLocked();
-}
-
-void PipelineCache::SolverAppendToxic(uint64_t vertex_shader_hash,
-                                      uint64_t pixel_shader_hash) {
-  {
-    // May be called from multiple creation threads (crash-catch path).
-    std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-    std::ofstream toxic_file(solver_toxic_path_, std::ios::app);
-    if (!toxic_file) {
-      return;
-    }
-    toxic_file << fmt::format("{:016X} {:016X}\n", vertex_shader_hash,
-                              pixel_shader_hash);
-  }
-  if (pixel_shader_hash == kSolverToxicAnyPixelShader) {
-    return;
-  }
-  // If this vertex shader has now hung with several different pixel shaders,
-  // it is the vertex shader that is at fault, not any of the pairs. Left as
-  // pairs, the game would need a crash-and-restart cycle for every pixel
-  // shader it is ever drawn with - Black Ops has one such vertex shader
-  // appearing with at least four. Promote it to a whole-shader entry.
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  size_t pairs_with_vertex_shader = 0;
-  for (const std::pair<uint64_t, uint64_t>& toxic : solver_toxic_shaders_) {
-    if (toxic.first == vertex_shader_hash &&
-        toxic.second != kSolverToxicAnyPixelShader) {
-      ++pairs_with_vertex_shader;
-    }
-  }
-  if (pairs_with_vertex_shader < kSolverToxicPairsPerVertexShader) {
-    return;
-  }
-  if (!solver_toxic_shaders_.emplace(vertex_shader_hash,
-                                     kSolverToxicAnyPixelShader)
-           .second) {
-    return;
-  }
-  std::ofstream toxic_file(solver_toxic_path_, std::ios::app);
-  if (toxic_file) {
-    toxic_file << fmt::format("{:016X} {:016X}\n", vertex_shader_hash,
-                              kSolverToxicAnyPixelShader);
-  }
-  XELOGW(
-      "Toxic-shader solver: VS {:016X} has now hung the GPU with {} different "
-      "pixel shaders - quarantining every draw that uses it, rather than one "
-      "pair per crash",
-      vertex_shader_hash, pairs_with_vertex_shader);
-}
-
-void PipelineCache::SolverRetractThisRunToxic() {
-  // Out-of-memory was detected: compiler crashes quarantined EARLIER in this
-  // run (before the first observed E_OUTOFMEMORY) were most likely also
-  // out-of-memory victims. Rewrite the skip list with only the entries known
-  // at startup, dropping everything appended during this session.
-  std::lock_guard<std::mutex> lock(solver_journal_mutex_);
-  std::ofstream toxic_file(solver_toxic_path_, std::ios::trunc);
-  if (!toxic_file) {
-    return;
-  }
-  for (const auto& pair : solver_toxic_shaders_) {
-    toxic_file << fmt::format("{:016X} {:016X}\n", pair.first, pair.second);
-  }
-  XELOGW(
-      "Toxic-shader solver: dropped the pairs quarantined during this "
-      "out-of-memory session from {} (kept the {} known at startup)",
-      xe::path_to_utf8(solver_toxic_path_), solver_toxic_shaders_.size());
-}
-#endif  // XE_PLATFORM_WINRT
 
 void PipelineCache::EndSubmission() {
   // Periodically persist the pipeline library. A console application is often
@@ -4449,7 +3941,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // the crash solver has learned automatically.
   bool skip_pipeline = command_processor_.IsShaderSkipped(vs_hash, ps_hash);
 #if XE_PLATFORM_WINRT
-  skip_pipeline = skip_pipeline || IsShaderToxic(vs_hash, ps_hash);
+  skip_pipeline = skip_pipeline || solver_.IsShaderToxic(vs_hash, ps_hash);
 #endif  // XE_PLATFORM_WINRT
   if (skip_pipeline) {
     return nullptr;
@@ -4868,47 +4360,28 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // so the pair is left in the journal and confirmed toxic on the next launch.
   // In safe mode the serialize lock guarantees exactly one pipeline is ever in
   // flight, so a crash pinpoints the culprit unambiguously.
-  struct SolverProbe {
-    PipelineCache& cache;
-    std::pair<uint64_t, uint64_t> key;
-    std::unique_lock<std::mutex> serialize_lock;
-    bool active = false;
-    ~SolverProbe() {
-      // Leave the entry in the journal if the device was lost - it stays a
-      // suspect for the next launch. Otherwise a normal return clears it.
-      if (active && !cache.solver_device_lost_.load(std::memory_order_acquire)) {
-        cache.SolverJournalEnd(key.first, key.second);
-      }
+  // Pre-flight: refuse to hand the driver a pipeline it is not in a state to
+  // compile, instead of paying a crash to find that out. The compiler allocates
+  // heavily and, once the process is short of commit, takes an access violation
+  // on its own failed allocations - contained by the guard below, but the run
+  // has still been through a driver crash, and a Dark Souls II session at 3x3
+  // goes through several of those before dying inside XBSC_XS for good. There
+  // is nothing to lose by waiting: the pipeline would have failed anyway, the
+  // draw is skipped either way, and the memory core is freeing memory
+  // meanwhile, so the next attempt usually gets through.
+  if (solver_.Preflight() ==
+      ToxicShaderSolver::PreflightVerdict::kDeferOutOfMemory) {
+    static std::atomic<uint32_t> preflight_defers{0};
+    uint32_t defer_index = preflight_defers.fetch_add(1) + 1;
+    if (defer_index <= 4 || (defer_index % 512) == 0) {
+      XELOGW(
+          "Pipeline creation deferred - too little memory for the driver's "
+          "shader compiler to work in (VS {:016X}, PS {:016X}) ({})",
+          vs_hash, ps_hash, defer_index);
     }
-  } solver_probe{*this, std::make_pair(vs_hash, ps_hash)};
-  // Only bracket the creation with the crash journal while recovering from a
-  // crash (solver_journaling_); a normal run does zero per-creation file I/O.
-  if (solver_enabled_ && solver_journaling_) {
-    if (solver_safe_mode_) {
-      // Safe mode serializes every creation to pin down which pipeline kills
-      // the driver - which also means the game gets its pipelines one at a
-      // time and renders almost nothing until they arrive. That's a price
-      // worth paying for the first pipelines of a run, not for the whole
-      // session: if this many have been created without a crash, whatever
-      // killed the previous run isn't reproducing (a run killed by running out
-      // of memory leaves the same "crashed" marker as a toxic shader), so stop
-      // isolating and let creation go wide again.
-      if (solver_safe_mode_creations_.fetch_add(1, std::memory_order_relaxed) >=
-          kSolverSafeModeMaxCreations) {
-        solver_safe_mode_ = false;
-        XELOGW(
-            "Toxic-shader solver: {} pipelines created in safe mode without a "
-            "crash - the previous run's death isn't reproducing, resuming "
-            "parallel creation (journaling stays on)",
-            kSolverSafeModeMaxCreations);
-      } else {
-        solver_probe.serialize_lock =
-            std::unique_lock<std::mutex>(solver_serialize_mutex_);
-      }
-    }
-    SolverJournalBegin(vs_hash, ps_hash);
-    solver_probe.active = true;
+    return nullptr;
   }
+  ToxicShaderSolver::CreationProbe solver_probe(solver_, vs_hash, ps_hash);
   // Ask the pipeline library first - a hit skips the driver's compiler
   // entirely, which is the whole point of keeping it.
   std::wstring library_name;
@@ -4927,35 +4400,13 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   HRESULT hr = CreateGraphicsPipelineStateGuarded(
       device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
   if (creation_exception_code != 0) {
-    // With the process out of memory, the driver's shader compiler crashes on
-    // its own failed allocations - on perfectly valid shaders (confirmed in
-    // GTA IV at 2x2: E_OUTOFMEMORY failures interleaved with these AVs, and
-    // the same pairs compile fine at 1x1). The crash may even PRECEDE the
-    // first E_OUTOFMEMORY pipeline failure (the compiler allocates a lot), so
-    // also check the actual memory headroom right now - if the title is
-    // nearly out of its budget, this is an OOM victim, not a toxic shader.
-    if (!solver_oom_seen_.load(std::memory_order_acquire)) {
-      MEMORYSTATUSEX oom_check_status = {sizeof(oom_check_status)};
-      // Watch COMMIT headroom (ullAvailPageFile), not physical - the compiler
-      // fails its allocations when the commit charge, not physical RAM, is
-      // exhausted (see the memory-pressure note in EndSubmission).
-      if (GlobalMemoryStatusEx(&oom_check_status) &&
-          oom_check_status.ullAvailPageFile < (UINT64_C(768) << 20)) {
-        if (!solver_oom_seen_.exchange(true, std::memory_order_acq_rel)) {
-          XELOGW(
-              "Toxic-shader solver: the driver's shader compiler crashed with "
-              "only {} MB of commit left - treating this and further crashes "
-              "as out-of-memory victims, not toxic shaders (lower the memory "
-              "usage - e.g. the resolution scale - instead)",
-              uint64_t(oom_check_status.ullAvailPageFile) >> 20);
-          std::error_code oom_ec;
-          std::filesystem::remove(solver_running_path_, oom_ec);
-          SolverRetractThisRunToxic();
-        }
-      }
-    }
-    // Skip the draws this run, but don't brand the pair toxic.
-    if (solver_oom_seen_.load(std::memory_order_acquire)) {
+    // The compiler crashed and the exception was contained. Whether that means
+    // the pair is toxic or simply that the process is out of memory is the
+    // solver's call - the compiler AVs on its own failed allocations too, on
+    // perfectly valid shaders.
+    if (solver_.ReportCompilerCrash(vs_hash, ps_hash) ==
+        ToxicShaderSolver::CrashVerdict::kOutOfMemoryVictim) {
+      // Skip the draws this run, but don't brand the pair toxic.
       XELOGW(
           "Toxic-shader solver: the driver's shader compiler crashed "
           "(exception 0x{:08X}) on VS {:016X}, PS {:016X} while the process "
@@ -4965,46 +4416,42 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       xe::FlushLog();
       return nullptr;
     }
-    // The driver's shader compiler crashed on this pipeline and the exception
-    // was contained. Quarantine the pair immediately - both for the next runs
-    // (the .toxic file) and effectively for this run (this Pipeline object
-    // keeps a null state, so its draws are skipped and it's never re-queued).
+    // Quarantined - both for the next runs (the .toxic file) and effectively
+    // for this run (this Pipeline object keeps a null state, so its draws are
+    // skipped and it's never re-queued).
     XELOGE(
         "Toxic-shader solver: the driver's shader compiler CRASHED (exception "
         "0x{:08X}) creating the pipeline with VS {:016X}, PS {:016X} - the "
         "crash was contained, quarantining the pair and skipping its draws",
         uint32_t(creation_exception_code), vs_hash, ps_hash);
-    if (solver_enabled_) {
-      SolverAppendToxic(vs_hash, ps_hash);
-      // Dump the exact DXBC the compiler crashed on next to the .toxic list
-      // for offline analysis of the construct the driver chokes on (the
-      // hashes identify the guest ucode; the DXBC differs per translation,
-      // e.g. per resolution scale).
-      if (!solver_toxic_path_.empty()) {
-        auto dump_stage_dxbc = [this](const char* stage, uint64_t hash,
-                                      const void* code, size_t code_size) {
-          if (!code || !code_size) {
-            return;
-          }
-          std::filesystem::path dump_path = solver_toxic_path_;
-          dump_path += fmt::format(".{}_{:016X}.dxbc", stage, hash);
-          std::error_code dump_ec;
-          if (std::filesystem::exists(dump_path, dump_ec)) {
-            return;
-          }
-          FILE* dump_file = xe::filesystem::OpenFile(dump_path, "wb");
-          if (dump_file) {
-            std::fwrite(code, 1, code_size, dump_file);
-            std::fclose(dump_file);
-            XELOGI("Toxic-shader solver: dumped crashing {} DXBC to {}", stage,
-                   xe::path_to_utf8(dump_path));
-          }
-        };
-        dump_stage_dxbc("vs", vs_hash, state_desc.VS.pShaderBytecode,
-                        state_desc.VS.BytecodeLength);
-        dump_stage_dxbc("ps", ps_hash, state_desc.PS.pShaderBytecode,
-                        state_desc.PS.BytecodeLength);
-      }
+    // Dump the exact DXBC the compiler crashed on next to the .toxic list for
+    // offline analysis of the construct the driver chokes on (the hashes
+    // identify the guest ucode; the DXBC differs per translation, e.g. per
+    // resolution scale).
+    if (!solver_.toxic_path().empty()) {
+      auto dump_stage_dxbc = [this](const char* stage, uint64_t hash,
+                                    const void* code, size_t code_size) {
+        if (!code || !code_size) {
+          return;
+        }
+        std::filesystem::path dump_path = solver_.toxic_path();
+        dump_path += fmt::format(".{}_{:016X}.dxbc", stage, hash);
+        std::error_code dump_ec;
+        if (std::filesystem::exists(dump_path, dump_ec)) {
+          return;
+        }
+        FILE* dump_file = xe::filesystem::OpenFile(dump_path, "wb");
+        if (dump_file) {
+          std::fwrite(code, 1, code_size, dump_file);
+          std::fclose(dump_file);
+          XELOGI("Toxic-shader solver: dumped crashing {} DXBC to {}", stage,
+                 xe::path_to_utf8(dump_path));
+        }
+      };
+      dump_stage_dxbc("vs", vs_hash, state_desc.VS.pShaderBytecode,
+                      state_desc.VS.BytecodeLength);
+      dump_stage_dxbc("ps", ps_hash, state_desc.PS.pShaderBytecode,
+                      state_desc.PS.BytecodeLength);
     }
     xe::FlushLog();
     return nullptr;
@@ -5019,30 +4466,17 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     // thousands of identical errors (the failures are a symptom, not a cause).
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
 #if XE_PLATFORM_WINRT
-      // The device is gone. Suppress the crash journal's normal removal for
-      // every pipeline still in flight (the guard checks this flag) so they
-      // remain suspects for the next launch even though the process survived a
-      // *graceful* removal - a hard crash would have left them anyway. In
-      // serialized safe mode exactly one pipeline was in flight, so this pair
-      // is the confirmed culprit: append it to the per-game skip list now (the
-      // in-memory set stays immutable; the file is reloaded next launch).
-      if (solver_enabled_) {
-        solver_device_lost_.store(true, std::memory_order_release);
-      }
+      // The device is gone. The solver suppresses the crash journal's normal
+      // removal for every pipeline still in flight, so they remain suspects for
+      // the next launch even though the process survived a *graceful* removal -
+      // a hard crash would have left them anyway - and in serialized safe mode
+      // exactly one pipeline was in flight, which makes this pair the confirmed
+      // culprit.
+      solver_.ReportDeviceRemovedDuringCreation(vs_hash, ps_hash);
 #endif  // XE_PLATFORM_WINRT
       static std::atomic<bool> device_removed_logged{false};
       if (!device_removed_logged.exchange(true)) {
         HRESULT reason = device->GetDeviceRemovedReason();
-#if XE_PLATFORM_WINRT
-        if (solver_enabled_ && solver_safe_mode_) {
-          SolverAppendToxic(vs_hash, ps_hash);
-          XELOGW(
-              "Toxic-shader solver: confirmed VS {:016X}, PS {:016X} as toxic "
-              "(caused device removal while isolated in safe mode); it will be "
-              "skipped from the next launch",
-              vs_hash, ps_hash);
-        }
-#endif  // XE_PLATFORM_WINRT
         XELOGE(
             "Failed to create graphics pipeline: THE GPU DEVICE WAS "
             "REMOVED/RESET (hr=0x{:08X}, GetDeviceRemovedReason=0x{:08X}). "
@@ -5108,25 +4542,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
 #if XE_PLATFORM_WINRT
     if (hr == E_OUTOFMEMORY) {
-      // The system is out of memory - from this point the driver's shader
-      // compiler may CRASH (access violation on its own failed allocations)
-      // on perfectly valid shaders. Those are OOM victims, not toxic
-      // pipelines: stop quarantining, and drop the crash marker so a
-      // subsequent out-of-memory process death doesn't promote the in-flight
-      // pairs to the per-game skip list on the next launch.
-      if (solver_enabled_ &&
-          !solver_oom_seen_.exchange(true, std::memory_order_acq_rel)) {
-        XELOGW(
-            "Toxic-shader solver: pipeline creation failed with "
-            "E_OUTOFMEMORY - the process is out of memory; driver shader "
-            "compiler crashes from now on will NOT be treated as toxic "
-            "shaders (lower the memory usage - e.g. the resolution scale or "
-            "the post-processing output resolution - instead)");
-        std::error_code oom_ec;
-        std::filesystem::remove(solver_running_path_, oom_ec);
-        // Pairs quarantined earlier in this run were likely OOM victims too.
-        SolverRetractThisRunToxic();
-      }
+      // From this point the driver's shader compiler may CRASH on perfectly
+      // valid shaders, on its own failed allocations - the solver stops
+      // quarantining and rewinds what it quarantined earlier in this run.
+      solver_.ReportOutOfMemory();
     }
 #endif  // XE_PLATFORM_WINRT
     if (runtime_description.pixel_shader != nullptr) {

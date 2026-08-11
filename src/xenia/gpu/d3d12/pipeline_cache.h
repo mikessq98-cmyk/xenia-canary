@@ -34,6 +34,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
+#include "xenia/gpu/d3d12/toxic_shader_solver.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/primitive_processor.h"
@@ -72,45 +73,44 @@ class PipelineCache {
   void ShutdownShaderStorage();
 
 #if XE_PLATFORM_WINRT
+  // The toxic-shader solver itself - see toxic_shader_solver.h. Thin
+  // forwarders below for the calls the command processor makes, so the device
+  // loss and draw paths do not have to reach through the pipeline cache into
+  // another object.
+  ToxicShaderSolver& solver() { return solver_; }
   // Marks that the host GPU device has been lost (callable from any thread) so
-  // the toxic-shader solver keeps its crash journal on shutdown even though
-  // the process exits gracefully - covers device loss detected outside
-  // pipeline creation (present/submission), including a creation call that
-  // hung the driver's shader compiler and never returned.
-  void SolverOnDeviceLost();
-  // Quarantines a pipeline identified as an EXECUTION-side hang suspect (the
-  // most recently bound pipeline when the device was removed with
-  // DXGI_ERROR_DEVICE_HUNG) - appends it to the per-game .toxic file so the
-  // next launch skips it. The creation-side solver cannot see this class of
-  // failure at all: nothing crashes while compiling, the GPU hangs executing
-  // an already-built pipeline. The suspect may be innocent (the hang can lag
-  // the guilty draw); the .toxic file is plain text and can be pruned.
+  // the solver keeps its crash journal on shutdown even though the process
+  // exits gracefully - covers device loss detected outside pipeline creation
+  // (present/submission), including a creation call that hung the driver's
+  // shader compiler and never returned.
+  void SolverOnDeviceLost() { solver_.OnDeviceLost(); }
   // Records that the device died while EXECUTING draws rather than while
   // creating a pipeline. The next launch then runs draws one at a time,
-  // journalling each, so the hang leaves exactly one suspect behind - see
-  // solver_execution_safe_mode().
-  void SolverMarkExecutionHang();
-  // While true, every draw is submitted alone, waited on, and written to the
-  // execution journal first. Costs a slideshow for one launch and finds the
-  // hanging draw with no guesswork; cleared automatically once it has.
+  // journalling each, so the hang leaves exactly one suspect behind.
+  void SolverMarkExecutionHang() { solver_.MarkExecutionHang(); }
   bool solver_execution_safe_mode() const {
-    return solver_execution_safe_mode_;
+    return solver_.execution_safe_mode();
   }
   // Called just before a draw is submitted in execution safe mode.
   void SolverExecutionJournalDraw(uint64_t vertex_shader_hash,
-                                  uint64_t pixel_shader_hash);
-  // Whether this pair has never been seen to survive execution. The FIRST draw
-  // using it is submitted alone and waited on, so if it hangs the GPU the
-  // journal holds it alone and the next launch quarantines it. Pairs that
-  // survive are remembered on disk and never checked again - so the cost is
-  // one synchronization per distinct pair per game, not per draw.
+                                  uint64_t pixel_shader_hash) {
+    solver_.ExecutionJournalDraw(vertex_shader_hash, pixel_shader_hash);
+  }
+  // Whether this pair has never been seen to survive execution.
   bool SolverNeedsExecutionVerification(uint64_t vertex_shader_hash,
-                                        uint64_t pixel_shader_hash);
+                                        uint64_t pixel_shader_hash) {
+    return solver_.NeedsExecutionVerification(vertex_shader_hash,
+                                              pixel_shader_hash);
+  }
   // The pair drew without hanging the GPU. Remembered across launches.
   void SolverMarkExecutionVerified(uint64_t vertex_shader_hash,
-                                   uint64_t pixel_shader_hash);
+                                   uint64_t pixel_shader_hash) {
+    solver_.MarkExecutionVerified(vertex_shader_hash, pixel_shader_hash);
+  }
   void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
-                                        uint64_t pixel_shader_hash);
+                                        uint64_t pixel_shader_hash) {
+    solver_.QuarantineExecutionSuspect(vertex_shader_hash, pixel_shader_hash);
+  }
 #endif  // XE_PLATFORM_WINRT
 
   void EndSubmission();
@@ -493,106 +493,12 @@ class PipelineCache {
       const PipelineRuntimeDescription& runtime_description);
 
 #if XE_PLATFORM_WINRT
-  // --- Toxic-shader solver (Xbox UWP only) ------------------------------
-  // Some [VS,PS] pipeline combinations hard-crash the Xbox UWP D3D12 driver
-  // inside CreateGraphicsPipelineState (e.g. GTA IV). This auto-detects and
-  // skips them across runs, so a single crash immunizes every later launch -
-  // no manual cvars::d3d12_skip_shaders editing needed.
-  //
-  // Phase A (detect): each creation is bracketed by an on-disk crash journal
-  //   (<cache>/shaders/<title>.d3d12.inflight). The pair is written before the
-  //   driver call and removed on any normal return, so a hard crash leaves the
-  //   in-flight pair(s) behind.
-  // Phase B (confirm): on the next launch the journal is read. A lone leftover
-  //   pair is unambiguously the culprit -> appended to the per-game skip file
-  //   (<cache>/shaders/<title>.d3d12.toxic). Several leftovers -> "safe mode"
-  //   (all creation serialized) so the next crash narrows down to exactly one.
-  void SolverInitialize(const std::filesystem::path& cache_root,
-                        uint32_t title_id);
-  void SolverShutdown(bool clean_exit);
-  // Confirmed-toxic lookup. Immutable after SolverInitialize (built before any
-  // creation thread runs), so reads are lock-free.
-  bool IsShaderToxic(uint64_t vertex_shader_hash,
-                     uint64_t pixel_shader_hash) const;
-  void SolverJournalBegin(uint64_t vertex_shader_hash,
-                          uint64_t pixel_shader_hash);
-  void SolverJournalEnd(uint64_t vertex_shader_hash,
-                        uint64_t pixel_shader_hash);
-  // Rewrites the whole journal from solver_inflight_. Caller holds the mutex.
-  void SolverRewriteJournalLocked();
-  void SolverAppendToxic(uint64_t vertex_shader_hash,
-                         uint64_t pixel_shader_hash);
-  // On the first observed E_OUTOFMEMORY: rewrites the skip list with only the
-  // entries known at startup (quarantines made earlier in this session were
-  // likely out-of-memory victims, not genuinely toxic pairs).
-  void SolverRetractThisRunToxic();
-
-
-  bool solver_enabled_ = false;
-  // Whether to write the per-creation crash journal this session. To avoid the
-  // journal's file I/O (under a lock, on every pipeline creation) becoming
-  // thread contention during normal prewarming, journaling is OFF unless the
-  // previous run did NOT exit cleanly (a leftover ".running" marker) - i.e. we
-  // only pay the cost while actually hunting a driver crash. Known-toxic
-  // skipping (the cheap in-memory lookup) is always active.
-  bool solver_journaling_ = false;
-  // All pipeline creation serialized to one-in-flight to pinpoint the culprit.
-  bool solver_safe_mode_ = false;
-  // Creations performed in safe mode, and the number after which safe mode
-  // gives up on reproducing the previous run's crash (see CreateD3D12Pipeline)
-  // instead of starving the game of pipelines for the whole session.
-  std::atomic<uint32_t> solver_safe_mode_creations_{0};
-  static constexpr uint32_t kSolverSafeModeMaxCreations = 192;
-  std::filesystem::path solver_toxic_path_;
-  std::filesystem::path solver_journal_path_;
-  // Presence at startup means the last run crashed (deleted on clean exit).
-  std::filesystem::path solver_running_path_;
-  // As the pixel shader of a toxic entry: matches every pixel shader, i.e.
-  // the vertex shader itself is quarantined. A guest shader can't hash to
-  // this, and the manual d3d12_skip_shaders syntax has the same idea as
-  // "[hash,sol]".
-  static constexpr uint64_t kSolverToxicAnyPixelShader = UINT64_MAX;
-  // Distinct pixel shaders one vertex shader must hang with before it is
-  // blamed as a whole. Two is enough to tell "this pair is broken" from "this
-  // vertex shader is broken", and waiting for more costs a crash each.
-  static constexpr size_t kSolverToxicPairsPerVertexShader = 2;
-  std::set<std::pair<uint64_t, uint64_t>> solver_toxic_shaders_;
-  std::mutex solver_journal_mutex_;
-  std::set<std::pair<uint64_t, uint64_t>> solver_inflight_;
-  std::FILE* solver_journal_file_ = nullptr;
-  // Set once the D3D12 device is lost during creation. Tells the in-flight
-  // guards to leave their entries in the journal (so they survive as suspects)
-  // even on a graceful removal where the process doesn't hard-crash.
-  std::atomic<bool> solver_device_lost_{false};
-  // Set once any pipeline creation fails with E_OUTOFMEMORY: from that point
-  // driver shader compiler crashes are treated as out-of-memory victims (the
-  // compiler AVs on its own failed allocations) and are NOT quarantined as
-  // toxic pairs.
-  std::atomic<bool> solver_oom_seen_{false};
-  // Held while a pipeline is created in safe mode (only one at a time).
-  std::mutex solver_serialize_mutex_;
-
-  // Execution-side solver. A pipeline that CREATES fine can still hang the GPU
-  // when it runs (Black Ops does, reproducibly, on one object), and the list of
-  // recently bound pipelines can't identify it - the GPU runs behind, so its
-  // newest entry is just the newest. So on the launch after an execution hang,
-  // draws are serialized and journalled, which leaves exactly one suspect.
-  bool solver_execution_safe_mode_ = false;
-  std::filesystem::path solver_execution_journal_path_;
-  // Written when the device is lost outside pipeline creation; its presence at
-  // the next launch is what turns execution safe mode on.
-  std::filesystem::path solver_execution_hang_path_;
-  std::FILE* solver_execution_journal_file_ = nullptr;
-  uint32_t solver_execution_draws_ = 0;
-  // Pairs already observed to execute without hanging the GPU, kept across
-  // launches so a game is only ever checked once per pair. Command processor
-  // thread only.
-  std::set<std::pair<uint64_t, uint64_t>> solver_verified_;
-  std::filesystem::path solver_verified_path_;
-  std::FILE* solver_verified_file_ = nullptr;
-  // Give up reproducing after this many draws rather than leaving the game a
-  // slideshow forever when the hang doesn't come back.
-  static constexpr uint32_t kSolverExecutionSafeModeMaxDraws = 300000;
+  // Everything about which shader pairs the driver cannot survive lives in
+  // ToxicShaderSolver now - it was two hundred lines of unrelated state in the
+  // middle of pipeline creation. The pipeline cache reports what happened
+  // (a contained compiler crash, an out-of-memory failure, a device removal)
+  // and the solver decides what it means.
+  ToxicShaderSolver solver_;
 #endif  // XE_PLATFORM_WINRT
 
   // Sum of resident translated shader bytecode sizes (incremented on a
