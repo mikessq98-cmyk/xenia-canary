@@ -248,9 +248,18 @@ void TextureCache::CompletedSubmissionUpdated(
   // cut back, refilled from guest memory (blocking the command processor
   // mid-frame each time) and grew into it again, hundreds of times per
   // session, while gigabytes of host memory sat unused.
-  bool under_pressure = host_memory_pressure_.load(std::memory_order_relaxed);
+  GpuMemoryArbiter::Pressure pressure =
+      host_memory_pressure_.load(std::memory_order_relaxed);
+  bool under_pressure = pressure != GpuMemoryArbiter::Pressure::kNone;
   uint64_t idle_eviction_ms =
       uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
+  if (pressure == GpuMemoryArbiter::Pressure::kCritical) {
+    // The host is short right now. Age still decides the ORDER, but the bar
+    // for "old enough" drops to the minimum that keeps the current frame's
+    // textures safe - the arbiter is about to start taking memory anyway, and
+    // what this releases first is cheaper than what it would take.
+    idle_eviction_ms = kMinEvictionAgeMs;
+  }
 
   // Releasing idle textures a handful at a time, every time a submission
   // completes, is worse than releasing the same textures in one go: every
@@ -258,9 +267,11 @@ void TextureCache::CompletedSubmissionUpdated(
   // everything, and that cost is paid per batch rather than per texture. It
   // isn't urgent work either - nothing is waiting for this memory, or the
   // pressure path would be running instead. So let idle textures accumulate
-  // and take them in one pass.
-  if (completed_submission_index <
-      last_idle_eviction_submission_ + kIdleEvictionIntervalSubmissions) {
+  // and take them in one pass. Under critical pressure that reasoning is
+  // reversed - something IS waiting - so the batching is skipped.
+  if (pressure != GpuMemoryArbiter::Pressure::kCritical &&
+      completed_submission_index <
+          last_idle_eviction_submission_ + kIdleEvictionIntervalSubmissions) {
     idle_eviction_ms = 0;
   }
 

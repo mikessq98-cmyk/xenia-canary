@@ -642,15 +642,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Spare pool pages the arbiter keeps when it asks for the rest back, so the
   // next frame doesn't immediately allocate again.
   static constexpr size_t kConstantBufferPoolKeep = 4;
-  // Free host commit below which the texture cache is told to honour its soft
-  // size limit. This is an emergency valve, not the normal mechanism: what
-  // decides a texture's fate is how long the game has gone without drawing
-  // with it, and size-driven eviction on top of that produced 438 evictions in
-  // one Black Ops session with 1.3-2.8 GB free - throwing away work nobody
-  // needed back. Set just above the arbiter's own trim target so the cheap
-  // release still happens before the arbiter has to take anything.
-  static constexpr uint64_t kTextureCachePressureFreeBytes = UINT64_C(896)
-                                                             << 20;
 
   static constexpr uint32_t kViewBindfulHeapSize = 32768;
   static_assert(kViewBindfulHeapSize <=

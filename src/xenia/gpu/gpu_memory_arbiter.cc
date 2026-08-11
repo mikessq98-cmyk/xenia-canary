@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 
@@ -27,6 +28,8 @@ const char* GpuMemoryArbiter::GetConsumerName(ConsumerKind kind) {
       return "shader bytecode";
     case ConsumerKind::kUploadPools:
       return "upload pools";
+    case ConsumerKind::kResourceReusePool:
+      return "resource reuse pool";
     case ConsumerKind::kIdleScaledResolve:
       return "idle scaled resolve regions";
     case ConsumerKind::kUnusedRenderTargets:
@@ -35,6 +38,19 @@ const char* GpuMemoryArbiter::GetConsumerName(ConsumerKind kind) {
       return "textures";
     case ConsumerKind::kOwningRenderTargets:
       return "render targets holding EDRAM data";
+    default:
+      return "unknown";
+  }
+}
+
+const char* GpuMemoryArbiter::GetPressureName(Pressure pressure) {
+  switch (pressure) {
+    case Pressure::kNone:
+      return "none";
+    case Pressure::kElevated:
+      return "elevated";
+    case Pressure::kCritical:
+      return "critical";
     default:
       return "unknown";
   }
@@ -55,11 +71,13 @@ uint64_t GpuMemoryArbiter::QueryFreeHostBytes() {
 }
 
 void GpuMemoryArbiter::RegisterConsumer(ConsumerKind kind, UsageFunction usage,
-                                        TrimFunction trim) {
+                                        TrimFunction trim,
+                                        FreeUnneededFunction free_unneeded) {
   Consumer consumer;
   consumer.kind = kind;
   consumer.usage = std::move(usage);
   consumer.trim = std::move(trim);
+  consumer.free_unneeded = std::move(free_unneeded);
   consumers_.push_back(std::move(consumer));
   // Keep the list in eviction order so Update just walks it.
   std::stable_sort(consumers_.begin(), consumers_.end(),
@@ -80,6 +98,65 @@ uint64_t GpuMemoryArbiter::GetTotalUsage() const {
   return total;
 }
 
+void GpuMemoryArbiter::LogStatistics() const {
+  uint64_t free_bytes = last_free_bytes_;
+  XELOGI(
+      "[MEM] gpu memory core: pressure {}, {} MB free, using {} MB/s | "
+      "released on sight {} MB, forced trims {} freeing {} MB",
+      GetPressureName(pressure()),
+      free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
+      int64_t(consumption_bytes_per_second_) >> 20,
+      total_freed_immediately_bytes_ >> 20, total_trims_,
+      total_released_bytes_ >> 20);
+  for (const Consumer& consumer : consumers_) {
+    if (!consumer.usage) {
+      continue;
+    }
+    uint64_t usage = consumer.usage();
+    if (!usage) {
+      continue;
+    }
+    XELOGI("[MEM]   {} MB held by {}", usage >> 20,
+           GetConsumerName(consumer.kind));
+  }
+}
+
+double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
+  constexpr double kInfinite = 1.0e9;
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  if (last_trend_free_bytes_ == UINT64_MAX || now_ms <= last_trend_time_ms_) {
+    last_trend_free_bytes_ = free_bytes;
+    last_trend_time_ms_ = now_ms;
+    return kInfinite;
+  }
+  double elapsed_seconds = double(now_ms - last_trend_time_ms_) / 1000.0;
+  if (elapsed_seconds < 0.05) {
+    return consumption_bytes_per_second_ > 0.0
+               ? double(free_bytes > kFloorFreeBytes
+                            ? free_bytes - kFloorFreeBytes
+                            : 0) /
+                     consumption_bytes_per_second_
+               : kInfinite;
+  }
+  // Positive when free memory is falling.
+  double delta = double(int64_t(last_trend_free_bytes_) - int64_t(free_bytes));
+  double instant_rate = delta / elapsed_seconds;
+  last_trend_free_bytes_ = free_bytes;
+  last_trend_time_ms_ = now_ms;
+  // Smoothed, because one poll that happens to straddle a level load reads as
+  // hundreds of MB/s and would trigger a panic trim over nothing.
+  consumption_bytes_per_second_ =
+      consumption_bytes_per_second_ * (1.0 - kRateSmoothing) +
+      instant_rate * kRateSmoothing;
+  if (consumption_bytes_per_second_ <= 0.0) {
+    // Not falling - memory is being returned faster than taken.
+    return kInfinite;
+  }
+  uint64_t above_floor =
+      free_bytes > kFloorFreeBytes ? free_bytes - kFloorFreeBytes : 0;
+  return double(above_floor) / consumption_bytes_per_second_;
+}
+
 void GpuMemoryArbiter::Update(uint64_t submission_index) {
   if (consumers_.empty()) {
     return;
@@ -91,7 +168,55 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
 
   uint64_t free_bytes = QueryFreeHostBytes();
   last_free_bytes_ = free_bytes;
-  if (free_bytes == UINT64_MAX || free_bytes >= kTargetFreeBytes) {
+
+  // Whatever is genuinely dead goes back now, at any pressure. Keeping it
+  // costs the emulation nothing to lose and brings the shortage closer - and
+  // doing it continuously is what keeps the trend gentle enough that the
+  // predictive path below rarely has to do anything at all.
+  for (const Consumer& consumer : consumers_) {
+    if (!consumer.free_unneeded) {
+      continue;
+    }
+    uint64_t freed = consumer.free_unneeded();
+    if (freed) {
+      total_freed_immediately_bytes_ += freed;
+    }
+  }
+
+  // How long the current rate of consumption leaves before allocations start
+  // failing. This replaces fixed thresholds: what matters is not how much is
+  // free at this instant but whether it will still be enough by the time the
+  // scene finishes streaming. Reacting to the slope means releases are early,
+  // gradual and cheap instead of an emergency.
+  double seconds_to_floor = UpdateTrendAndGetSecondsToFloor(free_bytes);
+
+  Pressure new_pressure;
+  if (free_bytes == UINT64_MAX) {
+    new_pressure = Pressure::kNone;
+  } else if (free_bytes <= kFloorFreeBytes ||
+             seconds_to_floor <= kCriticalSecondsToFloor) {
+    new_pressure = Pressure::kCritical;
+  } else if (seconds_to_floor <= kElevatedSecondsToFloor) {
+    new_pressure = Pressure::kElevated;
+  } else {
+    new_pressure = Pressure::kNone;
+  }
+  Pressure old_pressure = pressure_.exchange(new_pressure,
+                                             std::memory_order_relaxed);
+  if (new_pressure != old_pressure) {
+    XELOGI(
+        "GPU memory: pressure {} -> {} ({} MB free, using {} MB/s, {} s of "
+        "headroom left)",
+        GetPressureName(old_pressure), GetPressureName(new_pressure),
+        free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
+        int64_t(consumption_bytes_per_second_) >> 20,
+        seconds_to_floor >= 1.0e8 ? -1 : int64_t(seconds_to_floor));
+  }
+
+  if (new_pressure != Pressure::kCritical) {
+    // Elevated is handled by the caches themselves giving back what has aged
+    // out - gradually, and only what nothing is using. Taking memory by force
+    // is reserved for critical.
     return;
   }
 
@@ -104,7 +229,15 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
     return;
   }
 
-  uint64_t bytes_to_free = kTargetFreeBytes - free_bytes + kTrimHeadroomBytes;
+  // Ask for enough to buy back a comfortable amount of TIME at the observed
+  // rate, not a fixed number of megabytes: the same shortfall means something
+  // very different at 5 MB/s and at 200 MB/s.
+  uint64_t bytes_to_free = uint64_t(std::max(
+      0.0, consumption_bytes_per_second_ * kTrimTargetSecondsOfHeadroom));
+  if (free_bytes < kFloorFreeBytes) {
+    bytes_to_free += kFloorFreeBytes - free_bytes;
+  }
+  bytes_to_free = std::clamp(bytes_to_free, kMinTrimBytes, kMaxTrimBytes);
   uint64_t total_before = GetTotalUsage();
   uint64_t released_total = 0;
 
@@ -127,12 +260,17 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   }
 
   last_trim_submission_ = submission_index;
+  ++total_trims_;
+  total_released_bytes_ += released_total;
   if (released_total) {
     XELOGI(
-        "GPU memory: freed {} MB total to get back to {} MB of headroom "
+        "GPU memory: freed {} MB, buying back about {} s at the current rate "
         "(caches held {} MB, host had {} MB free)",
-        released_total >> 20, kTargetFreeBytes >> 20, total_before >> 20,
-        free_bytes >> 20);
+        released_total >> 20,
+        consumption_bytes_per_second_ > 0.0
+            ? int64_t(double(released_total) / consumption_bytes_per_second_)
+            : 0,
+        total_before >> 20, free_bytes >> 20);
   } else {
     // Nothing could be given up: everything still in use. Reporting it is
     // what tells a memory problem apart from a leak.

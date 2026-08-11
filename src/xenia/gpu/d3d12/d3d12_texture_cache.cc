@@ -1008,8 +1008,13 @@ uint64_t D3D12TextureCache::ReleaseIdleScaledResolveRegionsForArbiter(
   }
   uint64_t completed_submission = command_processor_.GetCompletedSubmission();
   uint64_t released_bytes = 0;
+  // bytes_to_free == 0 means "everything that qualifies as idle" - used by the
+  // memory core's release-on-sight pass, where the point is not to hit a
+  // number but to not hold what the next resolve would regenerate anyway.
+  bool release_all_idle = bytes_to_free == 0;
   for (auto it = scaled_resolve_regions_.begin();
-       it != scaled_resolve_regions_.end() && released_bytes < bytes_to_free;) {
+       it != scaled_resolve_regions_.end() &&
+       (release_all_idle || released_bytes < bytes_to_free);) {
     if (it->last_use_submission + kScaledResolveRegionIdleSubmissions >
         completed_submission) {
       ++it;
