@@ -226,6 +226,11 @@ class GpuMemoryArbiter {
   uint64_t last_trend_time_ms_ = 0;
   double consumption_bytes_per_second_ = 0.0;
   static constexpr double kRateSmoothing = 0.25;
+  // The baseline the rate is measured over. Streaming makes free memory rise
+  // and fall constantly; anything shorter than this measures the wobble rather
+  // than the direction, which read as 56 MB/s of consumption in a session
+  // where memory ended where it started.
+  static constexpr double kTrendWindowSeconds = 10.0;
   // Totals since startup, for the periodic report - a trim that keeps
   // happening is a different problem from one that happened once.
   uint64_t total_trims_ = 0;

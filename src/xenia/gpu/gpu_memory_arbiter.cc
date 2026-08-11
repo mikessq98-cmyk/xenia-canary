@@ -130,7 +130,13 @@ double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
     return kInfinite;
   }
   double elapsed_seconds = double(now_ms - last_trend_time_ms_) / 1000.0;
-  if (elapsed_seconds < 0.05) {
+  // Measure over a long baseline, not between consecutive polls. A Dark Souls
+  // II session sat between 1345 and 1388 MB free for twenty minutes - not
+  // falling at all - while consecutive samples read 56 MB/s and put the core
+  // in elevated almost permanently: 58 trims where none were needed. Memory
+  // that goes down and back up is not consumption, and only a window long
+  // enough to contain both halves of that can tell the difference.
+  if (elapsed_seconds < kTrendWindowSeconds) {
     return consumption_bytes_per_second_ > 0.0
                ? double(free_bytes > kFloorFreeBytes
                             ? free_bytes - kFloorFreeBytes
@@ -138,16 +144,14 @@ double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
                      consumption_bytes_per_second_
                : kInfinite;
   }
-  // Positive when free memory is falling.
+  // Positive when free memory is genuinely lower than a whole window ago.
   double delta = double(int64_t(last_trend_free_bytes_) - int64_t(free_bytes));
-  double instant_rate = delta / elapsed_seconds;
+  double window_rate = delta / elapsed_seconds;
   last_trend_free_bytes_ = free_bytes;
   last_trend_time_ms_ = now_ms;
-  // Smoothed, because one poll that happens to straddle a level load reads as
-  // hundreds of MB/s and would trigger a panic trim over nothing.
   consumption_bytes_per_second_ =
       consumption_bytes_per_second_ * (1.0 - kRateSmoothing) +
-      instant_rate * kRateSmoothing;
+      window_rate * kRateSmoothing;
   if (consumption_bytes_per_second_ <= 0.0) {
     // Not falling - memory is being returned faster than taken.
     return kInfinite;
