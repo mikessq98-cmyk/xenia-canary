@@ -391,7 +391,13 @@ class PipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     inline bool operator==(const PipelineDescription& other) const;
-    static constexpr uint32_t kVersion = 0x20260716;
+    // 20260811: descriptions are canonicalized before hashing
+    // (NormalizePipelineDescription), so a description written by an earlier
+    // build hashes differently from the same state today. Without the bump the
+    // stored pipelines load under their old hashes, every draw then misses and
+    // waits for a pipeline to be built again, and the geometry is missing until
+    // it is - which is exactly what a second launch looked like.
+    static constexpr uint32_t kVersion = 0x20260811;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {

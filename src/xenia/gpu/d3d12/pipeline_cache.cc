@@ -141,7 +141,7 @@ DEFINE_bool(
 
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
-    d3d12_pipeline_library, true,
+    d3d12_pipeline_library, false,
     "Keep the driver's COMPILED pipelines in a D3D12 pipeline library on disk, "
     "next to the shader storage, and reuse them on later launches.\n"
     "The shader storage alone only records which pipelines a game needs - the "
@@ -151,7 +151,12 @@ DEFINE_bool(
     "the library, a second launch of the same game creates them almost "
     "instantly.\n"
     "The library is rejected by the runtime after a driver update (its "
-    "contents are driver-specific); that is detected and it is simply rebuilt.",
+    "contents are driver-specific); that is detected and it is simply rebuilt.\n"
+    "OFF by default because it still crashes this console's driver even with "
+    "the D3D12_FEATURE_SHADER_CACHE support query that was added after it first "
+    "killed the device before the first draw. The query says the feature is "
+    "supported and it dies anyway, so there is nothing left to check before "
+    "using it - only a report that it works.",
     "D3D12");
 
 DEFINE_bool(
