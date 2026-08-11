@@ -1,7 +1,13 @@
 add_library(xenia-gpu STATIC)
 xe_platform_sources(xenia-gpu ${CMAKE_CURRENT_SOURCE_DIR})
-if(APPLE)
-  # No Vulkan/SPIR-V backend on macOS — remove spirv_* sources
+# No Vulkan/SPIR-V backend on macOS, and none in the UWP App Container either
+# (Xbox is D3D12-only) - third_party only defines the glslang-spirv target for
+# the platforms that have one. UWP was missing from this condition, so it linked
+# a target that does not exist there; CMake took the name for a plain library
+# and propagated "glslang-spirv.lib" PUBLIC, out through xenia-app, and the
+# executable could not be linked (LNK1181).
+if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+  # Remove spirv_* sources - nothing links the SPIR-V builder they need.
   get_target_property(_gpu_srcs xenia-gpu SOURCES)
   list(FILTER _gpu_srcs EXCLUDE REGEX "spirv_")
   set_target_properties(xenia-gpu PROPERTIES SOURCES "${_gpu_srcs}")
