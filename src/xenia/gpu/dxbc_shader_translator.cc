@@ -75,6 +75,22 @@ DEFINE_bool(
 
 #if XE_PLATFORM_WINRT
 DEFINE_int32(
+    dxbc_switch_chunk_labels, 0,
+    "Xbox UWP only, effective with dxbc_switch=true: split the control-flow "
+    "dispatcher into nested switches of at most this many guest labels each, "
+    "instead of emitting one switch with a case per label.\n"
+    "The console's shader compiler crashes on a switch with hundreds of cases "
+    "inside a loop. dxbc_switch_max_labels handles that by giving up on switch "
+    "entirely for such a shader and falling back to if-based flow, which costs "
+    "both codegen quality and the AMD driver stability that switch was chosen "
+    "for. Chunking keeps switch and simply never hands the compiler an "
+    "oversized one: the chunks nest as if/else on a range test, so exactly one "
+    "runs per iteration of the main loop and dispatch behaviour is unchanged.\n"
+    "0 disables chunking (dxbc_switch_max_labels then applies as before). 256 "
+    "is a reasonable starting point; smaller chunks mean more range tests, "
+    "larger ones approach what the compiler refused.",
+    "GPU");
+DEFINE_int32(
     dxbc_switch_max_labels, 512,
     "Xbox UWP only, effective with dxbc_switch=true: shaders with more guest "
     "control-flow labels than this are translated with if-based flow control "
@@ -260,13 +276,57 @@ bool DxbcShaderTranslator::UseSwitchForControlFlow() const {
   // persistent depends on it (only the ucode and pipeline descriptions are
   // stored, DXBC is retranslated every run).
   if (use_switch && !is_depth_only_pixel_shader_ &&
-      cvars::dxbc_switch_max_labels > 0 &&
+      !IsSwitchChunkingEnabled() && cvars::dxbc_switch_max_labels > 0 &&
       current_shader().label_addresses().size() >
           size_t(cvars::dxbc_switch_max_labels)) {
     use_switch = false;
   }
 #endif  // XE_PLATFORM_WINRT
   return use_switch;
+}
+
+bool DxbcShaderTranslator::IsSwitchChunkingEnabled() const {
+#if XE_PLATFORM_WINRT
+  // Only worth it when the shader would otherwise exceed what the console
+  // compiler takes in one switch - a small shader gets a single chunk and the
+  // exact code it got before.
+  return cvars::dxbc_switch && cvars::dxbc_switch_chunk_labels > 0 &&
+         !is_depth_only_pixel_shader_ &&
+         vendor_id_ != ui::GraphicsProvider::GpuVendorID::kIntel;
+#else
+  return false;
+#endif
+}
+
+uint32_t DxbcShaderTranslator::GetSwitchChunkSize() const {
+  return IsSwitchChunkingEnabled()
+             ? uint32_t(cvars::dxbc_switch_chunk_labels)
+             : 0;
+}
+
+void DxbcShaderTranslator::OpenSwitchChunk(uint32_t first_cf_index) {
+  // Guard the chunk with a range test so only one chunk's switch is entered
+  // per iteration of the main loop. The last chunk needs no test - it is the
+  // else of the previous one, so anything that reaches it belongs to it.
+  uint32_t chunk_size = GetSwitchChunkSize();
+  uint32_t label_count = uint32_t(current_shader().label_addresses().size());
+  bool is_last_chunk = first_cf_index + chunk_size >= label_count;
+  if (!is_last_chunk) {
+    uint32_t chunk_end = first_cf_index + chunk_size;
+    uint32_t test_temp = PushSystemTemp();
+    a_.OpULT(dxbc::Dest::R(test_temp, 0b0001),
+             dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY),
+             dxbc::Src::LU(chunk_end));
+    a_.OpIf(true, dxbc::Src::R(test_temp, dxbc::Src::kXXXX));
+    PopSystemTemp();
+    ++switch_chunk_open_ifs_;
+  }
+  a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
+}
+
+void DxbcShaderTranslator::CloseSwitchChunk() {
+  a_.OpBreak();
+  a_.OpEndSwitch();
 }
 
 bool DxbcShaderTranslator::UseSwitchBreakDispatch() const {
@@ -1115,7 +1175,13 @@ void DxbcShaderTranslator::StartTranslation() {
   }
   // Switch and the first label (pc == 0).
   if (UseSwitchForControlFlow()) {
-    a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
+    switch_chunk_open_ifs_ = 0;
+    switch_chunk_current_ = 0;
+    if (IsSwitchChunkingEnabled()) {
+      OpenSwitchChunk(0);
+    } else {
+      a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
+    }
     a_.OpCase(dxbc::Src::LU(0));
   } else {
     a_.OpIf(false, dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
@@ -1257,6 +1323,13 @@ void DxbcShaderTranslator::CompleteShaderCode() {
       }
       a_.OpBreak();
       a_.OpEndSwitch();
+      // Close the range tests that split the dispatcher into chunks. One per
+      // chunk boundary, innermost first - the last chunk was the else of the
+      // one before it and opened no test of its own.
+      while (switch_chunk_open_ifs_) {
+        a_.OpEndIf();
+        --switch_chunk_open_ifs_;
+      }
       if (UseSwitchBreakDispatch()) {
         // In break dispatch, control reaches this point after EVERY case (a
         // label jump breaks out of the switch), so the main loop may only be
@@ -1973,6 +2046,23 @@ void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
       // Close the previous label (in break dispatch, JumpToLabel itself ends
       // with the case-terminating break).
       a_.OpBreak();
+    }
+    uint32_t chunk_size = GetSwitchChunkSize();
+    if (chunk_size && (cf_index / chunk_size) != switch_chunk_current_) {
+      // This label starts a new chunk. One switch with hundreds of cases is
+      // what the console's shader compiler cannot take; several smaller ones,
+      // each behind a range test, produce the same dispatch without ever
+      // handing it an oversized switch - and without falling back to if-based
+      // flow for the whole shader, which is what happened before and costs
+      // both codegen quality and AMD driver stability.
+      // The nesting is if/else, so exactly one chunk runs per iteration:
+      // `break` inside a case always targets its own switch (there are no
+      // inner loops or switches in a case), leaves it, falls out of the ifs,
+      // and the main loop re-enters with the updated pc.
+      switch_chunk_current_ = cf_index / chunk_size;
+      CloseSwitchChunk();
+      a_.OpElse();
+      OpenSwitchChunk(switch_chunk_current_ * chunk_size);
     }
     // Go to the next label.
     a_.OpCase(dxbc::Src::LU(cf_index));

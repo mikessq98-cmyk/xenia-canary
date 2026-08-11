@@ -729,6 +729,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // miscompile into GPU-hanging code (DEVICE_HUNG with different pipelines
   // each time - a systemic codegen issue, not per-shader).
   bool UseSwitchBreakDispatch() const;
+
+  // Whether the dispatcher switch is split into several smaller ones, so the
+  // console's compiler is never handed one with hundreds of cases - see
+  // dxbc_switch_chunk_labels.
+  bool IsSwitchChunkingEnabled() const;
+  uint32_t GetSwitchChunkSize() const;
+  // Emits the range test (except for the last chunk, which is the else of the
+  // previous one) and opens the chunk's switch.
+  void OpenSwitchChunk(uint32_t first_cf_index);
+  void CloseSwitchChunk();
+  // Range tests currently open, closed together at the end of the shader.
+  uint32_t switch_chunk_open_ifs_ = 0;
+  uint32_t switch_chunk_current_ = 0;
   // Whether to emit the main-loop iteration watchdog (see
   // system_temp_main_loop_guard_).
   bool UseMainLoopGuard() const;
