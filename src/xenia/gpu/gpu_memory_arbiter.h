@@ -166,8 +166,22 @@ class GpuMemoryArbiter {
   //    how long that leaves. Reacting to the slope means the release happens
   //    early enough to be gradual and cheap, rather than as an emergency.
   //
-  // Only the last-resort floor is absolute, because below it allocations start
-  // failing outright and there is nothing left to predict.
+  // Trend alone is NOT enough, and a Dark Souls II session at 3x3 proved it:
+  // pressure went to none at 784 MB free because consumption had slowed to
+  // 16 MB/s, which extrapolated to 24 seconds of headroom - and then a single
+  // scaled-resolve region took the lot at once. The log after that is 1010
+  // failed upload buffers, 1290 dropped draws, and the shader compiler
+  // crashing out of memory. A rate says nothing about an allocation that has
+  // not happened yet, and at a draw resolution scale the individual
+  // allocations are enormous.
+  //
+  // So the level is the WORSE of two readings: what the trend predicts, and
+  // where the free memory is in absolute terms. The trend catches a slow
+  // slide early, when releasing is cheap; the absolute levels catch a step
+  // that no rate could have foreseen. Neither replaces the other.
+  static constexpr uint64_t kElevatedFreeBytes = UINT64_C(1024) << 20;
+  static constexpr uint64_t kCriticalFreeBytes = UINT64_C(640) << 20;
+  // Below this allocations are already failing - nothing left to predict.
   static constexpr uint64_t kFloorFreeBytes = UINT64_C(384) << 20;
   // Start giving memory back when the current rate of consumption would reach
   // the floor within this long. Chosen so that a release is spread over many

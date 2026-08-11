@@ -190,27 +190,44 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   // gradual and cheap instead of an emergency.
   double seconds_to_floor = UpdateTrendAndGetSecondsToFloor(free_bytes);
 
+  // The worse of the two readings. The trend sees a slow slide coming while
+  // releasing is still cheap; the absolute level sees what no rate can - the
+  // next single allocation. At a draw resolution scale one scaled-resolve
+  // region is worth many seconds of the average rate, so a comfortable
+  // extrapolation is not evidence that the memory is there.
+  Pressure by_trend;
+  if (seconds_to_floor <= kCriticalSecondsToFloor) {
+    by_trend = Pressure::kCritical;
+  } else if (seconds_to_floor <= kElevatedSecondsToFloor) {
+    by_trend = Pressure::kElevated;
+  } else {
+    by_trend = Pressure::kNone;
+  }
+  Pressure by_level;
+  if (free_bytes <= kCriticalFreeBytes) {
+    by_level = Pressure::kCritical;
+  } else if (free_bytes <= kElevatedFreeBytes) {
+    by_level = Pressure::kElevated;
+  } else {
+    by_level = Pressure::kNone;
+  }
   Pressure new_pressure;
   if (free_bytes == UINT64_MAX) {
     new_pressure = Pressure::kNone;
-  } else if (free_bytes <= kFloorFreeBytes ||
-             seconds_to_floor <= kCriticalSecondsToFloor) {
-    new_pressure = Pressure::kCritical;
-  } else if (seconds_to_floor <= kElevatedSecondsToFloor) {
-    new_pressure = Pressure::kElevated;
   } else {
-    new_pressure = Pressure::kNone;
+    new_pressure = std::max(by_trend, by_level);
   }
   Pressure old_pressure = pressure_.exchange(new_pressure,
                                              std::memory_order_relaxed);
   if (new_pressure != old_pressure) {
     XELOGI(
         "GPU memory: pressure {} -> {} ({} MB free, using {} MB/s, {} s of "
-        "headroom left)",
+        "headroom by trend; trend says {}, level says {})",
         GetPressureName(old_pressure), GetPressureName(new_pressure),
         free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
         int64_t(consumption_bytes_per_second_) >> 20,
-        seconds_to_floor >= 1.0e8 ? -1 : int64_t(seconds_to_floor));
+        seconds_to_floor >= 1.0e8 ? -1 : int64_t(seconds_to_floor),
+        GetPressureName(by_trend), GetPressureName(by_level));
   }
 
   if (new_pressure != Pressure::kCritical) {
