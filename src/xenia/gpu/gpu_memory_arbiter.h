@@ -151,10 +151,22 @@ class GpuMemoryArbiter {
   // Update. A level load can take gigabytes between two ordinary polls.
   static constexpr uint64_t kFastPollIntervalSubmissions = 4;
   static constexpr uint64_t kFastConsumptionBytesPerSecond = UINT64_C(64) << 20;
-  // After a trim, growth is left alone for this long. Without the pause the
-  // caches simply re-fill and the arbiter trims again a few submissions later,
-  // which is the oscillation this class exists to stop.
-  static constexpr uint64_t kTrimCooldownSubmissions = 240;
+  // After a trim, growth is left alone for this long. Short because a pass no
+  // longer releases much: many small releases spread over time cost nothing
+  // visible, while one large one is a stall. The long pause that used to be
+  // here existed only because a pass could free hundreds of megabytes at once.
+  static constexpr uint64_t kTrimCooldownSubmissions = 16;
+  // The most one pass may release. Freeing 563 MB in a single pass - measured
+  // in GTA IV, 404 MB of it textures - destroys hundreds of resources on the
+  // command processor thread and resets every texture binding, which is felt
+  // as a jerk. It also overshoots: the same session then showed memory coming
+  // straight back (a NEGATIVE consumption rate), meaning the game reloaded
+  // what had just been thrown away. Small bites, taken more often, reach the
+  // same place without either.
+  static constexpr uint64_t kMaxTrimPerPassBytes = UINT64_C(64) << 20;
+  // Even smaller in the elevated band, where nothing is urgent yet - the point
+  // there is to meet the shortage with releases nobody can feel.
+  static constexpr uint64_t kElevatedTrimPerPassBytes = UINT64_C(16) << 20;
 
   // Fixed thresholds are the wrong instrument and were removed. A number like
   // "trim below 768 MB free" is either too early - throwing away work while
@@ -196,12 +208,15 @@ class GpuMemoryArbiter {
   // fixed number of megabytes - the same shortfall means something very
   // different when memory is falling at 5 MB/s and at 200 MB/s.
   static constexpr double kTrimTargetSecondsOfHeadroom = 45.0;
-  // Sanity bounds on any single trim, so a wild rate estimate (a one-off
-  // allocation spike, a stalled poll) cannot ask for absurd amounts.
-  static constexpr uint64_t kMinTrimBytes = UINT64_C(64) << 20;
+  // Sanity bounds on what a trim may ask for before the per-pass cap applies.
+  static constexpr uint64_t kMinTrimBytes = UINT64_C(16) << 20;
   static constexpr uint64_t kMaxTrimBytes = UINT64_C(1024) << 20;
 
   std::atomic<Pressure> pressure_{Pressure::kNone};
+  // Consecutive polls that wanted a lower level - see the hysteresis in
+  // Update. Rising is immediate; falling has to be sustained.
+  uint32_t pressure_relief_polls_ = 0;
+  static constexpr uint32_t kPollsBeforeRelief = 4;
   uint64_t last_poll_submission_ = 0;
   uint64_t last_trim_submission_ = 0;
   uint64_t last_free_bytes_ = UINT64_MAX;

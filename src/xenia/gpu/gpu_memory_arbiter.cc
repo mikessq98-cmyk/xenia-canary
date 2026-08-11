@@ -228,6 +228,22 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   } else {
     new_pressure = std::max(by_trend, by_level);
   }
+  // Hysteresis. A Dark Souls II session sat at 727-735 MB free while the rate
+  // wobbled between 45 and 58 MB/s, and the level flapped
+  // critical->elevated->critical->elevated - each visit to critical starting
+  // another trim over a few megabytes of difference. Rising is immediate,
+  // because a shortage must be acted on at once; falling waits for the
+  // improvement to hold, so noise around a boundary cannot drive the caches.
+  Pressure previous = pressure_.load(std::memory_order_relaxed);
+  if (new_pressure < previous) {
+    if (++pressure_relief_polls_ < kPollsBeforeRelief) {
+      new_pressure = previous;
+    } else {
+      pressure_relief_polls_ = 0;
+    }
+  } else {
+    pressure_relief_polls_ = 0;
+  }
   Pressure old_pressure = pressure_.exchange(new_pressure,
                                              std::memory_order_relaxed);
   if (new_pressure != old_pressure) {
@@ -241,10 +257,7 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
         GetPressureName(by_trend), GetPressureName(by_level));
   }
 
-  if (new_pressure != Pressure::kCritical) {
-    // Elevated is handled by the caches themselves giving back what has aged
-    // out - gradually, and only what nothing is using. Taking memory by force
-    // is reserved for critical.
+  if (new_pressure == Pressure::kNone) {
     return;
   }
 
@@ -265,7 +278,20 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   if (free_bytes < kFloorFreeBytes) {
     bytes_to_free += kFloorFreeBytes - free_bytes;
   }
+  if (new_pressure == Pressure::kElevated) {
+    // Elevated is the smoothing band. Give back a little on every pass, well
+    // before anything is urgent, so the shortage is met by a series of
+    // releases nobody can feel rather than by one that stalls a frame. The
+    // caches also age out their own idle contents here; this is the part that
+    // keeps up when they cannot.
+    bytes_to_free = std::min(bytes_to_free, kElevatedTrimPerPassBytes);
+  }
   bytes_to_free = std::clamp(bytes_to_free, kMinTrimBytes, kMaxTrimBytes);
+  // Take it in bites. Reaching the target over several passes a few
+  // submissions apart is invisible; reaching it in one is a stall the length
+  // of destroying hundreds of resources, and it overshoots - the game reloads
+  // what was thrown away, which is worse than not having released it.
+  bytes_to_free = std::min(bytes_to_free, kMaxTrimPerPassBytes);
   uint64_t total_before = GetTotalUsage();
   uint64_t released_total = 0;
 
