@@ -86,6 +86,10 @@ DEFINE_int32(
     "for. Chunking keeps switch and simply never hands the compiler an "
     "oversized one: the chunks nest as if/else on a range test, so exactly one "
     "runs per iteration of the main loop and dispatch behaviour is unchanged.\n"
+    "This is the MAXIMUM per switch, not the chunk size - each shader's actual "
+    "chunk size is derived from its own label count, so the labels spread "
+    "evenly over the fewest chunks that stay under this and a shader that fits "
+    "in one switch gets no range test at all.\n"
     "0 disables chunking (dxbc_switch_max_labels then applies as before). 256 "
     "is a reasonable starting point; smaller chunks mean more range tests, "
     "larger ones approach what the compiler refused.",
@@ -299,20 +303,63 @@ bool DxbcShaderTranslator::IsSwitchChunkingEnabled() const {
 }
 
 uint32_t DxbcShaderTranslator::GetSwitchChunkSize() const {
-  return IsSwitchChunkingEnabled()
-             ? uint32_t(cvars::dxbc_switch_chunk_labels)
-             : 0;
+  if (!IsSwitchChunkingEnabled()) {
+    return 0;
+  }
+  uint32_t label_count = uint32_t(current_shader().label_addresses().size());
+  if (!label_count) {
+    return 0;
+  }
+  uint32_t max_per_chunk = uint32_t(cvars::dxbc_switch_chunk_labels);
+  if (label_count <= max_per_chunk) {
+    // Fits in one switch - this shader gets exactly the code it got before
+    // chunking existed, with no range test around it at all.
+    return label_count;
+  }
+  // The chunk size is the shader's own property, not the setting: the fewest
+  // chunks that keep every switch under what the compiler takes, with the
+  // labels spread evenly over them. Using the setting as the size directly
+  // leaves a ragged remainder - 260 labels became a chunk of 256 and a chunk of
+  // 4, and that second switch costs a whole range test to dispatch four cases.
+  uint32_t chunk_count = (label_count + max_per_chunk - 1) / max_per_chunk;
+  return (label_count + chunk_count - 1) / chunk_count;
 }
 
-void DxbcShaderTranslator::OpenSwitchChunk(uint32_t first_cf_index) {
+void DxbcShaderTranslator::BuildSwitchChunkBounds() {
+  switch_chunk_bounds_.clear();
+  switch_chunk_current_ = 0;
+  uint32_t chunk_size = GetSwitchChunkSize();
+  if (!chunk_size) {
+    return;
+  }
+  // Chunking has to split the CASES evenly, and the guest control-flow indices
+  // the cases are labelled with are sparse - a shader with 600 labels may
+  // spread them over indices 0 to 1200. Dividing an index by the chunk size
+  // (which is what this did before) therefore chunks by index RANGE, so how
+  // many cases land in a switch depends on how the game happened to lay its
+  // labels out, and the number the whole mechanism exists to bound is not
+  // bounded at all. Taking every chunk_size'th entry of the shader's own
+  // (sorted) label list gives each switch exactly that many cases, whatever the
+  // spacing, and the boundaries are real control-flow indices the range test
+  // can compare the program counter against.
+  const std::set<uint32_t>& labels = current_shader().label_addresses();
+  uint32_t ordinal = 0;
+  for (uint32_t label_cf_index : labels) {
+    if ((ordinal % chunk_size) == 0) {
+      switch_chunk_bounds_.push_back(label_cf_index);
+    }
+    ++ordinal;
+  }
+}
+
+void DxbcShaderTranslator::OpenSwitchChunk(uint32_t chunk_index) {
   // Guard the chunk with a range test so only one chunk's switch is entered
   // per iteration of the main loop. The last chunk needs no test - it is the
   // else of the previous one, so anything that reaches it belongs to it.
-  uint32_t chunk_size = GetSwitchChunkSize();
-  uint32_t label_count = uint32_t(current_shader().label_addresses().size());
-  bool is_last_chunk = first_cf_index + chunk_size >= label_count;
+  bool is_last_chunk = size_t(chunk_index) + 1 >= switch_chunk_bounds_.size();
   if (!is_last_chunk) {
-    uint32_t chunk_end = first_cf_index + chunk_size;
+    // Where the next chunk starts - the first label it holds.
+    uint32_t chunk_end = switch_chunk_bounds_[chunk_index + 1];
     uint32_t test_temp = PushSystemTemp();
     a_.OpULT(dxbc::Dest::R(test_temp, 0b0001),
              dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY),
@@ -1177,7 +1224,8 @@ void DxbcShaderTranslator::StartTranslation() {
   if (UseSwitchForControlFlow()) {
     switch_chunk_open_ifs_ = 0;
     switch_chunk_current_ = 0;
-    if (IsSwitchChunkingEnabled()) {
+    BuildSwitchChunkBounds();
+    if (!switch_chunk_bounds_.empty()) {
       OpenSwitchChunk(0);
     } else {
       a_.OpSwitch(dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kYYYY));
@@ -2047,22 +2095,23 @@ void DxbcShaderTranslator::ProcessLabel(uint32_t cf_index) {
       // with the case-terminating break).
       a_.OpBreak();
     }
-    uint32_t chunk_size = GetSwitchChunkSize();
-    if (chunk_size && (cf_index / chunk_size) != switch_chunk_current_) {
-      // This label starts a new chunk. One switch with hundreds of cases is
-      // what the console's shader compiler cannot take; several smaller ones,
-      // each behind a range test, produce the same dispatch without ever
-      // handing it an oversized switch - and without falling back to if-based
-      // flow for the whole shader, which is what happened before and costs
-      // both codegen quality and AMD driver stability.
-      // The nesting is if/else, so exactly one chunk runs per iteration:
-      // `break` inside a case always targets its own switch (there are no
-      // inner loops or switches in a case), leaves it, falls out of the ifs,
-      // and the main loop re-enters with the updated pc.
-      switch_chunk_current_ = cf_index / chunk_size;
+    // Labels are emitted in increasing control-flow index order, so crossing a
+    // chunk boundary means this label starts the next chunk. One switch with
+    // hundreds of cases is what the console's shader compiler cannot take;
+    // several smaller ones, each behind a range test, produce the same dispatch
+    // without ever handing it an oversized switch - and without falling back to
+    // if-based flow for the whole shader, which is what happened before and
+    // costs both codegen quality and AMD driver stability.
+    // The nesting is if/else, so exactly one chunk runs per iteration:
+    // `break` inside a case always targets its own switch (there are no
+    // inner loops or switches in a case), leaves it, falls out of the ifs,
+    // and the main loop re-enters with the updated pc.
+    while (size_t(switch_chunk_current_) + 1 < switch_chunk_bounds_.size() &&
+           cf_index >= switch_chunk_bounds_[switch_chunk_current_ + 1]) {
+      ++switch_chunk_current_;
       CloseSwitchChunk();
       a_.OpElse();
-      OpenSwitchChunk(switch_chunk_current_ * chunk_size);
+      OpenSwitchChunk(switch_chunk_current_);
     }
     // Go to the next label.
     a_.OpCase(dxbc::Src::LU(cf_index));

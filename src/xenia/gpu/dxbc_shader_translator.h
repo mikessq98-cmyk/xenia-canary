@@ -734,14 +734,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // console's compiler is never handed one with hundreds of cases - see
   // dxbc_switch_chunk_labels.
   bool IsSwitchChunkingEnabled() const;
+  // Labels per chunk, derived from THIS shader's label count rather than taken
+  // from the setting - see the definition.
   uint32_t GetSwitchChunkSize() const;
+  // Fills switch_chunk_bounds_ for the current shader. Empty afterwards when
+  // chunking does not apply, which is also how the caller tells.
+  void BuildSwitchChunkBounds();
   // Emits the range test (except for the last chunk, which is the else of the
   // previous one) and opens the chunk's switch.
-  void OpenSwitchChunk(uint32_t first_cf_index);
+  void OpenSwitchChunk(uint32_t chunk_index);
   void CloseSwitchChunk();
   // Range tests currently open, closed together at the end of the shader.
   uint32_t switch_chunk_open_ifs_ = 0;
   uint32_t switch_chunk_current_ = 0;
+  // Guest control-flow index of the first label in each chunk, ascending. The
+  // chunks hold an equal number of CASES, which is what the compiler's limit is
+  // about; the indices themselves are sparse and unevenly spaced.
+  std::vector<uint32_t> switch_chunk_bounds_;
   // Whether to emit the main-loop iteration watchdog (see
   // system_temp_main_loop_guard_).
   bool UseMainLoopGuard() const;
