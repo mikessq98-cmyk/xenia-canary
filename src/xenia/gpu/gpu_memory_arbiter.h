@@ -147,6 +147,10 @@ class GpuMemoryArbiter {
 
   // How often the host is polled. Everything below is in submissions.
   static constexpr uint64_t kPollIntervalSubmissions = 32;
+  // Used while memory is moving fast or headroom is already small - see
+  // Update. A level load can take gigabytes between two ordinary polls.
+  static constexpr uint64_t kFastPollIntervalSubmissions = 4;
+  static constexpr uint64_t kFastConsumptionBytesPerSecond = UINT64_C(64) << 20;
   // After a trim, growth is left alone for this long. Without the pause the
   // caches simply re-fill and the arbiter trims again a few submissions later,
   // which is the oscillation this class exists to stop.

@@ -161,7 +161,18 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   if (consumers_.empty()) {
     return;
   }
-  if (submission_index - last_poll_submission_ < kPollIntervalSubmissions) {
+  // How often to look depends on how fast memory is moving. A GTA IV session
+  // at 3x3 lost 1700 MB between two polls 32 submissions apart - by the time
+  // the next reading arrived there was nothing left to do about it. When
+  // consumption is high, or the remaining headroom is small, the OS query is
+  // cheap compared to being blind through a level load.
+  uint64_t poll_interval = kPollIntervalSubmissions;
+  if (consumption_bytes_per_second_ > double(kFastConsumptionBytesPerSecond) ||
+      (last_free_bytes_ != UINT64_MAX &&
+       last_free_bytes_ < kElevatedFreeBytes)) {
+    poll_interval = kFastPollIntervalSubmissions;
+  }
+  if (submission_index - last_poll_submission_ < poll_interval) {
     return;
   }
   last_poll_submission_ = submission_index;
