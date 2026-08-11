@@ -164,6 +164,10 @@ class GpuMemoryArbiter {
   // what had just been thrown away. Small bites, taken more often, reach the
   // same place without either.
   static constexpr uint64_t kMaxTrimPerPassBytes = UINT64_C(64) << 20;
+  // Under critical pressure a 64 MB bite is too weak to end the shortage, so
+  // the caches stay pegged against their ceilings and hitch continuously -
+  // worse than one honest pause. Recovering properly is the gentler outcome.
+  static constexpr uint64_t kMaxTrimPerPassCriticalBytes = UINT64_C(320) << 20;
   // Even smaller in the elevated band, where nothing is urgent yet - the point
   // there is to meet the shortage with releases nobody can feel.
   static constexpr uint64_t kElevatedTrimPerPassBytes = UINT64_C(16) << 20;

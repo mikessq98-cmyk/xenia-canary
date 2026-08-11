@@ -291,11 +291,22 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
     bytes_to_free = std::min(bytes_to_free, kElevatedTrimPerPassBytes);
   }
   bytes_to_free = std::clamp(bytes_to_free, kMinTrimBytes, kMaxTrimBytes);
-  // Take it in bites. Reaching the target over several passes a few
-  // submissions apart is invisible; reaching it in one is a stall the length
-  // of destroying hundreds of resources, and it overshoots - the game reloads
-  // what was thrown away, which is worse than not having released it.
-  bytes_to_free = std::min(bytes_to_free, kMaxTrimPerPassBytes);
+  // Take it in bites, sized by urgency. Reaching the target over several
+  // passes a few submissions apart is invisible; reaching it in one is a stall
+  // the length of destroying hundreds of resources, and it overshoots - the
+  // game reloads what was thrown away.
+  //
+  // But a bite that is too small for the shortage is worse than either: Black
+  // Ops spent a whole session with its texture cache pegged at the hard limit
+  // while passes released 16 MB each, so the caches scraped along their
+  // ceilings continuously and the game hitched the entire time. Elevated stays
+  // gentle - there is time for many small bites. Critical is allowed to
+  // actually end the shortage, because recovering properly is what stops the
+  // hitching.
+  uint64_t per_pass_cap = new_pressure == Pressure::kCritical
+                              ? kMaxTrimPerPassCriticalBytes
+                              : kMaxTrimPerPassBytes;
+  bytes_to_free = std::min(bytes_to_free, per_pass_cap);
   uint64_t total_before = GetTotalUsage();
   uint64_t released_total = 0;
 

@@ -18,21 +18,6 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
-#if XE_PLATFORM_WINRT
-// The stock 384/768 MB budget is sized for a desktop where the texture cache
-// competes with everything else on the machine. Here the GPU budget is over
-// 4 GB and roughly 1.2 GB of it goes to everything that isn't textures, so
-// evicting at 768 MB throws away textures the title is still drawing with
-// while gigabytes sit unused - and refilling them blocks the command processor
-// for tens of milliseconds each time. Real memory pressure is the memory
-// arbiter's call (it can see the whole process, not just this cache); these
-// are only a backstop for the case where it never gets to run.
-#define XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT 1024
-#define XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT 1536
-#else
-#define XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT 384
-#define XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT 768
-#endif  // XE_PLATFORM_WINRT
 
 DEFINE_int32(
     draw_resolution_scale_x, 1,
@@ -54,21 +39,6 @@ DEFINE_int32(
     "See draw_resolution_scale_x for more information.",
     "GPU");
 DEFINE_uint32(
-    texture_cache_memory_limit_soft, XE_TEXTURE_CACHE_LIMIT_SOFT_DEFAULT,
-    "Maximum host texture memory usage (in megabytes) above which old textures "
-    "will be destroyed.",
-    "GPU");
-DEFINE_uint32(
-    texture_cache_memory_limit_soft_lifetime, 30,
-    "Seconds a texture should be unused to be considered old enough to be "
-    "deleted if texture memory usage exceeds texture_cache_memory_limit_soft.",
-    "GPU");
-DEFINE_uint32(
-    texture_cache_memory_limit_hard, XE_TEXTURE_CACHE_LIMIT_HARD_DEFAULT,
-    "Maximum host texture memory usage (in megabytes) above which textures "
-    "will be destroyed as soon as possible.",
-    "GPU");
-DEFINE_uint32(
     texture_cache_idle_eviction_seconds, 45,
     "Seconds a texture has to go unused before it is released even though "
     "there is no shortage of host memory and the cache is under its limits.\n"
@@ -79,16 +49,6 @@ DEFINE_uint32(
     "processor reloading textures mid-frame - from ever running.\n"
     "0 disables this and keeps everything until a limit or the memory arbiter "
     "forces a release.",
-    "GPU");
-DEFINE_uint32(
-    texture_cache_memory_limit_render_to_texture, 24,
-    "Part of the host texture memory budget (in megabytes) that will be scaled "
-    "by the current drawing resolution scale.\n"
-    "If texture_cache_memory_limit_soft, for instance, is 384, and this is 24, "
-    "it will be assumed that the game will be using roughly 24 MB of "
-    "render-to-texture (resolve) targets and 384 - 24 = 360 MB of regular "
-    "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
-    "96 MB, and with 3x3, it will be 360 + 216 MB.",
     "GPU");
 DEFINE_bool(tiled_shared_memory, true,
             "Enable tiled/sparse resources for efficient large address space "
@@ -228,95 +188,71 @@ void TextureCache::ClearCache() { DestroyAllTextures(); }
 
 void TextureCache::CompletedSubmissionUpdated(
     uint64_t completed_submission_index) {
-  // If memory usage is too high, destroy unused textures.
   uint64_t current_time = xe::Clock::QueryHostUptimeMillis();
-  // texture_cache_memory_limit_render_to_texture is assumed to be included in
-  // texture_cache_memory_limit_soft and texture_cache_memory_limit_hard, at 1x,
-  // so subtracting 1 from the scale.
-  uint32_t limit_scaled_resolve_add_mb =
-      cvars::texture_cache_memory_limit_render_to_texture *
-      (draw_resolution_scale_x() * draw_resolution_scale_y() - 1);
-  uint32_t limit_soft_mb =
-      cvars::texture_cache_memory_limit_soft + limit_scaled_resolve_add_mb;
-  uint32_t limit_hard_mb =
-      cvars::texture_cache_memory_limit_hard + limit_scaled_resolve_add_mb;
-  uint32_t limit_soft_lifetime =
-      cvars::texture_cache_memory_limit_soft_lifetime * 1000;
-  // How long a texture has gone unused is what decides whether it is worth
-  // keeping - not how big the cache happens to be. Evicting on size alone is
-  // what made this cache sit on its own ceiling: it grew into the limit, was
-  // cut back, refilled from guest memory (blocking the command processor
-  // mid-frame each time) and grew into it again, hundreds of times per
-  // session, while gigabytes of host memory sat unused.
+
+  // This cache does NOT decide how much memory it may hold. That is the memory
+  // core's job, and it asks through TrimTexturesForHostMemory when the host
+  // needs something back. Size limits here were the last place where a cache
+  // judged itself against a number of its own, and they contradicted the core
+  // exactly as the other thresholds did before them: Black Ops spent whole
+  // sessions pegged at the hard limit, scraping along its ceiling, while the
+  // core saw no shortage at all.
+  //
+  // What is left is the one question only this cache can answer: has the game
+  // stopped drawing with a texture. Age is the whole policy. Pressure from the
+  // core only decides how impatient to be about it.
   GpuMemoryArbiter::Pressure pressure =
       host_memory_pressure_.load(std::memory_order_relaxed);
-  bool under_pressure = pressure != GpuMemoryArbiter::Pressure::kNone;
   uint64_t idle_eviction_ms =
       uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
-  if (pressure == GpuMemoryArbiter::Pressure::kCritical) {
-    // The host is short right now. Age still decides the ORDER, but the bar
-    // for "old enough" drops to the minimum that keeps the current frame's
-    // textures safe - the arbiter is about to start taking memory anyway, and
-    // what this releases first is cheaper than what it would take.
-    idle_eviction_ms = kMinEvictionAgeMs;
+  switch (pressure) {
+    case GpuMemoryArbiter::Pressure::kElevated:
+      // Memory is wanted soon. Let go of things sooner than usual, still
+      // gradually, so the core rarely has to take anything by force.
+      idle_eviction_ms /= 4;
+      break;
+    case GpuMemoryArbiter::Pressure::kCritical:
+      // Needed now. Everything the current frame is not using goes.
+      idle_eviction_ms = kMinEvictionAgeMs;
+      break;
+    default:
+      break;
+  }
+  if (!idle_eviction_ms) {
+    return;
   }
 
-  // Releasing idle textures a handful at a time, every time a submission
-  // completes, is worse than releasing the same textures in one go: every
-  // eviction calls ResetTextureBindings, so the next draws have to re-bind
-  // everything, and that cost is paid per batch rather than per texture. It
-  // isn't urgent work either - nothing is waiting for this memory, or the
-  // pressure path would be running instead. So let idle textures accumulate
-  // and take them in one pass. Under critical pressure that reasoning is
-  // reversed - something IS waiting - so the batching is skipped.
+  // Releasing a handful every time a submission completes is worse than
+  // releasing the same textures in one go: every eviction pass calls
+  // ResetTextureBindings, so the next draws re-bind everything, and that cost
+  // is per pass rather than per texture. Nothing waits on this memory unless
+  // the core says otherwise - under critical pressure something does, so the
+  // batching is skipped.
   if (pressure != GpuMemoryArbiter::Pressure::kCritical &&
       completed_submission_index <
           last_idle_eviction_submission_ + kIdleEvictionIntervalSubmissions) {
-    idle_eviction_ms = 0;
+    return;
   }
+  last_idle_eviction_submission_ = completed_submission_index;
 
   bool destroyed_any = false;
   uint64_t usage_before = textures_total_host_memory_usage_;
   size_t destroyed_count = 0;
-  const char* reason = "idle";
+  const char* reason =
+      pressure == GpuMemoryArbiter::Pressure::kCritical
+          ? "unused, host memory critical"
+          : (pressure == GpuMemoryArbiter::Pressure::kElevated
+                 ? "unused, host memory wanted"
+                 : "unused for a long time");
   while (texture_used_first_ != nullptr) {
-    uint64_t total_host_memory_usage_mb =
-        (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
-    bool limit_hard_exceeded = total_host_memory_usage_mb > limit_hard_mb;
-    bool limit_soft_exceeded = total_host_memory_usage_mb > limit_soft_mb;
-
     Texture* texture = texture_used_first_;
     if (texture->last_usage_submission_index() > completed_submission_index) {
       break;
     }
-    // The list is in use order, so if the oldest texture isn't old enough to
-    // go, nothing after it is either - every exit below can break.
+    // The list is in use order, so once the oldest is too recent to go,
+    // nothing after it qualifies either.
     uint64_t unused_for_ms = current_time - texture->last_usage_time();
-    if (limit_hard_exceeded) {
-      // Over the emergency ceiling. Still refuse to touch anything drawn in
-      // the last moments: throwing out what the current scene is actively
-      // using guarantees it is reloaded within a frame or two, which is the
-      // stutter this is supposed to prevent.
-      if (unused_for_ms < kMinEvictionAgeMs) {
-        break;
-      }
-      reason = "hard limit";
-    } else if (limit_soft_exceeded && under_pressure) {
-      // Over the soft limit AND the host is actually short on memory. Without
-      // the pressure check this fires purely because the cache is big, which
-      // on a console with gigabytes free is throwing away work for nothing.
-      if (unused_for_ms < limit_soft_lifetime) {
-        break;
-      }
-      reason = "soft limit under memory pressure";
-    } else if (idle_eviction_ms && unused_for_ms >= idle_eviction_ms) {
-      last_idle_eviction_submission_ = completed_submission_index;
-      // Not short of memory and under every limit, but this texture hasn't
-      // been drawn with in a long time - it is very unlikely to come back
-      // before the scene changes, and releasing it early keeps the headroom
-      // that stops the emergency path from ever running.
-      reason = "unused for a long time";
-    } else {
+    if (unused_for_ms < idle_eviction_ms) {
       break;
     }
     if (!destroyed_any) {
