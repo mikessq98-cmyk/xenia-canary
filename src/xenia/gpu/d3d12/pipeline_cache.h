@@ -468,6 +468,12 @@ class PipelineCache {
       PipelineRuntimeDescription& runtime_description_out,
       bool for_placeholder = false);
 
+  // Clears the fields of a description that cannot affect rendering given the
+  // state that governs them (blend factors with the write mask closed, stencil
+  // operations with the test off), so descriptions that differ only in dead
+  // bits hash to the same pipeline instead of each compiling their own.
+  static void NormalizePipelineDescription(PipelineDescription& description);
+
   static bool GetGeometryShaderKey(
       PipelineGeometryShader geometry_shader_type,
       DxbcShaderTranslator::Modification vertex_shader_modification,

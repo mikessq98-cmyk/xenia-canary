@@ -73,6 +73,22 @@ DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
             "D3D12");
 
+DEFINE_bool(
+    d3d12_deduplicate_pipeline_states, true,
+    "Canonicalize the pipeline description before looking a pipeline up, so "
+    "states that cannot render differently share one pipeline.\n"
+    "The description is hashed to find an existing pipeline, so two draws whose "
+    "descriptions differ by a single bit get two pipelines - even when the bit "
+    "is one Direct3D ignores in that configuration, such as a blend factor for "
+    "a render target whose colour write mask is fully closed, or stencil "
+    "operations recorded while the stencil test is off. Each of those costs a "
+    "driver compilation of tens of milliseconds and every draw needing it is "
+    "skipped until it finishes.\n"
+    "Only fields that are dead given the state governing them are cleared, so "
+    "rendering is unaffected. Turn off to compare pipeline counts, or if a "
+    "title ever renders differently with it on.",
+    "D3D12");
+
 #if XE_PLATFORM_WINRT
 DEFINE_bool(
     d3d12_verify_new_draws, true,
@@ -3114,7 +3130,61 @@ bool PipelineCache::GetCurrentStateDescription(
   }
   description_out.host_msaa_samples = host_msaa_samples;
 
+  NormalizePipelineDescription(description_out);
+
   return true;
+}
+
+void PipelineCache::NormalizePipelineDescription(
+    PipelineDescription& description) {
+  if (!cvars::d3d12_deduplicate_pipeline_states) {
+    return;
+  }
+  // The description is hashed to find an existing pipeline, so two draws that
+  // produce byte-different descriptions get two pipelines even when the
+  // difference cannot affect a single pixel - a blend factor recorded for a
+  // render target with the colour write mask fully closed, stencil operations
+  // recorded while the stencil test is off. Each of those is a driver
+  // compilation costing tens of milliseconds and a draw skipped until it
+  // finishes, bought for nothing.
+  //
+  // Zeroing the fields that are dead given the state that governs them makes
+  // the description canonical, so all of them collapse onto ONE pipeline that
+  // is already built. It cannot change rendering: every field cleared here is
+  // one Direct3D itself ignores in that configuration.
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    PipelineRenderTarget& render_target = description.render_targets[i];
+    if (!render_target.used) {
+      // Nothing about an unbound target is read.
+      std::memset(&render_target, 0, sizeof(render_target));
+      continue;
+    }
+    if (!render_target.write_mask) {
+      // Bound, but no channel is written - the blend state is inert.
+      render_target.src_blend = PipelineBlendFactor::kOne;
+      render_target.dest_blend = PipelineBlendFactor::kZero;
+      render_target.blend_op = xenos::BlendOp::kAdd;
+      render_target.src_blend_alpha = PipelineBlendFactor::kOne;
+      render_target.dest_blend_alpha = PipelineBlendFactor::kZero;
+      render_target.blend_op_alpha = xenos::BlendOp::kAdd;
+    }
+  }
+  if (!description.stencil_enable) {
+    description.stencil_read_mask = 0;
+    description.stencil_write_mask = 0;
+    description.stencil_front_fail_op = xenos::StencilOp::kKeep;
+    description.stencil_front_depth_fail_op = xenos::StencilOp::kKeep;
+    description.stencil_front_pass_op = xenos::StencilOp::kKeep;
+    description.stencil_front_func = xenos::CompareFunction::kAlways;
+    description.stencil_back_fail_op = xenos::StencilOp::kKeep;
+    description.stencil_back_depth_fail_op = xenos::StencilOp::kKeep;
+    description.stencil_back_pass_op = xenos::StencilOp::kKeep;
+    description.stencil_back_func = xenos::CompareFunction::kAlways;
+  }
+  // Polygon offset only exists for triangles, and only when it is non-zero.
+  if (description.depth_bias == 0 && description.depth_bias_slope_scaled == 0.0f) {
+    description.depth_bias_slope_scaled = 0.0f;  // normalize -0.0f
+  }
 }
 
 bool PipelineCache::GetGeometryShaderKey(
