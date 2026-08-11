@@ -1040,20 +1040,28 @@ class D3D12TextureCache final : public TextureCache {
   // surfaces, orders of magnitude smaller than this - only merging could ever
   // approach it, and it simply stops merging there.
   static constexpr uint64_t kScaledResolveMaxRegionSize = 1ULL << 31;
-  // Host memory kept free for everything else (the driver's compilation
-  // arenas, textures, render targets) when deciding whether another scaled
-  // resolve region may be committed. Regions are individual surfaces - tens of
-  // megabytes - so this only has to cover a compilation burst; a large reserve
-  // refuses them while the host still has hundreds of megabytes free, and a
-  // refused region means a resolve or texture load is skipped, which shows up
-  // as missing render-to-texture effects.
-  static constexpr uint64_t kScaledResolveHostMemoryReserve = 384ULL << 20;
+  // How much host memory a region may take is NOT decided here. This cache
+  // used to keep its own 384 MB reserve and compare against GlobalMemoryStatusEx
+  // itself, which made it the last cache holding a threshold of its own - and
+  // it was the wrong instrument twice over. It could only ever release its own
+  // idle regions, so when a 336 MB region would not fit it gave up while
+  // 719 MB of render targets and 343 MB of textures sat next to it; and it
+  // never learned that the allocation failed anyway. One Dark Souls II session
+  // at 3x3 failed to create the same region 1287 times, took 307 resolve
+  // destinations down with it and ended in an out-of-memory death, with the
+  // budget check reporting success every single time. The core is asked now -
+  // see GpuMemoryArbiter::TryReserveAllocation and ReportAllocationFailure.
+  //
   // Submissions a region may go unused before it may be released to make room
   // for another one (~a few seconds of gameplay).
   static constexpr uint64_t kScaledResolveRegionIdleSubmissions = 600;
   // Count of committed-path requests refused because no memory could be freed
   // for them. Telemetry / log throttling.
   uint32_t scaled_resolve_budget_skips_ = 0;
+  // Same, for regions the driver refused to create even though the budget said
+  // there was room. Throttles what used to be an unbounded stream of identical
+  // error lines - 1287 of them in one session.
+  uint32_t scaled_resolve_creation_failures_ = 0;
   // Not very big heaps (16 MB) because they are needed pretty sparsely. One
   // 2x-scaled 1280x720x32bpp texture is slighly bigger than 14 MB.
   static constexpr uint32_t kScaledResolveHeapSizeLog2 = 24;

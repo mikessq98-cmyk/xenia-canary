@@ -311,6 +311,13 @@ class TextureCache {
       return last_usage_submission_index_;
     }
     uint64_t last_usage_time() const { return last_usage_time_; }
+    // How many distinct submissions this texture has been drawn with. Time of
+    // last use alone cannot tell a texture the game draws with every frame from
+    // one it touched once on the way past, and both look identical at the head
+    // of a least-recently-used list a couple of frames later - which is why
+    // forced eviction kept taking the working set. Counted in MarkAsUsed, which
+    // relinks at most once per submission.
+    uint32_t used_submission_count() const { return used_submission_count_; }
 
     bool base_outdated(const global_unique_lock_type& global_lock) const {
       return base_outdated_;
@@ -349,6 +356,10 @@ class TextureCache {
     }
 
    private:
+    // The cache owns the usage list this texture links itself into, and walks
+    // it when it has to choose what to evict.
+    friend class TextureCache;
+
     TextureCache& texture_cache_;
 
     TextureKey key_;
@@ -359,6 +370,7 @@ class TextureCache {
 
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
+    uint32_t used_submission_count_ = 1;
     Texture* used_previous_;
     Texture* used_next_;
     // Whether this texture is in the usage tracking list (for LRU eviction).
@@ -719,6 +731,14 @@ class TextureCache {
   // Nothing drawn this recently is evicted, even over the hard limit - it
   // would be reloaded within a frame or two.
   static constexpr uint64_t kMinEvictionAgeMs = 500;
+  // A texture drawn with in at least this many distinct submissions is part of
+  // what the game is rendering, not something streamed past. Forced eviction
+  // takes everything below this first, in least-recently-used order, and only
+  // touches the rest if that was not enough. Small on purpose: two or three
+  // frames of use is already the difference between a surface the game keeps
+  // coming back to and a one-off blit source, and setting it high would protect
+  // so much that the first pass finds nothing.
+  static constexpr uint32_t kFrequentUseSubmissions = 8;
   // Idle eviction is batched rather than run every submission: each eviction
   // pass resets the texture bindings, so a few textures at a time costs far
   // more re-binding than the same textures taken at once. Nothing waits on

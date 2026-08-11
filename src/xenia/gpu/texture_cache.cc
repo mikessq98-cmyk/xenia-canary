@@ -291,32 +291,76 @@ uint64_t TextureCache::TrimTexturesForHostMemory(
     uint64_t bytes_to_free, uint64_t completed_submission_index) {
   uint64_t released = 0;
   bool destroyed_any = false;
-  while (texture_used_first_ != nullptr && released < bytes_to_free) {
+  size_t destroyed_streaming = 0, destroyed_working_set = 0;
+
+  // Two passes over the same use-ordered list. The first takes only textures
+  // the game has drawn with a handful of times - streamed-past surfaces, a
+  // one-off blit source, the tail of a cutscene - and leaves the working set
+  // alone. Only if that does not cover the request does the second pass fall
+  // back to plain recency and start taking things the game is still drawing
+  // with.
+  //
+  // Recency alone used to be the whole policy, and it evicted the wrong
+  // textures: a texture drawn with every single frame arrives at the head of
+  // the list a couple of frames after its last use exactly like one drawn with
+  // once, so a title in steady state had its working set taken and reloaded
+  // continuously - 2718 MB of texture evictions in one Dark Souls II session
+  // that ended with the cache within ten megabytes of the size it started at,
+  // every one of them paying the driver's 10-38 ms to create the host resource
+  // again, on the command processor thread, mid-frame.
+  for (int pass = 0; pass < 2 && released < bytes_to_free; ++pass) {
+    bool take_frequently_used = pass != 0;
     Texture* texture = texture_used_first_;
-    // Only textures the GPU is done with - the LRU list is in use order, so
-    // once the oldest is still pending, so is everything after it.
-    if (texture->last_usage_submission_index() > completed_submission_index) {
-      break;
+    while (texture != nullptr && released < bytes_to_free) {
+      // The texture is destroyed below, which unlinks it - remember where to
+      // continue before that happens.
+      Texture* next = texture->used_next_;
+      // Only textures the GPU is done with - the list is in use order, so once
+      // the oldest is still pending, so is everything after it.
+      if (texture->last_usage_submission_index() > completed_submission_index) {
+        break;
+      }
+      if (!take_frequently_used &&
+          texture->used_submission_count() >= kFrequentUseSubmissions) {
+        texture = next;
+        continue;
+      }
+      uint64_t texture_bytes = texture->GetHostMemoryUsage();
+      auto found_texture_it = textures_.find(texture->key());
+      assert_true(found_texture_it != textures_.end());
+      if (found_texture_it == textures_.end()) {
+        texture = next;
+        continue;
+      }
+      assert_true(found_texture_it->second.get() == texture);
+      if (!destroyed_any) {
+        destroyed_any = true;
+        // A texture being destroyed may still be bound from an earlier
+        // submission with nothing having overwritten the binding yet.
+        ResetTextureBindings();
+      }
+      if (take_frequently_used) {
+        ++destroyed_working_set;
+      } else {
+        ++destroyed_streaming;
+      }
+      textures_.erase(found_texture_it);
+      // `texture` is invalid now.
+      released += texture_bytes;
+      texture = next;
     }
-    uint64_t texture_bytes = texture->GetHostMemoryUsage();
-    if (!destroyed_any) {
-      destroyed_any = true;
-      // A texture being destroyed may still be bound from an earlier
-      // submission with nothing having overwritten the binding yet.
-      ResetTextureBindings();
-    }
-    auto found_texture_it = textures_.find(texture->key());
-    assert_true(found_texture_it != textures_.end());
-    if (found_texture_it == textures_.end()) {
-      break;
-    }
-    assert_true(found_texture_it->second.get() == texture);
-    textures_.erase(found_texture_it);
-    // `texture` is invalid now.
-    released += texture_bytes;
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+    // Which of the two passes did the work is the whole diagnosis: taking
+    // streamed-past textures is free, and having to take the working set means
+    // the title genuinely does not fit and something else has to give.
+    if (destroyed_working_set) {
+      XELOGW(
+          "Texture cache: released {} MB for the host - {} streamed-past "
+          "textures were not enough, {} still in use had to go as well",
+          released >> 20, destroyed_streaming, destroyed_working_set);
+    }
   }
   return released;
 }
@@ -675,6 +719,12 @@ void TextureCache::Texture::MarkAsUsed() {
   }
   last_usage_submission_index_ = texture_cache_.current_submission_index_;
   last_usage_time_ = texture_cache_.current_submission_time_;
+  // One per submission the texture was actually drawn with - this is the
+  // frequency half of the eviction decision. Saturating, because the only
+  // question ever asked of it is whether it reached kFrequentUseSubmissions.
+  if (used_submission_count_ != UINT32_MAX) {
+    ++used_submission_count_;
+  }
   if (used_next_ == nullptr) {
     // Already the most recently used.
     return;

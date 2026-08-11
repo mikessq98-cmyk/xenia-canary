@@ -81,6 +81,13 @@ class GpuMemoryArbiter {
   // Asked to release at least `bytes_to_free`; returns what it actually
   // released. Returning less than asked is normal and simply moves the
   // arbiter on to the next consumer.
+  //
+  // MUST only release resources the GPU has finished with - Update runs before
+  // anything is recorded into the command list, but TryReserveAllocation is
+  // called from an allocator mid-submission, where a resource referenced by
+  // recorded commands would be replayed after being destroyed. Every consumer
+  // registered today already checks the completed submission for its own
+  // reasons; a new one has to as well.
   using TrimFunction = std::function<uint64_t(uint64_t bytes_to_free)>;
   // Current host memory held by this consumer, for reporting and for deciding
   // whether asking it is worthwhile at all.
@@ -103,6 +110,33 @@ class GpuMemoryArbiter {
   // and its answer does not change meaningfully between draws), updates the
   // pressure level, and trims when below the target.
   void Update(uint64_t submission_index);
+
+  // Called by a consumer that is about to make a large host allocation, before
+  // it makes it. This is the only way the core can know about an allocation
+  // that has not happened yet - a rate of consumption cannot predict one, which
+  // is what a Dark Souls II session proved when pressure read "none" at 784 MB
+  // free with 24 seconds of extrapolated headroom and a single scaled-resolve
+  // region then took the lot.
+  //
+  // Trims other consumers (never the requester's own kind - it is about to use
+  // that memory) until the allocation fits alongside the reserve, and returns
+  // whether it is now expected to. A false return means the caller should skip
+  // the allocation rather than let the driver fail it.
+  bool TryReserveAllocation(ConsumerKind requester, uint64_t bytes);
+
+  // Reports that an allocation of this size failed anyway, and releases memory
+  // so the caller can retry. This is the single most valuable observation the
+  // core can get: the OS reported enough free commit and the allocation still
+  // did not fit, so the real ceiling is lower than any query says. One Dark
+  // Souls II session at 3x3 failed to create the same 336 MB scaled-resolve
+  // region 1287 times while the core, reading ~900 MB free, was busy evicting
+  // textures - nothing ever told it that the memory it was looking at could not
+  // actually be used. Escalates to critical for the next few polls so the
+  // caches stop growing into it as well.
+  //
+  // Returns how much it freed; zero means there is nothing left to give and the
+  // caller should stop asking rather than retry.
+  uint64_t ReportAllocationFailure(ConsumerKind requester, uint64_t bytes);
 
   // The current answer to "does the host need memory back". Safe to read from
   // any thread; caches consult this instead of thresholds of their own.
@@ -135,8 +169,17 @@ class GpuMemoryArbiter {
   };
 
   // Updates consumption_bytes_per_second_ and returns how long the current
-  // rate leaves before the floor, or infinity when memory is not falling.
-  double UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes);
+  // rate leaves before the reserve, or infinity when memory is not falling.
+  double UpdateTrendAndGetSecondsToReserve(uint64_t free_bytes);
+  // Moves the settled level towards the current reading - see the member.
+  void UpdateSettledLevel(uint64_t free_bytes, uint64_t now_ms);
+  // Records a single allocation's size into the decaying maximum the reserve
+  // is derived from.
+  void NoteAllocationSize(uint64_t bytes, uint64_t now_ms);
+  // Walks the consumers in eviction order asking for memory. Returns what was
+  // actually released. `skip` is not asked (the caller is about to use that
+  // memory itself); pass kCount to ask everyone.
+  uint64_t TrimConsumers(uint64_t bytes_to_free, ConsumerKind skip);
 
   static const char* GetConsumerName(ConsumerKind kind);
   // Reads free host commit (the binding limit on the console - allocations
@@ -172,42 +215,40 @@ class GpuMemoryArbiter {
   // there is to meet the shortage with releases nobody can feel.
   static constexpr uint64_t kElevatedTrimPerPassBytes = UINT64_C(16) << 20;
 
-  // Fixed thresholds are the wrong instrument and were removed. A number like
-  // "trim below 768 MB free" is either too early - throwing away work while
-  // gigabytes sit unused, which is what produced 438 evictions in one session -
-  // or too late, because what matters is not how much is free right now but
-  // whether it will still be enough by the time the scene finishes streaming.
+  // WHERE THE DANGER LINE COMES FROM.
   //
-  // What is used instead:
-  //  - Anything that is genuinely not needed is released as soon as that is
-  //    known, at no threshold at all (see kFreeImmediately consumers). Nothing
-  //    is kept just because there is room for it.
-  //  - Everything else is judged by TREND: how fast free memory is falling and
-  //    how long that leaves. Reacting to the slope means the release happens
-  //    early enough to be gradual and cheap, rather than as an emergency.
+  // It is not a constant, and picking a better constant is not the fix. That
+  // was tried across three builds on 2026-08-11 and every one of them solved
+  // the previous symptom and created the next, because the number has to be
+  // two different things at once: Dark Souls II settles at ~900 MB free and is
+  // perfectly healthy there, so a 1024 MB threshold left it permanently
+  // "elevated" and the core trimmed 170 times, 5534 MB, in a single session -
+  // taking textures and the resource reuse pool, the two most expensive things
+  // to rebuild, and the game simply loaded them again. Black Ops with the same
+  // constant never triggered at all and grew its texture cache to 1836 MB.
   //
-  // Trend alone is NOT enough, and a Dark Souls II session at 3x3 proved it:
-  // pressure went to none at 784 MB free because consumption had slowed to
-  // 16 MB/s, which extrapolated to 24 seconds of headroom - and then a single
-  // scaled-resolve region took the lot at once. The log after that is 1010
-  // failed upload buffers, 1290 dropped draws, and the shader compiler
-  // crashing out of memory. A rate says nothing about an allocation that has
-  // not happened yet, and at a draw resolution scale the individual
-  // allocations are enormous.
-  //
-  // So the level is the WORSE of two readings: what the trend predicts, and
-  // where the free memory is in absolute terms. The trend catches a slow
-  // slide early, when releasing is cheap; the absolute levels catch a step
-  // that no rate could have foreseen. Neither replaces the other.
-  static constexpr uint64_t kElevatedFreeBytes = UINT64_C(1024) << 20;
-  static constexpr uint64_t kCriticalFreeBytes = UINT64_C(640) << 20;
-  // Below this allocations are already failing - nothing left to predict.
-  static constexpr uint64_t kFloorFreeBytes = UINT64_C(384) << 20;
+  // What actually decides whether free memory is enough is the size of the
+  // NEXT allocation, and that is a property of the title (and of the resolution
+  // scale), discovered by watching it: at 3x3 a single scaled-resolve region is
+  // 356 MB, at 1x1 the largest thing anyone allocates is a few MB. So the
+  // reserve is derived from the largest single allocation actually observed,
+  // and the only constants left are bounds on that derivation and a margin for
+  // the parts of the process this core does not manage at all (the JIT's code
+  // cache, guest threads, the driver's own allocations).
+  static constexpr uint64_t kUnmanagedMarginBytes = UINT64_C(192) << 20;
+  static constexpr uint64_t kMinReserveBytes = UINT64_C(256) << 20;
+  // A title that once allocated something enormous must not be left permanently
+  // convinced it is out of memory - past this, the trend and the allocation
+  // requests carry the load instead.
+  static constexpr uint64_t kMaxReserveBytes = UINT64_C(1024) << 20;
+  // The observed maximum decays, so a size that one level needed and no other
+  // does stops holding the reserve up. Long enough to span a level load.
+  static constexpr uint64_t kAllocationObservationMs = 120 * 1000;
   // Start giving memory back when the current rate of consumption would reach
-  // the floor within this long. Chosen so that a release is spread over many
+  // the reserve within this long. Chosen so that a release is spread over many
   // frames instead of landing in one.
-  static constexpr double kElevatedSecondsToFloor = 20.0;
-  static constexpr double kCriticalSecondsToFloor = 6.0;
+  static constexpr double kElevatedSecondsToReserve = 20.0;
+  static constexpr double kCriticalSecondsToReserve = 6.0;
   // Free enough to buy back this much time at the observed rate, rather than a
   // fixed number of megabytes - the same shortfall means something very
   // different when memory is falling at 5 MB/s and at 200 MB/s.
@@ -215,6 +256,13 @@ class GpuMemoryArbiter {
   // Sanity bounds on what a trim may ask for before the per-pass cap applies.
   static constexpr uint64_t kMinTrimBytes = UINT64_C(16) << 20;
   static constexpr uint64_t kMaxTrimBytes = UINT64_C(1024) << 20;
+
+  // Room for the next allocation of the size this title actually makes.
+  uint64_t GetReserveBytes() const;
+  // The largest single allocation seen recently, which is what the reserve has
+  // to cover. Zero until anything reports one.
+  uint64_t largest_allocation_bytes_ = 0;
+  uint64_t largest_allocation_time_ms_ = 0;
 
   std::atomic<Pressure> pressure_{Pressure::kNone};
   // Consecutive polls that wanted a lower level - see the hysteresis in
@@ -224,6 +272,46 @@ class GpuMemoryArbiter {
   uint64_t last_poll_submission_ = 0;
   uint64_t last_trim_submission_ = 0;
   uint64_t last_free_bytes_ = UINT64_MAX;
+
+  // THE SETTLED LEVEL: where this title lives.
+  //
+  // Every title finds an equilibrium - it fills its caches, the host settles at
+  // some amount free, and it stays there. That level is not a shortage however
+  // low it is; the caches hold exactly what the game is drawing with, and
+  // taking any of it away just makes them load it again. What IS a shortage is
+  // memory going down and not coming back.
+  //
+  // So this tracks the level free memory keeps returning to, with a time
+  // constant of tens of seconds: a slide leaves the settled level behind (the
+  // gap is the evidence), while a title that simply lives low is matched within
+  // a minute and the gap closes. Under elevated pressure - where nothing is
+  // urgent yet - a closed gap means there is nothing a forced trim can fix, and
+  // the pass is skipped. This is what stops the 170-trim session: Dark Souls II
+  // sat between 901 and 963 MB free for twenty minutes, which is flat.
+  uint64_t settled_free_bytes_ = UINT64_MAX;
+  uint64_t settled_time_ms_ = 0;
+  // How fast the settled level follows the reading. One time constant per this
+  // many seconds - long enough that a real slide registers as a gap, short
+  // enough that a title which has genuinely moved to a new level is accepted
+  // before the next trim decision matters.
+  static constexpr double kSettledLevelTimeConstantSeconds = 45.0;
+  // Free memory wobbles by tens of megabytes with ordinary streaming. Anything
+  // inside this of the settled level is flat.
+  static constexpr uint64_t kFlatBandBytes = UINT64_C(64) << 20;
+
+  // ALLOCATION FAILURE FEEDBACK.
+  //
+  // When an allocation fails while the OS still reports room for it, that
+  // report is wrong for the purpose - fragmentation, the GPU-visible budget, or
+  // driver overhead put the real ceiling lower. Nothing else the core can
+  // measure says this. So a failure escalates to critical for a few polls and
+  // sets the next trim's target to the size that failed, which is the amount
+  // the caller's retry needs.
+  uint64_t allocation_failure_bytes_ = 0;
+  uint32_t allocation_failure_polls_ = 0;
+  static constexpr uint32_t kFailureEscalationPolls = 8;
+  uint64_t total_allocation_failures_ = 0;
+
   // For the trend. The rate is smoothed because a single poll straddling a
   // level load reads as hundreds of MB/s and would trigger a panic trim.
   uint64_t last_trend_free_bytes_ = UINT64_MAX;
@@ -240,6 +328,10 @@ class GpuMemoryArbiter {
   uint64_t total_trims_ = 0;
   uint64_t total_released_bytes_ = 0;
   uint64_t total_freed_immediately_bytes_ = 0;
+  uint64_t total_reserved_for_allocations_bytes_ = 0;
+  // Passes skipped because the level was flat - the difference between "the
+  // core has nothing to do" and "the core is not being called".
+  uint64_t total_flat_skips_ = 0;
 };
 
 }  // namespace gpu

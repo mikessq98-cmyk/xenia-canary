@@ -33,12 +33,6 @@
 #include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
-#if XE_PLATFORM_WIN32
-// GlobalMemoryStatusEx - the host commit headroom the scaled resolve regions
-// are budgeted against.
-#include "xenia/base/platform_win.h"
-#endif
-
 DEFINE_int32(
     d3d12_scaled_resolve_max_mb, 0,
     "Hard cap, in megabytes, on the memory backing draw_resolution_scale "
@@ -1071,62 +1065,23 @@ bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
     }
     return true;
   }
-  // Automatic: keep a reserve of host memory free for everything else. The
-  // commit limit is what actually fails allocations on Xbox (E_OUTOFMEMORY
-  // while free physical RAM still looks plentiful), so budget against it.
-#if XE_PLATFORM_WIN32
-  MEMORYSTATUSEX memory_status = {sizeof(memory_status)};
-  if (!GlobalMemoryStatusEx(&memory_status)) {
-    return true;
-  }
-  uint64_t available = memory_status.ullAvailPageFile;
-  if (available >= bytes_needed + kScaledResolveHostMemoryReserve) {
-    return true;
-  }
-  // Short on memory - reclaim regions the game hasn't touched in a while
-  // before giving up on this one. Their contents are lost, so this only
-  // happens under real pressure: a surface untouched for hundreds of
-  // submissions is almost certainly a finished effect, and if the game does
-  // come back to it, it re-resolves into a freshly committed region.
-  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
-  uint64_t released_bytes = 0;
-  for (auto it = scaled_resolve_regions_.begin();
-       it != scaled_resolve_regions_.end();) {
-    if (it->last_use_submission + kScaledResolveRegionIdleSubmissions >
-        completed_submission) {
-      ++it;
-      continue;
-    }
-    released_bytes += it->size;
-    scaled_resolve_committed_bytes_ -= it->size;
-    if (scaled_resolve_committed_current_region_ == it->buffer.get()) {
-      scaled_resolve_committed_current_region_ = nullptr;
-    }
-    // Retired with the last use (long completed for an idle region), not the
-    // current submission - see the explicit-cap path above.
-    scaled_resolve_retired_buffers_.push_back(
-        {it->last_use_submission, std::move(it->buffer)});
-    it = scaled_resolve_regions_.erase(it);
-  }
+  // Automatic. Give up this cache's OWN dead weight first - regions the game
+  // has stopped resolving into hold nothing anyone can read, and an idle
+  // region's last GPU use is long completed, so the memory serves this request
+  // rather than merely stopping the growth. Then ask the memory core, which is
+  // the only thing that can see the render targets and textures next door.
+  uint64_t released_bytes = ReleaseIdleScaledResolveRegionsForArbiter(0);
   if (released_bytes) {
-    // An idle region's last GPU use is long completed, so this sweep frees
-    // the just-retired buffers immediately - the released memory can serve
-    // the CURRENT request, not just stop the growth.
-    ReleaseCompletedRetiredScaledResolveBuffers();
-    if (GlobalMemoryStatusEx(&memory_status)) {
-      available = memory_status.ullAvailPageFile;
-    }
     XELOGI(
-        "D3D12TextureCache: released {} MB of idle scaled resolve regions "
-        "under memory pressure ({} MB commit now available), {} MB still "
-        "resident",
-        released_bytes >> 20, available >> 20,
-        scaled_resolve_committed_bytes_ >> 20);
+        "D3D12TextureCache: released {} MB of idle scaled resolve regions to "
+        "make room for a new one, {} MB still resident",
+        released_bytes >> 20, scaled_resolve_committed_bytes_ >> 20);
   }
-  return available >= bytes_needed + kScaledResolveHostMemoryReserve;
-#else
-  return true;
-#endif  // XE_PLATFORM_WIN32
+  // The core trims everything EXCEPT this cache's own regions if it has to -
+  // asking a cache to release what it is about to allocate is how it ends up
+  // destroying and recreating the same buffer.
+  return command_processor_.memory_arbiter().TryReserveAllocation(
+      GpuMemoryArbiter::ConsumerKind::kIdleScaledResolve, bytes_needed);
 }
 
 bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
@@ -1297,11 +1252,43 @@ bool D3D12TextureCache::EnsureScaledResolveRegionCommitted(
           &ui::d3d12::util::kHeapPropertiesDefault,
           provider.GetHeapFlagCreateNotZeroed(), &region_desc, initial_state,
           nullptr, IID_PPV_ARGS(&region_resource)))) {
-    XELOGE(
-        "D3D12TextureCache: Failed to create a {} MB scaled resolve region at "
-        "0x{:X} ({} MB already resident)",
-        new_size >> 20, new_base, scaled_resolve_committed_bytes_ >> 20);
-    return false;
+    // The budget said there was room and the driver disagreed - fragmentation,
+    // the GPU-visible budget, or driver overhead put the real ceiling below
+    // what the OS reports. Nothing the core can measure tells it that, so tell
+    // it, and let it take the memory from the caches that still have some. This
+    // is the difference between one retry and the 1287 identical failures a
+    // Dark Souls II session at 3x3 produced, each one a full driver allocation
+    // attempt and a log line, with 307 resolves dropped behind them.
+    ++scaled_resolve_creation_failures_;
+    uint64_t reclaimed =
+        command_processor_.memory_arbiter().ReportAllocationFailure(
+            GpuMemoryArbiter::ConsumerKind::kIdleScaledResolve, new_size);
+    if (reclaimed) {
+      if (SUCCEEDED(device->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesDefault,
+              provider.GetHeapFlagCreateNotZeroed(), &region_desc,
+              initial_state, nullptr, IID_PPV_ARGS(&region_resource)))) {
+        XELOGI(
+            "D3D12TextureCache: a {} MB scaled resolve region at 0x{:X} was "
+            "refused, then created after the memory core freed {} MB",
+            new_size >> 20, new_base, reclaimed >> 20);
+      }
+    }
+    if (!region_resource) {
+      // Throttled: a silent stream of these is the difference between "a few
+      // effects missing" and "the game can't render", but an unbounded one
+      // costs more than it reports.
+      if (scaled_resolve_creation_failures_ <= 8 ||
+          (scaled_resolve_creation_failures_ % 256) == 0) {
+        XELOGE(
+            "D3D12TextureCache: Failed to create a {} MB scaled resolve region "
+            "at 0x{:X} ({} MB already resident) - the resolve is skipped "
+            "(occurrence {})",
+            new_size >> 20, new_base, scaled_resolve_committed_bytes_ >> 20,
+            scaled_resolve_creation_failures_);
+      }
+      return false;
+    }
   }
 
   ScaledResolveRegion new_region;

@@ -123,6 +123,12 @@ class D3D12CommandProcessor final : public CommandProcessor {
     return completion_timeline_->GetCompletedSubmissionFromLastUpdate();
   }
 
+  // The owner of the host memory policy. A cache about to make a large
+  // allocation asks it first instead of comparing against a threshold of its
+  // own - the only one left was in the scaled resolve allocator, and it could
+  // release nothing but its own regions.
+  GpuMemoryArbiter& memory_arbiter() { return memory_arbiter_; }
+
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionCompletion(GetCurrentSubmission()) if
   // it was done after the latest ExecuteCommandLists + Signal.
@@ -716,6 +722,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // The single place that decides what the GPU caches give back when the host
   // runs short - see GpuMemoryArbiter for why they must not decide alone.
+  // Exposed through memory_arbiter() so an allocator can ask before it
+  // allocates and report back when the allocation failed anyway.
   GpuMemoryArbiter memory_arbiter_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;

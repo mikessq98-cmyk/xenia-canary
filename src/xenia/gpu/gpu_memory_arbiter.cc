@@ -10,6 +10,7 @@
 #include "xenia/gpu/gpu_memory_arbiter.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -33,7 +34,12 @@ const char* GpuMemoryArbiter::GetConsumerName(ConsumerKind kind) {
     case ConsumerKind::kIdleScaledResolve:
       return "idle scaled resolve regions";
     case ConsumerKind::kUnusedRenderTargets:
-      return "unused render targets";
+      // Named for what may be TRIMMED from it. What it reports as held is every
+      // render target, including the ones holding EDRAM data that this consumer
+      // will never give up - the report used to read "719 MB held by unused
+      // render targets" when hardly any of it was unused, which sent the search
+      // for the memory in the wrong direction.
+      return "render targets (only the ones holding no EDRAM data are trimmed)";
     case ConsumerKind::kTextures:
       return "textures";
     case ConsumerKind::kOwningRenderTargets:
@@ -98,16 +104,69 @@ uint64_t GpuMemoryArbiter::GetTotalUsage() const {
   return total;
 }
 
+uint64_t GpuMemoryArbiter::GetReserveBytes() const {
+  // Enough for one more allocation of the size this title actually makes, plus
+  // a margin for the parts of the process this core does not manage (the JIT's
+  // code cache, guest thread stacks, the driver's own allocations). At 1x1 the
+  // largest anything allocates is a few megabytes and the reserve sits at its
+  // floor; at 3x3 a single scaled-resolve region is 356 MB and the reserve
+  // grows to match, without anyone having configured either case.
+  uint64_t largest = largest_allocation_bytes_;
+  uint64_t reserve = kUnmanagedMarginBytes + largest + largest / 2;
+  return std::clamp(reserve, kMinReserveBytes, kMaxReserveBytes);
+}
+
+void GpuMemoryArbiter::NoteAllocationSize(uint64_t bytes, uint64_t now_ms) {
+  if (bytes >= largest_allocation_bytes_) {
+    largest_allocation_bytes_ = bytes;
+    largest_allocation_time_ms_ = now_ms;
+    return;
+  }
+  // Decay: a size that one level needed and nothing since should stop holding
+  // the reserve up, but only slowly - the title may simply not have reached
+  // that surface again yet.
+  if (now_ms - largest_allocation_time_ms_ >= kAllocationObservationMs) {
+    largest_allocation_bytes_ = std::max(bytes, largest_allocation_bytes_ / 2);
+    largest_allocation_time_ms_ = now_ms;
+  }
+}
+
+void GpuMemoryArbiter::UpdateSettledLevel(uint64_t free_bytes,
+                                          uint64_t now_ms) {
+  if (settled_free_bytes_ == UINT64_MAX || now_ms <= settled_time_ms_) {
+    settled_free_bytes_ = free_bytes;
+    settled_time_ms_ = now_ms;
+    return;
+  }
+  double elapsed_seconds = double(now_ms - settled_time_ms_) / 1000.0;
+  settled_time_ms_ = now_ms;
+  // One time constant per kSettledLevelTimeConstantSeconds, expressed against
+  // real elapsed time rather than per poll - the poll interval changes by a
+  // factor of eight depending on how fast memory is moving, and a per-poll
+  // factor would make the settled level follow eight times faster exactly when
+  // a slide is happening, which is when it must not follow.
+  double alpha =
+      1.0 - std::exp(-elapsed_seconds / kSettledLevelTimeConstantSeconds);
+  double settled = double(settled_free_bytes_);
+  settled += (double(free_bytes) - settled) * alpha;
+  settled_free_bytes_ = uint64_t(std::max(0.0, settled));
+}
+
 void GpuMemoryArbiter::LogStatistics() const {
   uint64_t free_bytes = last_free_bytes_;
   XELOGI(
-      "[MEM] gpu memory core: pressure {}, {} MB free, using {} MB/s | "
-      "released on sight {} MB, forced trims {} freeing {} MB",
+      "[MEM] gpu memory core: pressure {}, {} MB free (settles at {} MB, "
+      "reserving {} MB for allocations of up to {} MB), using {} MB/s | "
+      "released on sight {} MB, forced trims {} freeing {} MB, {} passes "
+      "skipped as flat, {} allocation failures reclaimed {} MB",
       GetPressureName(pressure()),
       free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
+      settled_free_bytes_ == UINT64_MAX ? 0 : (settled_free_bytes_ >> 20),
+      GetReserveBytes() >> 20, largest_allocation_bytes_ >> 20,
       int64_t(consumption_bytes_per_second_) >> 20,
       total_freed_immediately_bytes_ >> 20, total_trims_,
-      total_released_bytes_ >> 20);
+      total_released_bytes_ >> 20, total_flat_skips_,
+      total_allocation_failures_, total_reserved_for_allocations_bytes_ >> 20);
   for (const Consumer& consumer : consumers_) {
     if (!consumer.usage) {
       continue;
@@ -121,8 +180,10 @@ void GpuMemoryArbiter::LogStatistics() const {
   }
 }
 
-double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
+double GpuMemoryArbiter::UpdateTrendAndGetSecondsToReserve(
+    uint64_t free_bytes) {
   constexpr double kInfinite = 1.0e9;
+  uint64_t reserve = GetReserveBytes();
   uint64_t now_ms = Clock::QueryHostUptimeMillis();
   if (last_trend_free_bytes_ == UINT64_MAX || now_ms <= last_trend_time_ms_) {
     last_trend_free_bytes_ = free_bytes;
@@ -138,9 +199,7 @@ double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
   // enough to contain both halves of that can tell the difference.
   if (elapsed_seconds < kTrendWindowSeconds) {
     return consumption_bytes_per_second_ > 0.0
-               ? double(free_bytes > kFloorFreeBytes
-                            ? free_bytes - kFloorFreeBytes
-                            : 0) /
+               ? double(free_bytes > reserve ? free_bytes - reserve : 0) /
                      consumption_bytes_per_second_
                : kInfinite;
   }
@@ -156,9 +215,127 @@ double GpuMemoryArbiter::UpdateTrendAndGetSecondsToFloor(uint64_t free_bytes) {
     // Not falling - memory is being returned faster than taken.
     return kInfinite;
   }
-  uint64_t above_floor =
-      free_bytes > kFloorFreeBytes ? free_bytes - kFloorFreeBytes : 0;
-  return double(above_floor) / consumption_bytes_per_second_;
+  uint64_t above_reserve = free_bytes > reserve ? free_bytes - reserve : 0;
+  return double(above_reserve) / consumption_bytes_per_second_;
+}
+
+uint64_t GpuMemoryArbiter::TrimConsumers(uint64_t bytes_to_free,
+                                         ConsumerKind skip) {
+  uint64_t released_total = 0;
+  for (const Consumer& consumer : consumers_) {
+    if (released_total >= bytes_to_free) {
+      break;
+    }
+    if (consumer.kind == skip) {
+      continue;
+    }
+    if (!consumer.trim) {
+      continue;
+    }
+    if (consumer.usage && !consumer.usage()) {
+      continue;
+    }
+    uint64_t released = consumer.trim(bytes_to_free - released_total);
+    if (!released) {
+      continue;
+    }
+    released_total += released;
+    // Sub-megabyte releases used to produce a line reading "released 0 MB",
+    // 86 of them in one session - noise that says nothing.
+    if (released >= (UINT64_C(1) << 20)) {
+      XELOGI("GPU memory: released {} MB of {}", released >> 20,
+             GetConsumerName(consumer.kind));
+    }
+  }
+  return released_total;
+}
+
+bool GpuMemoryArbiter::TryReserveAllocation(ConsumerKind requester,
+                                            uint64_t bytes) {
+  if (!bytes) {
+    return true;
+  }
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  // Even if this fits without help, the core has now learned how big this
+  // title's allocations are, which is what the reserve is derived from.
+  NoteAllocationSize(bytes, now_ms);
+
+  uint64_t free_bytes = QueryFreeHostBytes();
+  if (free_bytes == UINT64_MAX) {
+    return true;
+  }
+  last_free_bytes_ = free_bytes;
+
+  // Only this allocation has to fit, plus the margin for the parts of the
+  // process the caches do not own. The forward-looking part of the reserve is
+  // for the steady-state pressure signal; demanding it here as well would mean
+  // refusing an allocation there is room for.
+  uint64_t needed = bytes + kUnmanagedMarginBytes;
+  if (free_bytes >= needed) {
+    return true;
+  }
+
+  // The requester's own kind is never asked. It is about to use this memory,
+  // and releasing what it already holds to make room for what it is allocating
+  // is how a cache ends up destroying and recreating the same thing - the
+  // caches have their own idle policies for that, run before they get here.
+  uint64_t released =
+      TrimConsumers(needed - free_bytes, requester);
+  if (!released) {
+    return false;
+  }
+  total_reserved_for_allocations_bytes_ += released;
+  free_bytes = QueryFreeHostBytes();
+  if (free_bytes != UINT64_MAX) {
+    last_free_bytes_ = free_bytes;
+  }
+  XELOGI(
+      "GPU memory: freed {} MB so {} could allocate {} MB ({} MB free now)",
+      released >> 20, GetConsumerName(requester), bytes >> 20,
+      free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20));
+  return free_bytes == UINT64_MAX || free_bytes >= needed;
+}
+
+uint64_t GpuMemoryArbiter::ReportAllocationFailure(ConsumerKind requester,
+                                                   uint64_t bytes) {
+  ++total_allocation_failures_;
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  NoteAllocationSize(bytes, now_ms);
+  allocation_failure_bytes_ = std::max(allocation_failure_bytes_, bytes);
+  allocation_failure_polls_ = kFailureEscalationPolls;
+  // Straight to critical, without waiting for the next poll: the host just
+  // demonstrated that what it reports as free cannot all be used, so every
+  // cache should stop growing into it immediately.
+  pressure_.store(Pressure::kCritical, std::memory_order_relaxed);
+  pressure_relief_polls_ = 0;
+
+  // Free what the retry needs, not a capped bite - a bite smaller than the
+  // allocation cannot make it succeed, and failing the same allocation again
+  // costs another full driver attempt.
+  uint64_t released = TrimConsumers(bytes, requester);
+  total_reserved_for_allocations_bytes_ += released;
+  uint64_t free_bytes = QueryFreeHostBytes();
+  if (free_bytes != UINT64_MAX) {
+    last_free_bytes_ = free_bytes;
+  }
+  if (released) {
+    XELOGW(
+        "GPU memory: {} could not allocate {} MB with {} MB reported free - "
+        "released {} MB from the other caches for a retry (failure {})",
+        GetConsumerName(requester), bytes >> 20,
+        free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20), released >> 20,
+        total_allocation_failures_);
+  } else if (total_allocation_failures_ <= 4 ||
+             (total_allocation_failures_ % 256) == 0) {
+    XELOGW(
+        "GPU memory: {} could not allocate {} MB with {} MB reported free and "
+        "nothing could be released - the caches hold {} MB, all of it still in "
+        "use (failure {})",
+        GetConsumerName(requester), bytes >> 20,
+        free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
+        GetTotalUsage() >> 20, total_allocation_failures_);
+  }
+  return released;
 }
 
 void GpuMemoryArbiter::Update(uint64_t submission_index) {
@@ -171,9 +348,11 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   // consumption is high, or the remaining headroom is small, the OS query is
   // cheap compared to being blind through a level load.
   uint64_t poll_interval = kPollIntervalSubmissions;
+  uint64_t reserve = GetReserveBytes();
   if (consumption_bytes_per_second_ > double(kFastConsumptionBytesPerSecond) ||
+      allocation_failure_polls_ ||
       (last_free_bytes_ != UINT64_MAX &&
-       last_free_bytes_ < kElevatedFreeBytes)) {
+       last_free_bytes_ < reserve + largest_allocation_bytes_)) {
     poll_interval = kFastPollIntervalSubmissions;
   }
   if (submission_index - last_poll_submission_ < poll_interval) {
@@ -183,6 +362,10 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
 
   uint64_t free_bytes = QueryFreeHostBytes();
   last_free_bytes_ = free_bytes;
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  // Nothing allocated this poll is still an observation: it lets a size the
+  // title has stopped needing decay out of the reserve.
+  NoteAllocationSize(0, now_ms);
 
   // Whatever is genuinely dead goes back now, at any pressure. Keeping it
   // costs the emulation nothing to lose and brings the shortage closer - and
@@ -198,39 +381,58 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
     }
   }
 
-  // How long the current rate of consumption leaves before allocations start
-  // failing. This replaces fixed thresholds: what matters is not how much is
-  // free at this instant but whether it will still be enough by the time the
-  // scene finishes streaming. Reacting to the slope means releases are early,
-  // gradual and cheap instead of an emergency.
-  double seconds_to_floor = UpdateTrendAndGetSecondsToFloor(free_bytes);
+  // Where this title lives, and how far the current reading is from it.
+  UpdateSettledLevel(free_bytes, now_ms);
 
-  // The worse of the two readings. The trend sees a slow slide coming while
-  // releasing is still cheap; the absolute level sees what no rate can - the
-  // next single allocation. At a draw resolution scale one scaled-resolve
-  // region is worth many seconds of the average rate, so a comfortable
-  // extrapolation is not evidence that the memory is there.
+  // How long the current rate of consumption leaves before allocations start
+  // failing. Reacting to the slope means releases are early, gradual and cheap
+  // instead of an emergency.
+  double seconds_to_reserve = UpdateTrendAndGetSecondsToReserve(free_bytes);
+  // The reserve may have moved with the observation above.
+  reserve = GetReserveBytes();
+
+  // Three readings, and the worst of them wins.
+  //
+  // The trend sees a slow slide coming while releasing is still cheap. The
+  // absolute level sees what no rate can - the next single allocation, which at
+  // a draw resolution scale is worth many seconds of the average rate, so a
+  // comfortable extrapolation is not evidence that the memory is there. And a
+  // failed allocation is the only one of the three that is not a prediction at
+  // all: it already happened.
   Pressure by_trend;
-  if (seconds_to_floor <= kCriticalSecondsToFloor) {
+  if (seconds_to_reserve <= kCriticalSecondsToReserve) {
     by_trend = Pressure::kCritical;
-  } else if (seconds_to_floor <= kElevatedSecondsToFloor) {
+  } else if (seconds_to_reserve <= kElevatedSecondsToReserve) {
     by_trend = Pressure::kElevated;
   } else {
     by_trend = Pressure::kNone;
   }
+  // Room for one more allocation of the observed size, but not for two, is what
+  // "elevated" means here. Where the title makes no large allocations at all
+  // the band falls back to the unmanaged margin, so the level signal never
+  // disappears entirely.
+  uint64_t elevated_band =
+      std::max(largest_allocation_bytes_, kUnmanagedMarginBytes);
   Pressure by_level;
-  if (free_bytes <= kCriticalFreeBytes) {
+  if (free_bytes <= reserve) {
     by_level = Pressure::kCritical;
-  } else if (free_bytes <= kElevatedFreeBytes) {
+  } else if (free_bytes <= reserve + elevated_band) {
     by_level = Pressure::kElevated;
   } else {
     by_level = Pressure::kNone;
+  }
+  Pressure by_failure = Pressure::kNone;
+  if (allocation_failure_polls_) {
+    --allocation_failure_polls_;
+    by_failure = Pressure::kCritical;
+  } else {
+    allocation_failure_bytes_ = 0;
   }
   Pressure new_pressure;
   if (free_bytes == UINT64_MAX) {
     new_pressure = Pressure::kNone;
   } else {
-    new_pressure = std::max(by_trend, by_level);
+    new_pressure = std::max(std::max(by_trend, by_level), by_failure);
   }
   // Hysteresis. A Dark Souls II session sat at 727-735 MB free while the rate
   // wobbled between 45 and 58 MB/s, and the level flapped
@@ -252,16 +454,40 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
                                              std::memory_order_relaxed);
   if (new_pressure != old_pressure) {
     XELOGI(
-        "GPU memory: pressure {} -> {} ({} MB free, using {} MB/s, {} s of "
-        "headroom by trend; trend says {}, level says {})",
+        "GPU memory: pressure {} -> {} ({} MB free, settles at {} MB, "
+        "reserving {} MB, using {} MB/s, {} s of headroom by trend; trend says "
+        "{}, level says {}, failures say {})",
         GetPressureName(old_pressure), GetPressureName(new_pressure),
         free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
-        int64_t(consumption_bytes_per_second_) >> 20,
-        seconds_to_floor >= 1.0e8 ? -1 : int64_t(seconds_to_floor),
-        GetPressureName(by_trend), GetPressureName(by_level));
+        settled_free_bytes_ == UINT64_MAX ? 0 : (settled_free_bytes_ >> 20),
+        reserve >> 20, int64_t(consumption_bytes_per_second_) >> 20,
+        seconds_to_reserve >= 1.0e8 ? -1 : int64_t(seconds_to_reserve),
+        GetPressureName(by_trend), GetPressureName(by_level),
+        GetPressureName(by_failure));
   }
 
   if (new_pressure == Pressure::kNone) {
+    return;
+  }
+
+  // MEMORY SITTING FLAT IS NOT A SHORTAGE, however low it sits.
+  //
+  // A title fills its caches and settles, and where it settles is where its
+  // working set fits. Taking memory from a cache in that state does not free
+  // anything for long - the game draws the same frame again and loads it all
+  // back. This is what the previous core did for twenty minutes in Dark Souls
+  // II: 170 forced trims, 5534 MB released, of which 2718 MB were textures and
+  // 2216 MB the resource reuse pool, and the cache sizes at the end were within
+  // ten megabytes of where they started. The whole 5.4 GB was reloaded.
+  //
+  // So under elevated pressure - where nothing is urgent - a level that has not
+  // moved off where it settles means there is nothing a forced trim can fix.
+  // Critical is different: there the reserve is already gone, and something is
+  // about to fail whether the level is flat or not.
+  if (new_pressure == Pressure::kElevated &&
+      settled_free_bytes_ != UINT64_MAX &&
+      free_bytes + kFlatBandBytes >= settled_free_bytes_) {
+    ++total_flat_skips_;
     return;
   }
 
@@ -279,9 +505,12 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   // very different at 5 MB/s and at 200 MB/s.
   uint64_t bytes_to_free = uint64_t(std::max(
       0.0, consumption_bytes_per_second_ * kTrimTargetSecondsOfHeadroom));
-  if (free_bytes < kFloorFreeBytes) {
-    bytes_to_free += kFloorFreeBytes - free_bytes;
+  if (free_bytes < reserve) {
+    bytes_to_free += reserve - free_bytes;
   }
+  // A recent failure overrides the estimate: that allocation is what the title
+  // is actually waiting for, and anything less than its size cannot help.
+  bytes_to_free = std::max(bytes_to_free, allocation_failure_bytes_);
   if (new_pressure == Pressure::kElevated) {
     // Elevated is the smoothing band. Give back a little on every pass, well
     // before anything is urgent, so the shortage is met by a series of
@@ -308,25 +537,8 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
                               : kMaxTrimPerPassBytes;
   bytes_to_free = std::min(bytes_to_free, per_pass_cap);
   uint64_t total_before = GetTotalUsage();
-  uint64_t released_total = 0;
 
-  for (const Consumer& consumer : consumers_) {
-    if (released_total >= bytes_to_free) {
-      break;
-    }
-    if (!consumer.trim) {
-      continue;
-    }
-    if (consumer.usage && !consumer.usage()) {
-      continue;
-    }
-    uint64_t released = consumer.trim(bytes_to_free - released_total);
-    if (released) {
-      XELOGI("GPU memory: released {} MB of {}", released >> 20,
-             GetConsumerName(consumer.kind));
-      released_total += released;
-    }
-  }
+  uint64_t released_total = TrimConsumers(bytes_to_free, ConsumerKind::kCount);
 
   last_trim_submission_ = submission_index;
   ++total_trims_;
