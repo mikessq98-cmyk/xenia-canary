@@ -152,6 +152,18 @@ namespace d3d12 {
 // the whole point - "async compilation is on but it stutters like sync" can
 // mean the pipeline path, the texture path, or waiting on the GPU, and these
 // need completely different fixes.
+// Where the command processor's blocked time went, by phase, since startup.
+// Individual slow phases are logged as they happen; these totals answer the
+// question that matters when deciding what to optimize - which phase owns the
+// stalls over a session, not which one happened to be slow once.
+struct BlockedPhaseTotals {
+  std::atomic<uint64_t> pipeline_ms{0};
+  std::atomic<uint64_t> texture_ms{0};
+  std::atomic<uint64_t> submission_ms{0};
+  std::atomic<uint32_t> occurrences{0};
+};
+static BlockedPhaseTotals g_blocked_phase_totals;
+
 static void ReportSlowDrawPhase(const char* phase, uint64_t start_ticks) {
   if (!cvars::d3d12_log_slow_draw_phases) {
     return;
@@ -161,6 +173,26 @@ static void ReportSlowDrawPhase(const char* phase, uint64_t start_ticks) {
   double ms = double(Clock::QueryHostTickCount() - start_ticks) * kTicksToMs;
   if (ms < 20.0) {
     return;
+  }
+  // Accumulate before the rate limiting below, so the totals cover every
+  // stall and not just the ones that got a line.
+  g_blocked_phase_totals.occurrences.fetch_add(1, std::memory_order_relaxed);
+  std::atomic<uint64_t>* bucket = nullptr;
+  switch (phase[0]) {
+    case 'p':
+      bucket = &g_blocked_phase_totals.pipeline_ms;
+      break;
+    case 't':
+      bucket = &g_blocked_phase_totals.texture_ms;
+      break;
+    case 's':
+      bucket = &g_blocked_phase_totals.submission_ms;
+      break;
+    default:
+      break;
+  }
+  if (bucket) {
+    bucket->fetch_add(uint64_t(ms), std::memory_order_relaxed);
   }
   static std::atomic<uint32_t> slow_phase_count{0};
   uint32_t n = slow_phase_count.fetch_add(1, std::memory_order_relaxed);
@@ -506,6 +538,26 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   // problem, which is the question the caches used to each answer for
   // themselves - and disagree on.
   memory_arbiter_.LogStatistics();
+
+  // One line for "what is this session actually losing time to". Everything in
+  // it existed already, but only as individual rate-limited lines that had to
+  // be counted by hand out of the log; as totals they say which phase owns the
+  // stalls, which is what decides where optimization is worth spending.
+  uint64_t pipeline_blocked_ms =
+      g_blocked_phase_totals.pipeline_ms.load(std::memory_order_relaxed);
+  uint64_t texture_blocked_ms =
+      g_blocked_phase_totals.texture_ms.load(std::memory_order_relaxed);
+  uint64_t submission_blocked_ms =
+      g_blocked_phase_totals.submission_ms.load(std::memory_order_relaxed);
+  XELOGI(
+      "[MEM] gpu work: {} draws skipped (pipeline not ready), {} drawn with a "
+      "substitute | command processor blocked {} times for {} ms total "
+      "(pipelines {} ms, textures {} ms, submission {} ms)",
+      draws_skipped_.load(std::memory_order_relaxed),
+      draws_substituted_.load(std::memory_order_relaxed),
+      g_blocked_phase_totals.occurrences.load(std::memory_order_relaxed),
+      pipeline_blocked_ms + texture_blocked_ms + submission_blocked_ms,
+      pipeline_blocked_ms, texture_blocked_ms, submission_blocked_ms);
 }
 
 void D3D12CommandProcessor::InitializeShaderStorage(
@@ -3499,8 +3551,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       void* substitute_handle =
           pipeline_cache_->GetReadySubstituteByHandle(pipeline_handle);
       if (substitute_handle) {
-        static std::atomic<uint32_t> substituted_draw_count{0};
-        uint32_t n = substituted_draw_count.fetch_add(1);
+        uint32_t n = draws_substituted_.fetch_add(1, std::memory_order_relaxed);
         if (n < 10 || (n % 4096) == 0) {
           XELOGI(
               "Drawing with a substituted pipeline while the real one "
@@ -3517,8 +3568,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         pipeline_cache_->PrioritizePipelineForPendingDraw(pipeline_handle);
         // Perfectly normal while pipelines compile in the background, and can
         // happen thousands of times per second - throttle the log heavily.
-        static std::atomic<uint32_t> skipped_draw_log_count{0};
-        uint32_t n = skipped_draw_log_count.fetch_add(1);
+        uint32_t n = draws_skipped_.fetch_add(1, std::memory_order_relaxed);
         if (n < 10 || (n % 1000) == 0) {
           XELOGI(
               "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, "

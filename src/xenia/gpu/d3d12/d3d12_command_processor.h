@@ -641,6 +641,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
   // Spare pool pages the arbiter keeps when it asks for the rest back, so the
   // next frame doesn't immediately allocate again.
+  // Session totals behind the periodic performance summary. Skipped draws and
+  // substitutions were only ever visible as individual rate-limited log lines,
+  // which says a stall happened but not whether it is the shape of the whole
+  // session - the question that decides what is worth optimizing.
+  std::atomic<uint32_t> draws_skipped_{0};
+  std::atomic<uint32_t> draws_substituted_{0};
+
   static constexpr size_t kConstantBufferPoolKeep = 4;
 
   static constexpr uint32_t kViewBindfulHeapSize = 32768;
