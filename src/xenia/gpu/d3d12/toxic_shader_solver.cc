@@ -35,6 +35,13 @@ namespace gpu {
 namespace d3d12 {
 
 namespace {
+// Written into the ".running" marker when the run is going down because the
+// DEVICE was lost, as opposed to the process dying with no explanation. Only
+// the second of those is a reason to serialize pipeline creation next launch -
+// see Initialize. An empty marker means the process died hard, which is the
+// case it cannot be written from and also the case where it must be assumed.
+constexpr const char* kDeviceLostMarker = "device-lost";
+
 // Parses one "<vs_hex> <ps_hex>" line of a solver file. Blank/`#` lines fail.
 bool ParseSolverLine(const std::string& line, uint64_t& vs, uint64_t& ps) {
   if (line.empty() || line[0] == '#') {
@@ -148,6 +155,18 @@ void ToxicShaderSolver::Initialize(
   const bool crashed_last_run = std::filesystem::exists(running_path_, ec);
   const bool explained_by_execution_hang = !execution_suspects.empty();
   journaling_ = crashed_last_run && !explained_by_execution_hang;
+  // Did the last run die because the DEVICE went, or because the process did?
+  // Shutdown writes kDeviceLostMarker into the marker when it knows the device
+  // was lost; a hard process death leaves the marker empty, because nothing
+  // ran to write anything. The distinction decides whether serializing
+  // creation is worth what it costs - see below.
+  bool device_lost_last_run = false;
+  if (crashed_last_run) {
+    std::ifstream marker(running_path_);
+    std::string contents;
+    std::getline(marker, contents);
+    device_lost_last_run = contents.find(kDeviceLostMarker) != std::string::npos;
+  }
 
   // Read any creation journal left behind by that crash (only meaningful if we
   // crashed).
@@ -182,19 +201,35 @@ void ToxicShaderSolver::Initialize(
       }
       XELOGW("  quarantined VS {:016X}, PS {:016X}", s.first, s.second);
     }
-  } else if (crashed_last_run && !explained_by_execution_hang) {
+  } else if (crashed_last_run && !explained_by_execution_hang &&
+             !device_lost_last_run) {
     // Crashed, but that run wasn't journaling yet (the first crash) - nothing
     // was recorded; this run will journal every creation.
     XELOGW(
         "Toxic-shader solver: previous run crashed with no journal - "
         "journaling and serializing pipeline creation this run to catch the "
         "culprit.");
+  } else if (crashed_last_run && !explained_by_execution_hang) {
+    XELOGW(
+        "Toxic-shader solver: the device was lost last run and neither journal "
+        "names anything - journaling this run, but NOT serializing creation: "
+        "nothing was in flight, so there is nothing there to catch.");
   }
   // Any recovery run runs fully serialized, not just the ambiguous case: a
   // game can have SEVERAL toxic shaders, and serialization guarantees the next
   // death leaves exactly one suspect (no innocent bystanders), converging one
   // culprit per crash instead of needing extra runs to disambiguate.
-  safe_mode_ = journaling_;
+  //
+  // EXCEPT when the device was lost and neither journal named anything. That
+  // costs more than it can possibly find: measured on 2026-08-12, a Black Ops
+  // run entered serialized safe mode after a device loss that had nothing in
+  // flight, and dropped 2.9 MILLION draws in its first ninety seconds - the
+  // whole level load rendered with most of its geometry missing - before the
+  // 192-creation auto-exit released it. Serialization exists to narrow down a
+  // creation that never returned; a lost device with an empty creation journal
+  // says the creation side was not involved at all. Journaling stays on (it is
+  // nearly free) so a real creation crash this run is still caught exactly.
+  safe_mode_ = journaling_ && !(device_lost_last_run && suspects.empty());
 
   // The same treatment for pipelines that create fine and hang the GPU when
   // they RUN. Whatever the last run left in the execution journal was in flight
@@ -317,6 +352,17 @@ void ToxicShaderSolver::Shutdown(bool clean_exit) {
         "Toxic-shader solver: shutdown after device loss - keeping the crash "
         "journal so the culprit can be confirmed on the next launch");
     clean_exit = false;
+  }
+  if (device_lost_.load(std::memory_order_acquire) && !running_path_.empty()) {
+    // Say WHY in the marker. The next launch reads it to decide whether
+    // serializing pipeline creation can find anything: a lost device is not
+    // evidence that a creation call misbehaved, and serializing on that
+    // assumption cost a Black Ops session 2.9 million skipped draws in its
+    // first ninety seconds. A process that dies hard writes nothing here,
+    // leaving the marker empty - which is exactly the case that does warrant
+    // serializing.
+    std::ofstream marker(running_path_, std::ios::trunc);
+    marker << kDeviceLostMarker << "\n";
   }
   if (execution_journal_file_) {
     std::fclose(execution_journal_file_);

@@ -22,7 +22,18 @@
 #include "xenia/ui/d3d12/d3d12_provider.h"
 
 DEFINE_bool(
-    d3d12_pipeline_blob_cache, true,
+    d3d12_pipeline_blob_cache, false,
+    "OFF BY DEFAULT ON EVIDENCE. Enabled for one Black Ops run on 2026-08-12 "
+    "with the blob file empty - so the only thing it did was call "
+    "ID3D12PipelineState::GetCachedBlob on freshly created pipelines - the "
+    "device died inside thirty seconds with DXGI_ERROR_DRIVER_INTERNAL_ERROR "
+    "(0x887A0020). The immediately following run, identical in every other "
+    "cvar, ran four minutes. That is one sample, not proof, but the reason "
+    "code is not the one this title normally dies of (0x887A0006 "
+    "DEVICE_HUNG), GetCachedBlob is the same driver serialisation machinery as "
+    "ID3D12PipelineLibrary - which is documented below as crashing this "
+    "console - and the failure is not contained: the SEH guard wraps pipeline "
+    "creation, not this. Turn it on only to retest it.\n"
     "Keep what the driver produced when it compiled each pipeline, next to the "
     "shader storage, and hand it back on the next launch so it does not have "
     "to compile it again.\n"
