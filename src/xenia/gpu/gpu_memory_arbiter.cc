@@ -546,12 +546,23 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   bytes_to_free = std::max(bytes_to_free, deferred_deficit_bytes_);
   deferred_deficit_bytes_ = 0;
   if (new_pressure == Pressure::kElevated) {
-    // Elevated is the smoothing band. Give back a little on every pass, well
-    // before anything is urgent, so the shortage is met by a series of
-    // releases nobody can feel rather than by one that stalls a frame. The
-    // caches also age out their own idle contents here; this is the part that
-    // keeps up when they cannot.
-    bytes_to_free = std::min(bytes_to_free, kElevatedTrimPerPassBytes);
+    // Elevated is the smoothing band: give back a little on every pass, well
+    // before anything is urgent, so the shortage is met by a series of releases
+    // nobody can feel rather than by one that stalls a frame.
+    //
+    // But "a little" has to be at least what the title is taking, or the band
+    // does nothing at all. Black Ops consumed 17 MB/s while passes released a
+    // flat 16 MB each, so every pass lost ground and the run went from elevated
+    // straight through to running out of memory - the log reads "freed 16 MB,
+    // buying back about 0 s at the current rate (caches held 2088 MB, host had
+    // 561 MB free)". Zero seconds is the whole story. The floor is a fixed
+    // small bite; above it the pass frees what the observed rate will consume
+    // before the next one, so the level stops moving instead of merely moving
+    // more slowly.
+    uint64_t keep_up_bytes = uint64_t(std::max(
+        0.0, consumption_bytes_per_second_ * kElevatedCatchUpSeconds));
+    bytes_to_free = std::min(
+        bytes_to_free, std::max(kElevatedTrimPerPassBytes, keep_up_bytes));
   }
   bytes_to_free = std::clamp(bytes_to_free, kMinTrimBytes, kMaxTrimBytes);
   // Take it in bites, sized by urgency. Reaching the target over several

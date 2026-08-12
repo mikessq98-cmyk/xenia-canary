@@ -217,20 +217,24 @@ void TextureCache::CompletedSubmissionUpdated(
   // core only decides how impatient to be about it.
   GpuMemoryArbiter::Pressure pressure =
       host_memory_pressure_.load(std::memory_order_relaxed);
-  // With memory to spare, age is not a reason to destroy anything. A texture
-  // costs 10-38 ms of driver time to create again - measured on this console -
-  // so throwing one away because nobody drew it for a while, while gigabytes
-  // sit free, buys nothing and costs that. It is also exactly what the player
-  // sees: Black Ops at 1x1 held 123 MB of textures with 2.9 GB free and still
-  // destroyed 20-37 of them every few seconds, so turning around and coming
-  // back made the world flicker and reload.
+  // WHAT AGES OUT WITH MEMORY TO SPARE - and it is not "nothing".
   //
-  // Time was the last threshold a cache still owned. It goes the same way as
-  // the size limits did: the core says whether memory is wanted, and only then
-  // does anything age out.
-  if (pressure == GpuMemoryArbiter::Pressure::kNone) {
-    return;
-  }
+  // Switching age eviction off entirely at no pressure was wrong, and Black Ops
+  // showed it within one session: the cache ran to 1877 MB, the core only began
+  // asking at 569 MB free, and the run died with "command processing ran out of
+  // memory". Evicting late is more expensive than evicting early, not less.
+  //
+  // But evicting the WORKING SET early is what made the world flicker: a
+  // texture the player is about to turn back towards costs 10-38 ms of driver
+  // time to build again, on the command processor thread, mid-frame.
+  //
+  // Both are true, and the frequency counter separates them. With memory to
+  // spare, only what the game streamed past - drawn in a handful of submissions
+  // ever - ages out; losing that costs nothing and is what keeps the cache
+  // bounded. Anything the game keeps coming back to is kept until the core says
+  // memory is actually wanted.
+  bool spare_streamed_past_only =
+      pressure == GpuMemoryArbiter::Pressure::kNone;
   uint64_t idle_eviction_ms =
       uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
   switch (pressure) {
@@ -284,9 +288,11 @@ void TextureCache::CompletedSubmissionUpdated(
           ? "unused, host memory critical"
           : (pressure == GpuMemoryArbiter::Pressure::kElevated
                  ? "unused, host memory wanted"
-                 : "unused for a long time");
-  while (texture_used_first_ != nullptr) {
-    Texture* texture = texture_used_first_;
+                 : "streamed past, never came back");
+  Texture* texture = texture_used_first_;
+  while (texture != nullptr) {
+    // Destroying the texture unlinks it - remember where to continue first.
+    Texture* next = texture->used_next_;
     if (texture->last_usage_submission_index() > completed_submission_index) {
       break;
     }
@@ -298,6 +304,12 @@ void TextureCache::CompletedSubmissionUpdated(
     }
     if (released_this_pass >= max_bytes_this_pass) {
       break;
+    }
+    if (spare_streamed_past_only &&
+        texture->used_submission_count() >= kFrequentUseSubmissions) {
+      // Part of what the game is actually rendering. Kept while there is room.
+      texture = next;
+      continue;
     }
     released_this_pass += texture->GetHostMemoryUsage();
     if (!destroyed_any) {
@@ -318,6 +330,7 @@ void TextureCache::CompletedSubmissionUpdated(
       ++destroyed_count;
       // `texture` is invalid now.
     }
+    texture = next;
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
@@ -922,7 +935,7 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
   return scale_bits;
 }
 
-void TextureCache::MeasureTextureContentDuplicate(const Texture& texture) {
+void TextureCache::MeasureTextureContentDuplicate(Texture& texture) {
   if (!cvars::texture_cache_measure_content_duplicates) {
     return;
   }
@@ -935,17 +948,28 @@ void TextureCache::MeasureTextureContentDuplicate(const Texture& texture) {
   if (!guest_data) {
     return;
   }
-  // The base level only. It is the bulk of a texture and enough to tell
-  // "the same picture loaded twice" from "two different pictures"; hashing the
-  // mip chain as well would double the cost of the measurement for nothing.
+  // The base level only. It is the bulk of a texture and enough to tell "the
+  // same picture again" from "a different picture"; hashing the mip chain too
+  // would double the cost of the measurement for nothing.
   uint64_t content_hash = XXH3_64bits(guest_data, base_size);
   uint64_t host_bytes = texture.GetHostMemoryUsage();
   ++measured_texture_count_;
   measured_texture_bytes_ += host_bytes;
-  auto inserted = measured_content_hashes_.emplace(content_hash, host_bytes);
-  if (!inserted.second) {
-    ++measured_duplicate_count_;
-    measured_duplicate_bytes_ += host_bytes;
+  if (texture.measured_content_hash_ == content_hash) {
+    // Same texture, same bytes: the guest wrote its streaming buffer and the
+    // watch fired, but nothing about the picture changed - this whole upload
+    // did no work.
+    ++measured_reload_unchanged_count_;
+    measured_reload_unchanged_bytes_ += host_bytes;
+    return;
+  }
+  texture.measured_content_hash_ = content_hash;
+  auto inserted = measured_content_hashes_.emplace(content_hash, texture.key());
+  if (!inserted.second && !(inserted.first->second == texture.key())) {
+    // The same picture, at a different guest address, as a second host
+    // resource - what sharing one resource between them would save.
+    ++measured_shared_content_count_;
+    measured_shared_content_bytes_ += host_bytes;
   }
 }
 
@@ -955,10 +979,12 @@ std::string TextureCache::GetContentDuplicateReport() const {
     return std::string();
   }
   return fmt::format(
-      "{} of {} textures loaded were byte-identical to one already loaded, "
-      "{} MB of {} MB",
-      measured_duplicate_count_, measured_texture_count_,
-      measured_duplicate_bytes_ >> 20, measured_texture_bytes_ >> 20);
+      "{} loads, {} MB total | re-uploaded unchanged: {} ({} MB) | same "
+      "picture at another address: {} ({} MB)",
+      measured_texture_count_, measured_texture_bytes_ >> 20,
+      measured_reload_unchanged_count_,
+      measured_reload_unchanged_bytes_ >> 20, measured_shared_content_count_,
+      measured_shared_content_bytes_ >> 20);
 }
 
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {

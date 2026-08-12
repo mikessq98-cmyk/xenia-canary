@@ -371,6 +371,9 @@ class TextureCache {
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
     uint32_t used_submission_count_ = 1;
+    // Hash of the guest bytes this texture was last built from, 0 when never
+    // measured. Only maintained while the duplicate measurement is on.
+    uint64_t measured_content_hash_ = 0;
     Texture* used_previous_;
     Texture* used_next_;
     // Whether this texture is in the usage tracking list (for LRU eviction).
@@ -657,10 +660,19 @@ class TextureCache {
   // holds thousands of small textures (5114 destroyed in one pass, 1593 MB), so
   // it is a fair question; the cost of a texture on this console is the host
   // resource, 10-38 ms of driver time, which dedup would also save.
-  void MeasureTextureContentDuplicate(const Texture& texture);
-  std::unordered_map<uint64_t, uint64_t> measured_content_hashes_;
-  uint64_t measured_duplicate_count_ = 0;
-  uint64_t measured_duplicate_bytes_ = 0;
+  void MeasureTextureContentDuplicate(Texture& texture);
+  // Content hash -> the texture that first presented it. Which texture matters:
+  // a hash that comes back on the SAME key is the guest overwriting a streaming
+  // buffer with bytes it already held, and the fix for that is to skip the
+  // upload; a hash that comes back on a DIFFERENT key is genuinely the same
+  // picture at two addresses, and the fix for that is to share one host
+  // resource. The first measurement could not tell them apart and reported 25%
+  // for the two of them together, which points at two very different projects.
+  std::unordered_map<uint64_t, TextureKey> measured_content_hashes_;
+  uint64_t measured_reload_unchanged_count_ = 0;
+  uint64_t measured_reload_unchanged_bytes_ = 0;
+  uint64_t measured_shared_content_count_ = 0;
+  uint64_t measured_shared_content_bytes_ = 0;
   uint64_t measured_texture_count_ = 0;
   uint64_t measured_texture_bytes_ = 0;
 

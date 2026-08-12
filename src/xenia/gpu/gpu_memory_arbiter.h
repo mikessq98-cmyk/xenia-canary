@@ -217,9 +217,14 @@ class GpuMemoryArbiter {
   // the caches stay pegged against their ceilings and hitch continuously -
   // worse than one honest pause. Recovering properly is the gentler outcome.
   static constexpr uint64_t kMaxTrimPerPassCriticalBytes = UINT64_C(320) << 20;
-  // Even smaller in the elevated band, where nothing is urgent yet - the point
-  // there is to meet the shortage with releases nobody can feel.
+  // The smallest an elevated pass bothers with. It is a FLOOR, not the size:
+  // see Update, where a pass also has to cover what the title will consume
+  // before the next one, or the band cannot hold the level at all.
   static constexpr uint64_t kElevatedTrimPerPassBytes = UINT64_C(16) << 20;
+  // How far ahead an elevated pass frees, at the observed rate. Long enough to
+  // outpace consumption between passes, short enough that the release is still
+  // small and frequent rather than a stall.
+  static constexpr double kElevatedCatchUpSeconds = 4.0;
 
   // WHERE THE DANGER LINE COMES FROM.
   //
