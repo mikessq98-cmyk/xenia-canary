@@ -81,13 +81,6 @@ class GpuMemoryArbiter {
   // Asked to release at least `bytes_to_free`; returns what it actually
   // released. Returning less than asked is normal and simply moves the
   // arbiter on to the next consumer.
-  //
-  // MUST only release resources the GPU has finished with - Update runs before
-  // anything is recorded into the command list, but TryReserveAllocation is
-  // called from an allocator mid-submission, where a resource referenced by
-  // recorded commands would be replayed after being destroyed. Every consumer
-  // registered today already checks the completed submission for its own
-  // reasons; a new one has to as well.
   using TrimFunction = std::function<uint64_t(uint64_t bytes_to_free)>;
   // Current host memory held by this consumer, for reporting and for deciding
   // whether asking it is worthwhile at all.
@@ -100,9 +93,19 @@ class GpuMemoryArbiter {
   // shortage arrive sooner. Returns bytes freed; may be null.
   using FreeUnneededFunction = std::function<uint64_t()>;
 
+  // `trim_safe_mid_submission` says this consumer may be trimmed at ANY point,
+  // not only at the submission boundary where Update runs. Almost nothing
+  // qualifies: the command list is recorded ahead of the GPU, so destroying a
+  // host resource that recorded commands still reference - through a root
+  // argument or a descriptor a table already points at - is a use-after-free
+  // the GPU discovers later, as a hang or a driver crash a long way from here.
+  // Only consumers holding nothing the GPU can reach (translated bytecode on
+  // the CPU, pool pages already reclaimed) may set it. Everything else is
+  // deferred to the next submission boundary, which costs at most a frame.
   void RegisterConsumer(ConsumerKind kind, UsageFunction usage,
                         TrimFunction trim,
-                        FreeUnneededFunction free_unneeded = nullptr);
+                        FreeUnneededFunction free_unneeded = nullptr,
+                        bool trim_safe_mid_submission = false);
   void UnregisterConsumers();
 
   // Called once per submission from the command processor. Polls the host at
@@ -166,6 +169,7 @@ class GpuMemoryArbiter {
     UsageFunction usage;
     TrimFunction trim;
     FreeUnneededFunction free_unneeded;
+    bool trim_safe_mid_submission = false;
   };
 
   // Updates consumption_bytes_per_second_ and returns how long the current
@@ -178,8 +182,10 @@ class GpuMemoryArbiter {
   void NoteAllocationSize(uint64_t bytes, uint64_t now_ms);
   // Walks the consumers in eviction order asking for memory. Returns what was
   // actually released. `skip` is not asked (the caller is about to use that
-  // memory itself); pass kCount to ask everyone.
-  uint64_t TrimConsumers(uint64_t bytes_to_free, ConsumerKind skip);
+  // memory itself); pass kCount to ask everyone. `mid_submission` restricts the
+  // walk to the consumers that declared themselves safe to trim there.
+  uint64_t TrimConsumers(uint64_t bytes_to_free, ConsumerKind skip,
+                         bool mid_submission);
 
   static const char* GetConsumerName(ConsumerKind kind);
   // Reads free host commit (the binding limit on the console - allocations
@@ -311,6 +317,13 @@ class GpuMemoryArbiter {
   uint32_t allocation_failure_polls_ = 0;
   static constexpr uint32_t kFailureEscalationPolls = 8;
   uint64_t total_allocation_failures_ = 0;
+  // What an allocator asked for and could not be given from the consumers that
+  // are safe to trim where it asked. Added to the next trim at the submission
+  // boundary, where every consumer can be asked. The allocation that prompted
+  // it is refused for now; the title re-attempts the same resolve on the next
+  // frame, by which point the memory is there.
+  uint64_t deferred_deficit_bytes_ = 0;
+  uint64_t total_deferred_deficit_bytes_ = 0;
 
   // For the trend. The rate is smoothed because a single poll straddling a
   // level load reads as hundreds of MB/s and would trigger a panic trim.

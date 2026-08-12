@@ -78,12 +78,14 @@ uint64_t GpuMemoryArbiter::QueryFreeHostBytes() {
 
 void GpuMemoryArbiter::RegisterConsumer(ConsumerKind kind, UsageFunction usage,
                                         TrimFunction trim,
-                                        FreeUnneededFunction free_unneeded) {
+                                        FreeUnneededFunction free_unneeded,
+                                        bool trim_safe_mid_submission) {
   Consumer consumer;
   consumer.kind = kind;
   consumer.usage = std::move(usage);
   consumer.trim = std::move(trim);
   consumer.free_unneeded = std::move(free_unneeded);
+  consumer.trim_safe_mid_submission = trim_safe_mid_submission;
   consumers_.push_back(std::move(consumer));
   // Keep the list in eviction order so Update just walks it.
   std::stable_sort(consumers_.begin(), consumers_.end(),
@@ -220,13 +222,17 @@ double GpuMemoryArbiter::UpdateTrendAndGetSecondsToReserve(
 }
 
 uint64_t GpuMemoryArbiter::TrimConsumers(uint64_t bytes_to_free,
-                                         ConsumerKind skip) {
+                                         ConsumerKind skip,
+                                         bool mid_submission) {
   uint64_t released_total = 0;
   for (const Consumer& consumer : consumers_) {
     if (released_total >= bytes_to_free) {
       break;
     }
     if (consumer.kind == skip) {
+      continue;
+    }
+    if (mid_submission && !consumer.trim_safe_mid_submission) {
       continue;
     }
     if (!consumer.trim) {
@@ -279,12 +285,24 @@ bool GpuMemoryArbiter::TryReserveAllocation(ConsumerKind requester,
   // and releasing what it already holds to make room for what it is allocating
   // is how a cache ends up destroying and recreating the same thing - the
   // caches have their own idle policies for that, run before they get here.
-  uint64_t released =
-      TrimConsumers(needed - free_bytes, requester);
+  //
+  // This runs wherever the allocator happens to be, which is in the middle of a
+  // submission, so only the consumers that hold nothing the GPU can reach are
+  // asked - see RegisterConsumer. Whatever that leaves short is remembered and
+  // taken at the next submission boundary, where the render targets and
+  // textures can safely be released.
+  uint64_t deficit = needed - free_bytes;
+  uint64_t released = TrimConsumers(deficit, requester,
+                                    /*mid_submission=*/true);
+  total_reserved_for_allocations_bytes_ += released;
+  if (released < deficit) {
+    uint64_t remaining = deficit - released;
+    deferred_deficit_bytes_ = std::max(deferred_deficit_bytes_, remaining);
+    total_deferred_deficit_bytes_ += remaining;
+  }
   if (!released) {
     return false;
   }
-  total_reserved_for_allocations_bytes_ += released;
   free_bytes = QueryFreeHostBytes();
   if (free_bytes != UINT64_MAX) {
     last_free_bytes_ = free_bytes;
@@ -311,9 +329,17 @@ uint64_t GpuMemoryArbiter::ReportAllocationFailure(ConsumerKind requester,
 
   // Free what the retry needs, not a capped bite - a bite smaller than the
   // allocation cannot make it succeed, and failing the same allocation again
-  // costs another full driver attempt.
-  uint64_t released = TrimConsumers(bytes, requester);
+  // costs another full driver attempt. Restricted to what is safe to release
+  // in the middle of a submission; the rest is taken at the next boundary and
+  // the title's next attempt at the same resolve gets it.
+  uint64_t released = TrimConsumers(bytes, requester,
+                                    /*mid_submission=*/true);
   total_reserved_for_allocations_bytes_ += released;
+  if (released < bytes) {
+    uint64_t remaining = bytes - released;
+    deferred_deficit_bytes_ = std::max(deferred_deficit_bytes_, remaining);
+    total_deferred_deficit_bytes_ += remaining;
+  }
   uint64_t free_bytes = QueryFreeHostBytes();
   if (free_bytes != UINT64_MAX) {
     last_free_bytes_ = free_bytes;
@@ -428,11 +454,16 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   } else {
     allocation_failure_bytes_ = 0;
   }
+  // An allocator that could not be served in the middle of a submission left
+  // its shortfall here. This is the safe point it was waiting for.
+  Pressure by_deferred =
+      deferred_deficit_bytes_ ? Pressure::kCritical : Pressure::kNone;
   Pressure new_pressure;
   if (free_bytes == UINT64_MAX) {
     new_pressure = Pressure::kNone;
   } else {
-    new_pressure = std::max(std::max(by_trend, by_level), by_failure);
+    new_pressure = std::max(std::max(by_trend, by_level),
+                            std::max(by_failure, by_deferred));
   }
   // Hysteresis. A Dark Souls II session sat at 727-735 MB free while the rate
   // wobbled between 45 and 58 MB/s, and the level flapped
@@ -509,8 +540,11 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
     bytes_to_free += reserve - free_bytes;
   }
   // A recent failure overrides the estimate: that allocation is what the title
-  // is actually waiting for, and anything less than its size cannot help.
+  // is actually waiting for, and anything less than its size cannot help. So
+  // does a shortfall an allocator could not be served with mid-submission.
   bytes_to_free = std::max(bytes_to_free, allocation_failure_bytes_);
+  bytes_to_free = std::max(bytes_to_free, deferred_deficit_bytes_);
+  deferred_deficit_bytes_ = 0;
   if (new_pressure == Pressure::kElevated) {
     // Elevated is the smoothing band. Give back a little on every pass, well
     // before anything is urgent, so the shortage is met by a series of
@@ -538,7 +572,11 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   bytes_to_free = std::min(bytes_to_free, per_pass_cap);
   uint64_t total_before = GetTotalUsage();
 
-  uint64_t released_total = TrimConsumers(bytes_to_free, ConsumerKind::kCount);
+  // Every consumer may be asked here: nothing has been recorded into the
+  // command list yet, so releasing a host resource cannot leave a recorded
+  // command pointing at it.
+  uint64_t released_total = TrimConsumers(bytes_to_free, ConsumerKind::kCount,
+                                          /*mid_submission=*/false);
 
   last_trim_submission_ = submission_index;
   ++total_trims_;

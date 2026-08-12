@@ -111,6 +111,24 @@ class PipelineCache {
                                         uint64_t pixel_shader_hash) {
     solver_.QuarantineExecutionSuspect(vertex_shader_hash, pixel_shader_hash);
   }
+  // An isolated draw hung the GPU - exact attribution, not a suspect.
+  void SolverQuarantineIsolatedExecutionHang(uint64_t vertex_shader_hash,
+                                             uint64_t pixel_shader_hash) {
+    solver_.QuarantineIsolatedExecutionHang(vertex_shader_hash,
+                                            pixel_shader_hash);
+  }
+  // Quarantined at startup or at any point since - the draw path asks per draw,
+  // so a pair quarantined mid-run stops being submitted immediately.
+  bool SolverIsShaderToxic(uint64_t vertex_shader_hash,
+                           uint64_t pixel_shader_hash) const {
+    return solver_.IsShaderToxic(vertex_shader_hash, pixel_shader_hash);
+  }
+  size_t solver_verified_at_startup() const {
+    return solver_.verified_at_startup();
+  }
+  size_t solver_verified_this_run() const {
+    return solver_.verified_this_run();
+  }
 #endif  // XE_PLATFORM_WINRT
 
   void EndSubmission();

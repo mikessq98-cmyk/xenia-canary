@@ -70,8 +70,10 @@ class ToxicShaderSolver {
   bool enabled() const { return enabled_; }
   const std::filesystem::path& toxic_path() const { return toxic_path_; }
 
-  // Confirmed-toxic lookup. The set is immutable after Initialize (built before
-  // any creation thread runs), so reads are lock-free.
+  // Confirmed-toxic lookup: the list loaded at startup, plus anything this run
+  // has quarantined since. A quarantine takes effect IMMEDIATELY - writing it
+  // to the file and waiting for the next launch to honour it means the run that
+  // found the bad pair keeps drawing with it.
   bool IsShaderToxic(uint64_t vertex_shader_hash,
                      uint64_t pixel_shader_hash) const;
 
@@ -168,6 +170,26 @@ class ToxicShaderSolver {
   void QuarantineExecutionSuspect(uint64_t vertex_shader_hash,
                                   uint64_t pixel_shader_hash);
 
+  // THE draw did not come back. This is the one execution-side verdict that is
+  // not a guess: the pair was submitted on its own and waited on, so nothing
+  // else was in flight and the attribution is exact. Quarantined here and now
+  // rather than left in the journal for the next launch to interpret - the run
+  // that found it is the run that knows, and a file that has to survive a
+  // device loss and a shutdown to carry the answer is one more thing that can
+  // go wrong.
+  void QuarantineIsolatedExecutionHang(uint64_t vertex_shader_hash,
+                                       uint64_t pixel_shader_hash);
+  // Whether the culprit is already named, so the device-loss path does not also
+  // ask the next launch to go looking for it.
+  bool execution_hang_identified() const { return execution_hang_identified_; }
+
+  // Pairs proven to survive execution: loaded at startup, and added this run.
+  // Reported by the periodic memory log - a successful verification is silent
+  // by design, and without these two numbers there is no way to tell "nothing
+  // needed checking" from "the list is not being kept".
+  size_t verified_at_startup() const { return verified_at_startup_; }
+  size_t verified_this_run() const { return verified_this_run_; }
+
   // Appends a pair to the persistent skip list, promoting the vertex shader as
   // a whole once it has hung with enough different pixel shaders.
   void AppendToxic(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash);
@@ -212,7 +234,21 @@ class ToxicShaderSolver {
   // as a whole. Two is enough to tell "this pair is broken" from "this vertex
   // shader is broken", and waiting for more costs a crash each.
   static constexpr size_t kToxicPairsPerVertexShader = 2;
+  // Loaded at startup and not written to afterwards, so reads need no lock.
   std::set<std::pair<uint64_t, uint64_t>> toxic_shaders_;
+
+  // Quarantined DURING this run. Kept separate from the startup set, and as a
+  // flat array rather than a container, because it is read on the draw path
+  // from the command processor thread while a creation thread may be appending
+  // to it: a fixed array plus a release/acquire count is a correct lock-free
+  // read, and a std::set would need a lock on every draw to be one. It only
+  // ever holds a handful of entries - a session that finds dozens of pairs the
+  // driver cannot survive has a bigger problem than this list.
+  static constexpr size_t kMaxRuntimeQuarantine = 64;
+  std::pair<uint64_t, uint64_t> runtime_quarantine_[kMaxRuntimeQuarantine] = {};
+  std::atomic<uint32_t> runtime_quarantine_count_{0};
+  void QuarantineForThisRun(uint64_t vertex_shader_hash,
+                            uint64_t pixel_shader_hash);
 
   std::mutex journal_mutex_;
   std::set<std::pair<uint64_t, uint64_t>> inflight_;
@@ -249,6 +285,11 @@ class ToxicShaderSolver {
   std::set<std::pair<uint64_t, uint64_t>> verified_;
   std::filesystem::path verified_path_;
   std::FILE* verified_file_ = nullptr;
+  size_t verified_at_startup_ = 0;
+  size_t verified_this_run_ = 0;
+  // Set once an isolated draw has named itself - see
+  // QuarantineIsolatedExecutionHang.
+  bool execution_hang_identified_ = false;
   // Give up reproducing after this many draws rather than leaving the game a
   // slideshow forever when the hang doesn't come back.
   static constexpr uint32_t kExecutionSafeModeMaxDraws = 300000;

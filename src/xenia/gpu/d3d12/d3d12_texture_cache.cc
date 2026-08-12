@@ -1065,21 +1065,16 @@ bool D3D12TextureCache::MakeRoomForScaledResolveRegion(uint64_t bytes_needed) {
     }
     return true;
   }
-  // Automatic. Give up this cache's OWN dead weight first - regions the game
-  // has stopped resolving into hold nothing anyone can read, and an idle
-  // region's last GPU use is long completed, so the memory serves this request
-  // rather than merely stopping the growth. Then ask the memory core, which is
-  // the only thing that can see the render targets and textures next door.
-  uint64_t released_bytes = ReleaseIdleScaledResolveRegionsForArbiter(0);
-  if (released_bytes) {
-    XELOGI(
-        "D3D12TextureCache: released {} MB of idle scaled resolve regions to "
-        "make room for a new one, {} MB still resident",
-        released_bytes >> 20, scaled_resolve_committed_bytes_ >> 20);
-  }
-  // The core trims everything EXCEPT this cache's own regions if it has to -
-  // asking a cache to release what it is about to allocate is how it ends up
-  // destroying and recreating the same buffer.
+  // Automatic: ask the memory core, which is the only thing that can see the
+  // render targets and textures next door. It never asks this cache to release
+  // what it is about to allocate - a cache made to free memory for its own
+  // allocation just destroys and recreates the same buffer.
+  //
+  // This cache's own idle regions are deliberately NOT swept here. The core
+  // sweeps them on every poll, at the submission boundary; this runs in the
+  // middle of a resolve, and destroying a region's buffer where the command
+  // list may already reference it by raw GPU address is a use-after-free the
+  // GPU only discovers later.
   return command_processor_.memory_arbiter().TryReserveAllocation(
       GpuMemoryArbiter::ConsumerKind::kIdleScaledResolve, bytes_needed);
 }

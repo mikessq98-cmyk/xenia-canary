@@ -228,7 +228,18 @@ void ToxicShaderSolver::Initialize(
           verified_.emplace(vs, ps);
         }
       }
+      verified_at_startup_ = verified_.size();
       verified_file_ = xe::filesystem::OpenFile(verified_path_, "ab");
+      if (!verified_file_) {
+        // Silent before: the run would verify every pair, throw the answers
+        // away and re-verify the whole game on the next launch, with nothing
+        // in the log to say why.
+        XELOGW(
+            "Toxic-shader solver: couldn't open {} for appending - pairs "
+            "proven safe this run will NOT be remembered and every one of them "
+            "will be checked again next launch",
+            xe::path_to_utf8(verified_path_));
+      }
     }
     execution_journal_file_ =
         xe::filesystem::OpenFile(execution_journal_path_, "wb+");
@@ -328,8 +339,41 @@ void ToxicShaderSolver::Shutdown(bool clean_exit) {
   execution_draws_ = 0;
 }
 
+void ToxicShaderSolver::QuarantineForThisRun(uint64_t vertex_shader_hash,
+                                             uint64_t pixel_shader_hash) {
+  // Caller holds nothing; appends are serialized by journal_mutex_, and the
+  // release store publishes the entry to the lock-free readers.
+  std::lock_guard<std::mutex> lock(journal_mutex_);
+  uint32_t count = runtime_quarantine_count_.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (runtime_quarantine_[i].first == vertex_shader_hash &&
+        runtime_quarantine_[i].second == pixel_shader_hash) {
+      return;
+    }
+  }
+  if (count >= kMaxRuntimeQuarantine) {
+    return;
+  }
+  runtime_quarantine_[count] = {vertex_shader_hash, pixel_shader_hash};
+  runtime_quarantine_count_.store(count + 1, std::memory_order_release);
+}
+
 bool ToxicShaderSolver::IsShaderToxic(uint64_t vertex_shader_hash,
                                       uint64_t pixel_shader_hash) const {
+  // Quarantined during this run - checked first because it is the cheap case
+  // and almost always empty.
+  uint32_t runtime_count =
+      runtime_quarantine_count_.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < runtime_count; ++i) {
+    const std::pair<uint64_t, uint64_t>& entry = runtime_quarantine_[i];
+    if (entry.first != vertex_shader_hash) {
+      continue;
+    }
+    if (entry.second == pixel_shader_hash ||
+        entry.second == kToxicAnyPixelShader) {
+      return true;
+    }
+  }
   if (toxic_shaders_.empty()) {
     return false;
   }
@@ -496,8 +540,32 @@ void ToxicShaderSolver::OnDeviceLost() {
   }
 }
 
+void ToxicShaderSolver::QuarantineIsolatedExecutionHang(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+  if (!enabled_) {
+    return;
+  }
+  execution_hang_identified_ = true;
+  AppendToxic(vertex_shader_hash, pixel_shader_hash);
+  // The device is going down with it, so keep whatever else this run learned.
+  device_lost_.store(true, std::memory_order_release);
+  XELOGE(
+      "Toxic-shader solver: VS {:016X}, PS {:016X} HUNG THE GPU. It was the "
+      "only draw in flight - it was submitted on its own and waited on - so "
+      "this is the culprit, not a guess. Quarantined in {}: the next launch "
+      "skips it and needs no hunting. Remove the line if it turns out to be "
+      "the wrong call.",
+      vertex_shader_hash, pixel_shader_hash, xe::path_to_utf8(toxic_path_));
+}
+
 void ToxicShaderSolver::MarkExecutionHang() {
   if (!enabled_) {
+    return;
+  }
+  if (execution_hang_identified_) {
+    // An isolated draw already named itself. Asking the next launch to
+    // serialize every draw would cost a whole slideshow session to rediscover
+    // something that is written down.
     return;
   }
   // A marker, not a suspect list: this run wasn't serializing, so nothing here
@@ -531,6 +599,7 @@ void ToxicShaderSolver::MarkExecutionVerified(uint64_t vertex_shader_hash,
   if (!verified_.emplace(vertex_shader_hash, pixel_shader_hash).second) {
     return;
   }
+  ++verified_this_run_;
   if (!verified_file_) {
     return;
   }
@@ -627,6 +696,11 @@ void ToxicShaderSolver::JournalEnd(uint64_t vertex_shader_hash,
 
 void ToxicShaderSolver::AppendToxic(uint64_t vertex_shader_hash,
                                     uint64_t pixel_shader_hash) {
+  // Effective from this instant, not from the next launch. Every quarantine
+  // goes through here - the compiler crash, the device removal in safe mode,
+  // the execution hang - so all of them now stop the pair being used for the
+  // rest of the session as well as being written down for the next one.
+  QuarantineForThisRun(vertex_shader_hash, pixel_shader_hash);
   {
     // May be called from multiple creation threads (crash-catch path).
     std::lock_guard<std::mutex> lock(journal_mutex_);
@@ -659,6 +733,17 @@ void ToxicShaderSolver::AppendToxic(uint64_t vertex_shader_hash,
   if (!toxic_shaders_.emplace(vertex_shader_hash, kToxicAnyPixelShader)
            .second) {
     return;
+  }
+  // The whole-shader entry has to take effect this run too. Appended inline
+  // rather than through QuarantineForThisRun because journal_mutex_ is held
+  // here and it is not recursive.
+  uint32_t runtime_count =
+      runtime_quarantine_count_.load(std::memory_order_relaxed);
+  if (runtime_count < kMaxRuntimeQuarantine) {
+    runtime_quarantine_[runtime_count] = {vertex_shader_hash,
+                                          kToxicAnyPixelShader};
+    runtime_quarantine_count_.store(runtime_count + 1,
+                                    std::memory_order_release);
   }
   std::ofstream toxic_file(toxic_path_, std::ios::app);
   if (toxic_file) {
