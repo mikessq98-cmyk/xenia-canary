@@ -118,15 +118,38 @@ void ToxicShaderSolver::Initialize(
     }
   }
 
+  // What the last run left in the EXECUTION journal, read first because it can
+  // explain the death on its own.
+  std::vector<std::pair<uint64_t, uint64_t>> execution_suspects;
+  {
+    std::ifstream execution_journal(execution_journal_path_);
+    std::string line;
+    while (std::getline(execution_journal, line)) {
+      uint64_t vs = 0, ps = 0;
+      if (ParseSolverLine(line, vs, ps)) {
+        execution_suspects.emplace_back(vs, ps);
+      }
+    }
+  }
+
   // A leftover ".running" marker means the previous run did NOT exit cleanly -
   // i.e. it crashed. We only pay for the per-creation crash journal while
   // recovering from such a crash; a normal run does no journaling at all (no
   // per-pipeline file I/O under a lock, so no contention on the creation
   // threads), only the cheap in-memory toxic lookup.
+  //
+  // But an execution hang leaves that marker too - the run is deliberately
+  // treated as unclean so its evidence survives - and the creation side then
+  // spent every following launch serializing 192 pipeline creations to hunt a
+  // crash that never happened there. The death is already accounted for when
+  // the execution journal names a draw, so the creation side has nothing to
+  // recover from and stays out of it.
   const bool crashed_last_run = std::filesystem::exists(running_path_, ec);
-  journaling_ = crashed_last_run;
+  const bool explained_by_execution_hang = !execution_suspects.empty();
+  journaling_ = crashed_last_run && !explained_by_execution_hang;
 
-  // Read any journal left behind by that crash (only meaningful if we crashed).
+  // Read any creation journal left behind by that crash (only meaningful if we
+  // crashed).
   std::vector<std::pair<uint64_t, uint64_t>> suspects;
   if (crashed_last_run) {
     std::ifstream journal_file(journal_path_);
@@ -158,7 +181,7 @@ void ToxicShaderSolver::Initialize(
       }
       XELOGW("  quarantined VS {:016X}, PS {:016X}", s.first, s.second);
     }
-  } else if (crashed_last_run) {
+  } else if (crashed_last_run && !explained_by_execution_hang) {
     // Crashed, but that run wasn't journaling yet (the first crash) - nothing
     // was recorded; this run will journal every creation.
     XELOGW(
@@ -176,15 +199,6 @@ void ToxicShaderSolver::Initialize(
   // they RUN. Whatever the last run left in the execution journal was in flight
   // when the device died, and in a serialized run that is exactly one draw.
   {
-    std::vector<std::pair<uint64_t, uint64_t>> execution_suspects;
-    std::ifstream execution_journal(execution_journal_path_);
-    std::string line;
-    while (std::getline(execution_journal, line)) {
-      uint64_t vs = 0, ps = 0;
-      if (ParseSolverLine(line, vs, ps)) {
-        execution_suspects.emplace_back(vs, ps);
-      }
-    }
     if (!execution_suspects.empty()) {
       XELOGW(
           "Toxic-shader solver: {} draw(s) were in flight when the GPU hung "
@@ -546,30 +560,27 @@ void ToxicShaderSolver::QuarantineIsolatedExecutionHang(
     return;
   }
   execution_hang_identified_ = true;
-  // Record the exact pair - it is what actually hung, and a human pruning the
-  // file needs to see it.
+  // The PAIR, and only the pair.
+  //
+  // Condemning the whole vertex shader on the first hang was tried and it is
+  // too broad: Black Ops' VS 75FFB53186F0DC20 draws with many different pixel
+  // shaders, so quarantining the shader outright removed all of them at once
+  // and left the scene with holes in it. One hang is one data point, and the
+  // promotion rule in AppendToxic already handles the case it was meant to -
+  // once the SAME vertex shader has hung with two different pixel shaders, it
+  // is the shader that is at fault and it gets condemned then, on evidence,
+  // instead of on the first sighting.
   AppendToxic(vertex_shader_hash, pixel_shader_hash);
-  // Then condemn the VERTEX SHADER as a whole, immediately, rather than after
-  // it has hung with two different pixel shaders as the creation-side rule
-  // requires. A GPU hang costs a device removal and a restart, so waiting for a
-  // second data point costs a whole session - and the evidence says there will
-  // be one: Black Ops' VS 75FFB53186F0DC20 (the shader in this very log) is
-  // drawn with at least four different pixel shaders, so pair-by-pair this
-  // converges in four device losses instead of one.
-  AppendToxic(vertex_shader_hash, kToxicAnyPixelShader);
   // The device is going down with it, so keep whatever else this run learned.
   device_lost_.store(true, std::memory_order_release);
   XELOGE(
       "Toxic-shader solver: VS {:016X}, PS {:016X} HUNG THE GPU. It was the "
       "only draw in flight - submitted on its own and waited on - so this is "
-      "the culprit, not a guess. EVERY draw using VS {:016X} is quarantined "
-      "from now on, not just this pair, because one hang costs a device "
-      "removal and the same vertex shader usually comes back with a different "
-      "pixel shader. Written to {} - prune it if that turns out too broad. "
-      "This run cannot continue: the OS has already removed the GPU device, "
-      "which no amount of skipping can undo.",
-      vertex_shader_hash, pixel_shader_hash, vertex_shader_hash,
-      xe::path_to_utf8(toxic_path_));
+      "the culprit, not a guess. The pair is quarantined from now on, here and "
+      "in {}; if this same vertex shader hangs with another pixel shader too, "
+      "the shader as a whole goes. This run cannot continue: the OS has "
+      "already removed the GPU device, which no amount of skipping can undo.",
+      vertex_shader_hash, pixel_shader_hash, xe::path_to_utf8(toxic_path_));
 }
 
 void ToxicShaderSolver::MarkExecutionHang() {

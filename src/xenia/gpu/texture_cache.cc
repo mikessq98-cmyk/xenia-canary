@@ -53,9 +53,16 @@ DEFINE_uint32(
     "memory back when it needs it.",
     "GPU");
 DEFINE_bool(
-    texture_cache_skip_unchanged_uploads, true,
+    texture_cache_skip_unchanged_uploads, false,
     "Skip re-uploading a texture when the guest wrote the memory it watches "
     "but the bytes did not actually change.\n"
+    "OFF by default: the first version of this put black surfaces on screen "
+    "(it recorded what it was about to upload before knowing the upload had "
+    "succeeded, and a second path uploaded without recording anything at all, "
+    "so a later write matched a hash for content that was never there). Both "
+    "are fixed, but nothing has confirmed that on hardware yet, and a wrong "
+    "picture is worse than a slow one. Turn it on to test - the memory report "
+    "shows what it saves.\n"
     "Measured, not assumed: a Black Ops session uploaded 68 GB of texture data "
     "against a resident cache of 1877 MB, and a quarter of those uploads were "
     "byte-identical to something already loaded. WHY the guest rewrites "
@@ -952,9 +959,39 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
   return scale_bits;
 }
 
+void TextureCache::CommitUploadedTextureHashes(Texture& texture,
+                                               uint64_t base_hash,
+                                               uint64_t mips_hash) {
+  // ONLY after the upload actually succeeded. Recording the hash before the
+  // load - which is what the first version did - means a load that fails, and
+  // they do fail when the host is out of memory, leaves the cache convinced it
+  // holds bytes it never uploaded. Every later write of the same content is
+  // then skipped and the texture stays empty for the rest of the session,
+  // which is exactly the black surfaces that showed up on hardware.
+  if (base_hash) {
+    texture.uploaded_base_hash_ = base_hash;
+  }
+  if (mips_hash) {
+    texture.uploaded_mips_hash_ = mips_hash;
+  }
+}
+
+void TextureCache::InvalidateUploadedTextureHashes(Texture& texture) {
+  // Whatever is on the host is no longer described by the recorded hashes.
+  // Used by the load path that does not maintain them: without this, an upload
+  // through that path leaves a STALE hash behind, and the next write of the
+  // older content matches it and gets skipped - showing the wrong picture
+  // rather than a missing one, which is worse.
+  texture.uploaded_base_hash_ = 0;
+  texture.uploaded_mips_hash_ = 0;
+}
+
 bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
-                                              bool& load_base,
-                                              bool& load_mips) {
+                                              bool& load_base, bool& load_mips,
+                                              uint64_t& base_hash_out,
+                                              uint64_t& mips_hash_out) {
+  base_hash_out = 0;
+  mips_hash_out = 0;
   if (!cvars::texture_cache_skip_unchanged_uploads ||
       (!load_base && !load_mips)) {
     return false;
@@ -987,7 +1024,8 @@ bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
         ++skipped_upload_count_;
         skipped_upload_bytes_ += size;
       } else {
-        texture.uploaded_base_hash_ = hash;
+        // Carried out, not stored - see CommitUploadedTextureHashes.
+        base_hash_out = hash;
       }
     }
   }
@@ -1006,7 +1044,7 @@ bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
         ++skipped_upload_count_;
         skipped_upload_bytes_ += size;
       } else {
-        texture.uploaded_mips_hash_ = hash;
+        mips_hash_out = hash;
       }
     }
   }
@@ -1193,7 +1231,9 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     // very often wrote the SAME BYTES back. See SkipUnchangedTextureUpload.
     bool load_base = (index_base_outdated & (1ULL << i)) != 0;
     bool load_mips = (index_mips_outdated & (1ULL << i)) != 0;
-    if (SkipUnchangedTextureUpload(texture, load_base, load_mips)) {
+    uint64_t pending_base_hash = 0, pending_mips_hash = 0;
+    if (SkipUnchangedTextureUpload(texture, load_base, load_mips,
+                                   pending_base_hash, pending_mips_hash)) {
       // Nothing to upload, but the watch still has to be re-armed, so the
       // texture goes through the rest of the pass as if it had been loaded.
       textures[i] = &texture;
@@ -1205,6 +1245,8 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
                                                load_mips)) {
       continue;
     }
+    CommitUploadedTextureHashes(texture, load_base ? pending_base_hash : 0,
+                                load_mips ? pending_mips_hash : 0);
     MeasureTextureContentDuplicate(texture);
 
     // reque for makeuptodatandwatch
@@ -1330,6 +1372,11 @@ bool TextureCache::LoadTextureData(Texture& texture) {
                                              mips_outdated)) {
     return false;
   }
+  // This path uploads without maintaining the content hashes, so whatever they
+  // said is no longer true of the host texture. Clearing them makes the next
+  // write re-upload; leaving them would let a stale hash match and skip an
+  // upload that was needed.
+  InvalidateUploadedTextureHashes(texture);
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a

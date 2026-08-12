@@ -669,7 +669,14 @@ class TextureCache {
   // nothing to upload at all. See the definition for why that case is common
   // here and was not on the original console.
   bool SkipUnchangedTextureUpload(Texture& texture, bool& load_base,
-                                  bool& load_mips);
+                                  bool& load_mips, uint64_t& base_hash_out,
+                                  uint64_t& mips_hash_out);
+  // Records what was uploaded - only ever called after the upload succeeded.
+  void CommitUploadedTextureHashes(Texture& texture, uint64_t base_hash,
+                                   uint64_t mips_hash);
+  // Forgets what the host texture holds, for paths that upload without
+  // maintaining the hashes.
+  void InvalidateUploadedTextureHashes(Texture& texture);
   uint64_t skipped_upload_count_ = 0;
   uint64_t skipped_upload_bytes_ = 0;
   double total_texture_load_ms_ = 0.0;
