@@ -565,6 +565,12 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
       g_blocked_phase_totals.occurrences.load(std::memory_order_relaxed),
       pipeline_blocked_ms + texture_blocked_ms + submission_blocked_ms,
       pipeline_blocked_ms, texture_blocked_ms, submission_blocked_ms);
+  if (pipeline_cache_) {
+    std::string blobs = pipeline_cache_->GetPipelineBlobCacheReport();
+    if (!blobs.empty()) {
+      XELOGI("[MEM] pipeline blob cache: {}", blobs);
+    }
+  }
 #if XE_PLATFORM_WINRT
   if (pipeline_cache_) {
     // A pair that passes execution verification is silent by design, which

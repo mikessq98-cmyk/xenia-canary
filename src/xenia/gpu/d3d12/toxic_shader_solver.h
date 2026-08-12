@@ -269,6 +269,11 @@ class ToxicShaderSolver {
   // compile fine at 1x1, and a Dark Souls II session at 3x3 ended with exactly
   // that crash at 727 MB free.
   static constexpr uint64_t kCompilerOutOfMemoryBytes = UINT64_C(768) << 20;
+  // Preflight is asked once per pipeline creation, and a prewarm creates every
+  // pipeline a title has. The host reading is shared for this long instead.
+  static constexpr uint64_t kPreflightSampleValidMs = 50;
+  mutable std::atomic<uint64_t> preflight_free_bytes_{0};
+  mutable std::atomic<uint64_t> preflight_sample_time_ms_{0};
 
   // Execution-side solver. A pipeline that CREATES fine can still hang the GPU
   // when it runs (Black Ops does, reproducibly, on one object).

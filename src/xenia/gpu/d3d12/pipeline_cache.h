@@ -34,6 +34,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
+#include "xenia/gpu/d3d12/pipeline_blob_cache.h"
 #include "xenia/gpu/d3d12/toxic_shader_solver.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -129,6 +130,12 @@ class PipelineCache {
   size_t solver_verified_this_run() const {
     return solver_.verified_this_run();
   }
+#endif  // XE_PLATFORM_WINRT
+  // How much pipeline compilation the stored driver blobs saved this launch.
+  std::string GetPipelineBlobCacheReport() const {
+    return blob_cache_.GetReport();
+  }
+#if XE_PLATFORM_WINRT
 #endif  // XE_PLATFORM_WINRT
 
   void EndSubmission();
@@ -518,6 +525,12 @@ class PipelineCache {
   // and the solver decides what it means.
   ToxicShaderSolver solver_;
 #endif  // XE_PLATFORM_WINRT
+
+  // What the driver produced for each pipeline last launch, so it does not
+  // have to produce it again. Not WINRT-only: nothing about a per-pipeline
+  // cached blob is console-specific, and a desktop driver benefits from it for
+  // the same reason.
+  PipelineBlobCache blob_cache_;
 
   // Sum of resident translated shader bytecode sizes (incremented on a
   // successful translation, decremented when released under memory pressure).

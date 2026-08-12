@@ -403,6 +403,7 @@ void PipelineCache::Shutdown() {
   // Clean teardown (threads already joined above, so no creation is in flight):
   // discard the crash journal so a normal exit isn't mistaken for a crash.
   solver_.Shutdown(/*clean_exit=*/true);
+  blob_cache_.Shutdown(/*clean_exit=*/true);
 #endif  // XE_PLATFORM_WINRT
 
   // Destroy all pipelines.
@@ -505,6 +506,10 @@ void PipelineCache::InitializeShaderStorage(
     InitializePipelineLibrary(solver_root, title_id);
     solver_.Initialize(solver_root, title_id);
   }
+  // Before any pipeline is created below, so the prewarm - which creates all
+  // of them - is exactly what the stored blobs serve.
+  blob_cache_.Initialize(GetShaderStorageRoot(cache_root), title_id,
+                         command_processor_.GetD3D12Provider());
 #endif  // XE_PLATFORM_WINRT
 
   // Create the pipelines.
@@ -758,6 +763,10 @@ void PipelineCache::InitializeShaderStorage(
         "Pipeline cache loaded: {} created, {} already exist, {} total stored",
         pipelines_created, pipelines_already_exist,
         pipeline_stored_descriptions.size());
+    // The prewarm is what the stored blobs exist for. Past it they are tens of
+    // megabytes doing nothing, on a budget where that matters - and having got
+    // this far without dying, they are cleared of having caused a crash.
+    blob_cache_.ReleaseLoadedBlobs();
     if (pipelines_vs_not_found || pipelines_vs_translation_missing ||
         pipelines_ps_not_found || pipelines_ps_translation_missing ||
         pipelines_root_sig_failed) {
@@ -4382,12 +4391,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     return nullptr;
   }
   ToxicShaderSolver::CreationProbe solver_probe(solver_, vs_hash, ps_hash);
+  uint64_t description_hash = XXH3_64bits(&description, sizeof(description));
   // Ask the pipeline library first - a hit skips the driver's compiler
   // entirely, which is the whole point of keeping it.
   std::wstring library_name;
   if (pipeline_library_) {
-    library_name =
-        fmt::format(L"{:016X}", XXH3_64bits(&description, sizeof(description)));
+    library_name = fmt::format(L"{:016X}", description_hash);
     std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
     if (SUCCEEDED(pipeline_library_->LoadGraphicsPipeline(
             library_name.c_str(), &state_desc, IID_PPV_ARGS(&state)))) {
@@ -4396,9 +4405,29 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
   }
 
+  // Hand the driver back what it produced for this exact pipeline last time,
+  // if we have it - that is the difference between loading a pipeline and
+  // compiling one, and compiling is 6-8 per second on this driver.
+  bool used_cached_blob = blob_cache_.ApplyTo(description_hash, state_desc);
+
   DWORD creation_exception_code = 0;
   HRESULT hr = CreateGraphicsPipelineStateGuarded(
       device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
+  if (used_cached_blob && (FAILED(hr) || creation_exception_code != 0)) {
+    // The runtime refused the blob (a driver update, or it simply does not
+    // like it), or the driver fell over on it. Either way this pipeline is
+    // fine - only its stored blob is not. Drop it and compile normally; this
+    // per-pipeline recovery is the whole reason for preferring cached blobs
+    // over ID3D12PipelineLibrary, where the same event takes everything down.
+    blob_cache_.Discard(description_hash);
+    state = nullptr;
+    state_desc.CachedPSO.pCachedBlob = nullptr;
+    state_desc.CachedPSO.CachedBlobSizeInBytes = 0;
+    creation_exception_code = 0;
+    used_cached_blob = false;
+    hr = CreateGraphicsPipelineStateGuarded(
+        device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
+  }
   if (creation_exception_code != 0) {
     // The compiler crashed and the exception was contained. Whether that means
     // the pair is toxic or simply that the process is out of memory is the
@@ -4578,6 +4607,13 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.vertex_shader->shader().ucode_data_hash());
   }
   state->SetName(name.c_str());
+
+  // Keep what the driver just produced, unless it came from a stored blob in
+  // the first place - re-storing that would only rewrite what is already
+  // there.
+  if (!used_cached_blob) {
+    blob_cache_.Store(description_hash, state);
+  }
 
   // Hand the freshly compiled pipeline to the library so the next launch does
   // not have to compile it again.

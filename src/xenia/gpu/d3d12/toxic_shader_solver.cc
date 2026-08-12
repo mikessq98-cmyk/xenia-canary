@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -419,7 +420,23 @@ ToxicShaderSolver::PreflightVerdict ToxicShaderSolver::Preflight() const {
   // that would have been skipped anyway (the pipeline would not have been
   // built), and the memory core is meanwhile freeing memory, so the retry
   // usually succeeds.
-  uint64_t free_bytes = QueryFreeHostBytes();
+  // Cached for a moment rather than queried per pipeline. The prewarm creates
+  // every pipeline a title has - 587 in Black Ops - so an uncached query here
+  // is 587 syscalls on the creation threads to answer a question whose answer
+  // cannot meaningfully change between two pipelines compiled milliseconds
+  // apart. Racy by construction and that is fine: the worst case is acting on
+  // a reading a few tens of milliseconds old, which is what the alternative
+  // does anyway.
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  uint64_t sampled_at = preflight_sample_time_ms_.load(std::memory_order_acquire);
+  uint64_t free_bytes;
+  if (sampled_at && now_ms - sampled_at < kPreflightSampleValidMs) {
+    free_bytes = preflight_free_bytes_.load(std::memory_order_relaxed);
+  } else {
+    free_bytes = QueryFreeHostBytes();
+    preflight_free_bytes_.store(free_bytes, std::memory_order_relaxed);
+    preflight_sample_time_ms_.store(now_ms, std::memory_order_release);
+  }
   if (free_bytes != UINT64_MAX && free_bytes < kCompilerOutOfMemoryBytes) {
     return PreflightVerdict::kDeferOutOfMemory;
   }
