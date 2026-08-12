@@ -9,12 +9,14 @@
 
 #include "xenia/gpu/dxbc_shader_translator.h"
 
+#include <atomic>
 #include <cstring>
 
 #include "third_party/dxbc/DXBCChecksum.h"
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/xenos.h"
@@ -1184,6 +1186,24 @@ void DxbcShaderTranslator::StartTranslation() {
     if (UseMainLoopGuard()) {
       // .x = iteration counter (zero-initialized), .y = limit test scratch.
       system_temp_main_loop_guard_ = PushSystemTemp(0b0011);
+#if XE_PLATFORM_WINRT
+      // Say once, out loud, that the watchdog is really in the shaders. It is
+      // the ONLY thing that can turn a miscompiled shader into one wrong draw
+      // instead of a device removal - by the time anything else notices, the
+      // OS has already taken the GPU away - and there was no way to confirm
+      // from a log whether it had been emitted at all.
+      static std::atomic<bool> guard_logged{false};
+      if (!guard_logged.exchange(true, std::memory_order_relaxed)) {
+        XELOGI(
+            "In-shader main loop guard ACTIVE at {} iterations. A shader whose "
+            "control flow the driver miscompiles exits after that instead of "
+            "spinning until the OS removes the device. The cap must be low "
+            "enough that a full-screen pass with every invocation hitting it "
+            "still finishes inside the OS GPU-hang window - so it belongs "
+            "DOWN as the resolution scale goes up.",
+            uint32_t(cvars::dxbc_main_loop_guard_iterations));
+      }
+#endif  // XE_PLATFORM_WINRT
     }
   }
 

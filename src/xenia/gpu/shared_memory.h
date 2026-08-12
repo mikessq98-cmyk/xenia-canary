@@ -114,6 +114,10 @@ class SharedMemory {
     return host_gpu_memory_sparse_used_bytes_;
   }
 
+  // Public so a caller holding only a SharedMemory can read the guest bytes it
+  // mirrors - the texture cache does, to hash what a texture was built from.
+  Memory& memory() const { return memory_; }
+
  protected:
   SharedMemory(Memory& memory);
   // Call in implementation-specific initialization.
@@ -128,8 +132,6 @@ class SharedMemory {
   // much).
   static constexpr uint32_t kHostGpuMemoryOptimalSparseAllocationLog2 = 22;
   static_assert(kHostGpuMemoryOptimalSparseAllocationLog2 <= kBufferSizeLog2);
-
-  Memory& memory() const { return memory_; }
 
   uint32_t page_size_log2() const { return page_size_log2_; }
 

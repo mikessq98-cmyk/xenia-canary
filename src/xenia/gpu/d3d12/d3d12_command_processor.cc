@@ -570,6 +570,12 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
         pipeline_cache_->solver_verified_this_run());
   }
 #endif  // XE_PLATFORM_WINRT
+  if (texture_cache_) {
+    std::string duplicates = texture_cache_->GetContentDuplicateReport();
+    if (!duplicates.empty()) {
+      XELOGI("[MEM] texture content duplicates: {}", duplicates);
+    }
+  }
 }
 
 void D3D12CommandProcessor::InitializeShaderStorage(

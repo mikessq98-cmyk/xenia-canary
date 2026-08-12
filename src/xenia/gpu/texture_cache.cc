@@ -15,6 +15,8 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+#include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
@@ -40,15 +42,27 @@ DEFINE_int32(
     "GPU");
 DEFINE_uint32(
     texture_cache_idle_eviction_seconds, 45,
-    "Seconds a texture has to go unused before it is released even though "
-    "there is no shortage of host memory and the cache is under its limits.\n"
-    "Keeping a texture costs nothing while memory is plentiful, but a texture "
-    "the game stopped drawing with minutes ago is very unlikely to come back "
-    "before the scene changes, and releasing it early keeps the headroom that "
-    "stops the emergency eviction path - the one that blocks the command "
-    "processor reloading textures mid-frame - from ever running.\n"
-    "0 disables this and keeps everything until a limit or the memory arbiter "
-    "forces a release.",
+    "Seconds a texture has to go unused before it is released, once the memory "
+    "core says host memory is wanted.\n"
+    "This no longer applies while there is no shortage: a texture costs 10-38 "
+    "ms of driver time to create again on the Xbox UWP driver, so releasing "
+    "one because nobody drew it for a while - with gigabytes free - pays that "
+    "for nothing, and the reload is what the player sees as the world "
+    "flickering.\n"
+    "0 disables age-based release entirely; the memory core still asks for "
+    "memory back when it needs it.",
+    "GPU");
+DEFINE_bool(
+    texture_cache_measure_content_duplicates, false,
+    "Diagnostic: hash the guest bytes of every texture as it is loaded and "
+    "report how many of them were byte-identical to a texture already loaded, "
+    "and how much host memory those duplicates account for.\n"
+    "Answers whether deduplicating textures by content would be worth building "
+    "before anything is built on the idea - a game that streams thousands of "
+    "small textures may be loading the same picture at several guest "
+    "addresses, or may not be, and the two cases look identical from the "
+    "outside. Costs one hash of the base level per load; leave it off "
+    "otherwise.",
     "GPU");
 DEFINE_bool(tiled_shared_memory, true,
             "Enable tiled/sparse resources for efficient large address space "
@@ -203,6 +217,20 @@ void TextureCache::CompletedSubmissionUpdated(
   // core only decides how impatient to be about it.
   GpuMemoryArbiter::Pressure pressure =
       host_memory_pressure_.load(std::memory_order_relaxed);
+  // With memory to spare, age is not a reason to destroy anything. A texture
+  // costs 10-38 ms of driver time to create again - measured on this console -
+  // so throwing one away because nobody drew it for a while, while gigabytes
+  // sit free, buys nothing and costs that. It is also exactly what the player
+  // sees: Black Ops at 1x1 held 123 MB of textures with 2.9 GB free and still
+  // destroyed 20-37 of them every few seconds, so turning around and coming
+  // back made the world flicker and reload.
+  //
+  // Time was the last threshold a cache still owned. It goes the same way as
+  // the size limits did: the core says whether memory is wanted, and only then
+  // does anything age out.
+  if (pressure == GpuMemoryArbiter::Pressure::kNone) {
+    return;
+  }
   uint64_t idle_eviction_ms =
       uint64_t(cvars::texture_cache_idle_eviction_seconds) * 1000;
   switch (pressure) {
@@ -238,6 +266,19 @@ void TextureCache::CompletedSubmissionUpdated(
   bool destroyed_any = false;
   uint64_t usage_before = textures_total_host_memory_usage_;
   size_t destroyed_count = 0;
+  // How much ONE pass may take. Without a cap this drains everything that has
+  // aged out, and when the core raises the pressure level the age limit drops
+  // by a factor of four, so thousands of textures qualify in the same instant:
+  // Black Ops destroyed 5114 of them in a single pass, 1593 MB down to 611 MB,
+  // then grew straight back and did it again. That is a relaxation oscillator,
+  // and the player sees it as the world flickering and reloading. The same
+  // textures still go - just spread over passes, at a rate the loader can keep
+  // up with instead of a cliff on the command processor thread.
+  const uint64_t max_bytes_this_pass =
+      pressure == GpuMemoryArbiter::Pressure::kCritical
+          ? kMaxIdleEvictionBytesPerPassCritical
+          : kMaxIdleEvictionBytesPerPass;
+  uint64_t released_this_pass = 0;
   const char* reason =
       pressure == GpuMemoryArbiter::Pressure::kCritical
           ? "unused, host memory critical"
@@ -255,6 +296,10 @@ void TextureCache::CompletedSubmissionUpdated(
     if (unused_for_ms < idle_eviction_ms) {
       break;
     }
+    if (released_this_pass >= max_bytes_this_pass) {
+      break;
+    }
+    released_this_pass += texture->GetHostMemoryUsage();
     if (!destroyed_any) {
       destroyed_any = true;
       // The texture being destroyed might have been bound in the previous
@@ -877,6 +922,45 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
   return scale_bits;
 }
 
+void TextureCache::MeasureTextureContentDuplicate(const Texture& texture) {
+  if (!cvars::texture_cache_measure_content_duplicates) {
+    return;
+  }
+  uint32_t base_size = texture.GetGuestBaseSize();
+  if (!base_size) {
+    return;
+  }
+  const uint8_t* guest_data = shared_memory().memory().TranslatePhysical(
+      texture.key().base_page << 12);
+  if (!guest_data) {
+    return;
+  }
+  // The base level only. It is the bulk of a texture and enough to tell
+  // "the same picture loaded twice" from "two different pictures"; hashing the
+  // mip chain as well would double the cost of the measurement for nothing.
+  uint64_t content_hash = XXH3_64bits(guest_data, base_size);
+  uint64_t host_bytes = texture.GetHostMemoryUsage();
+  ++measured_texture_count_;
+  measured_texture_bytes_ += host_bytes;
+  auto inserted = measured_content_hashes_.emplace(content_hash, host_bytes);
+  if (!inserted.second) {
+    ++measured_duplicate_count_;
+    measured_duplicate_bytes_ += host_bytes;
+  }
+}
+
+std::string TextureCache::GetContentDuplicateReport() const {
+  if (!cvars::texture_cache_measure_content_duplicates ||
+      !measured_texture_count_) {
+    return std::string();
+  }
+  return fmt::format(
+      "{} of {} textures loaded were byte-identical to one already loaded, "
+      "{} MB of {} MB",
+      measured_duplicate_count_, measured_texture_count_,
+      measured_duplicate_bytes_ >> 20, measured_texture_bytes_ >> 20);
+}
+
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
   assert_true(n_textures <= 64);
   if (n_textures < 2) {
@@ -998,6 +1082,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
             (index_mips_outdated & (1ULL << i)) != 0)) {
       continue;
     }
+    MeasureTextureContentDuplicate(texture);
 
     // reque for makeuptodatandwatch
     textures[i] = &texture;

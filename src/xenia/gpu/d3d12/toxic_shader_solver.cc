@@ -546,16 +546,30 @@ void ToxicShaderSolver::QuarantineIsolatedExecutionHang(
     return;
   }
   execution_hang_identified_ = true;
+  // Record the exact pair - it is what actually hung, and a human pruning the
+  // file needs to see it.
   AppendToxic(vertex_shader_hash, pixel_shader_hash);
+  // Then condemn the VERTEX SHADER as a whole, immediately, rather than after
+  // it has hung with two different pixel shaders as the creation-side rule
+  // requires. A GPU hang costs a device removal and a restart, so waiting for a
+  // second data point costs a whole session - and the evidence says there will
+  // be one: Black Ops' VS 75FFB53186F0DC20 (the shader in this very log) is
+  // drawn with at least four different pixel shaders, so pair-by-pair this
+  // converges in four device losses instead of one.
+  AppendToxic(vertex_shader_hash, kToxicAnyPixelShader);
   // The device is going down with it, so keep whatever else this run learned.
   device_lost_.store(true, std::memory_order_release);
   XELOGE(
       "Toxic-shader solver: VS {:016X}, PS {:016X} HUNG THE GPU. It was the "
-      "only draw in flight - it was submitted on its own and waited on - so "
-      "this is the culprit, not a guess. Quarantined in {}: the next launch "
-      "skips it and needs no hunting. Remove the line if it turns out to be "
-      "the wrong call.",
-      vertex_shader_hash, pixel_shader_hash, xe::path_to_utf8(toxic_path_));
+      "only draw in flight - submitted on its own and waited on - so this is "
+      "the culprit, not a guess. EVERY draw using VS {:016X} is quarantined "
+      "from now on, not just this pair, because one hang costs a device "
+      "removal and the same vertex shader usually comes back with a different "
+      "pixel shader. Written to {} - prune it if that turns out too broad. "
+      "This run cannot continue: the OS has already removed the GPU device, "
+      "which no amount of skipping can undo.",
+      vertex_shader_hash, pixel_shader_hash, vertex_shader_hash,
+      xe::path_to_utf8(toxic_path_));
 }
 
 void ToxicShaderSolver::MarkExecutionHang() {

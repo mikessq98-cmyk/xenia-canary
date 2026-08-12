@@ -648,6 +648,29 @@ class TextureCache {
                                       uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
+
+  // Hashes the guest bytes a texture was just built from and counts how much of
+  // the cache is byte-identical to something already in it. Costs a hash per
+  // load, so it is behind a cvar and off by default - the point is to answer,
+  // with a number instead of an opinion, whether deduplicating textures by
+  // content would buy anything before anything is built on the idea. Black Ops
+  // holds thousands of small textures (5114 destroyed in one pass, 1593 MB), so
+  // it is a fair question; the cost of a texture on this console is the host
+  // resource, 10-38 ms of driver time, which dedup would also save.
+  void MeasureTextureContentDuplicate(const Texture& texture);
+  std::unordered_map<uint64_t, uint64_t> measured_content_hashes_;
+  uint64_t measured_duplicate_count_ = 0;
+  uint64_t measured_duplicate_bytes_ = 0;
+  uint64_t measured_texture_count_ = 0;
+  uint64_t measured_texture_bytes_ = 0;
+
+ public:
+  // One line for the periodic memory report; empty when the measurement is off.
+  std::string GetContentDuplicateReport() const;
+
+  // Back to the access this section had - everything below was protected, and
+  // closing with `private` here silently took it away from the backends.
+ protected:
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -745,6 +768,12 @@ class TextureCache {
   // this memory - if anything did, the pressure path would be running.
   static constexpr uint64_t kIdleEvictionIntervalSubmissions = 600;
   uint64_t last_idle_eviction_submission_ = 0;
+  // The most one idle-eviction pass may release - see the pass itself. Both
+  // are per pass, and passes are kIdleEvictionIntervalSubmissions apart, so a
+  // cache that genuinely has to shrink still gets there quickly; what is
+  // prevented is doing it all in one frame.
+  static constexpr uint64_t kMaxIdleEvictionBytesPerPass = 64ULL << 20;
+  static constexpr uint64_t kMaxIdleEvictionBytesPerPassCritical = 256ULL << 20;
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;
