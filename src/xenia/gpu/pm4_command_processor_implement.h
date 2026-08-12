@@ -660,6 +660,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   uint32_t frontbuffer_height = reader_.ReadAndSwap<uint32_t>();
   reader_.AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  // One guest frame, from the guest's own point of view - the only place that
+  // is true, since a backend may present fewer or the presenter may repeat one.
+  NoteGuestFrame();
+
   COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
                                frontbuffer_height);
 

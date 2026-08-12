@@ -145,6 +145,23 @@ class CommandProcessor {
   // telemetry. Default no-op; the backend overrides it.
   virtual void LogHostMemoryStatistics() {}
 
+  // HOW FAST IS IT ACTUALLY RUNNING.
+  //
+  // The periodic report says what every cache holds, how much memory is left,
+  // where the command processor blocked and how many draws were dropped - and
+  // said nothing at all about the frame rate, which is the number every one of
+  // those is ultimately in service of. A log could show a session that looked
+  // healthy on every counter without answering whether the game was playable.
+  // Counted at the guest's swap, which is the only place a frame is a frame:
+  // the backend may present fewer, and the presenter may repeat one.
+  void NoteGuestFrame() {
+    guest_frames_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Frames per second since the previous call, and since the session started.
+  // Only ever called from the telemetry thread, which owns the two members
+  // below; the counter itself is written by the command processor thread.
+  std::string GetFrameRateReport();
+
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect GetDesiredSwapPostEffect() const {
     return swap_post_effect_desired_;
@@ -534,6 +551,12 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // See NoteGuestFrame / GetFrameRateReport.
+  std::atomic<uint64_t> guest_frames_{0};
+  uint64_t frame_rate_report_last_frames_ = 0;
+  uint64_t frame_rate_report_last_time_ms_ = 0;
+  uint64_t frame_rate_report_start_time_ms_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

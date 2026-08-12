@@ -1467,6 +1467,37 @@ uint32_t CommandProcessor::NormalizeSampleCount(uint64_t samples,
 
   return static_cast<uint32_t>(std::min<uint64_t>(normalized, UINT32_MAX));
 }
+
+std::string CommandProcessor::GetFrameRateReport() {
+  uint64_t frames = guest_frames_.load(std::memory_order_relaxed);
+  uint64_t now_ms = Clock::QueryHostUptimeMillis();
+  if (!frame_rate_report_start_time_ms_) {
+    frame_rate_report_start_time_ms_ = now_ms;
+    frame_rate_report_last_time_ms_ = now_ms;
+    frame_rate_report_last_frames_ = frames;
+    return std::string();
+  }
+  uint64_t interval_ms = now_ms - frame_rate_report_last_time_ms_;
+  uint64_t session_ms = now_ms - frame_rate_report_start_time_ms_;
+  double recent_fps =
+      interval_ms ? double(frames - frame_rate_report_last_frames_) * 1000.0 /
+                        double(interval_ms)
+                  : 0.0;
+  double session_fps =
+      session_ms ? double(frames) * 1000.0 / double(session_ms) : 0.0;
+  frame_rate_report_last_time_ms_ = now_ms;
+  frame_rate_report_last_frames_ = frames;
+  if (!frames) {
+    // Nothing has been presented yet - a title still loading, not a title
+    // running at zero.
+    return std::string();
+  }
+  return fmt::format(
+      "{:.1f} fps over the last {} s, {:.1f} fps average, {} guest frames in "
+      "{} s",
+      recent_fps, interval_ms / 1000, session_fps, frames, session_ms / 1000);
+}
+
 #define COMMAND_PROCESSOR CommandProcessor
 #include "pm4_command_processor_implement.h"
 }  // namespace gpu

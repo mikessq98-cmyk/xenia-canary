@@ -540,6 +540,15 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
         pipelines_total, pipelines_pending, worst_vs_hash, max_ps_per_vs);
   }
 
+  // The number everything else in this report is in service of. It goes first
+  // because a session that reads badly here is a different investigation from
+  // one that reads well, and every line below is read differently depending on
+  // the answer.
+  std::string frame_rate = GetFrameRateReport();
+  if (!frame_rate.empty()) {
+    XELOGI("[MEM] emulation speed: {}", frame_rate);
+  }
+
   // What the memory core itself decided, and what it has had to take so far.
   // The lines above say how big each cache is; this one says whether that is a
   // problem, which is the question the caches used to each answer for
