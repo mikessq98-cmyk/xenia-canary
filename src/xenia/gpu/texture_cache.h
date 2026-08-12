@@ -801,6 +801,11 @@ class TextureCache {
   // coming back to and a one-off blit source, and setting it high would protect
   // so much that the first pass finds nothing.
   static constexpr uint32_t kFrequentUseSubmissions = 8;
+  // How much longer a frequently-used texture is kept than a streamed-past one
+  // while there is memory to spare. Long enough that turning around and coming
+  // back does not reload the scene, short enough that a level the player left
+  // does not sit in the cache until something has to be taken by force.
+  static constexpr uint64_t kFrequentUseIdleMultiplier = 4;
   // Idle eviction is batched rather than run every submission: each eviction
   // pass resets the texture bindings, so a few textures at a time costs far
   // more re-binding than the same textures taken at once. Nothing waits on

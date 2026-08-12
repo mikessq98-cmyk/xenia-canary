@@ -330,8 +330,18 @@ void TextureCache::CompletedSubmissionUpdated(
       break;
     }
     if (spare_streamed_past_only &&
-        texture->used_submission_count() >= kFrequentUseSubmissions) {
-      // Part of what the game is actually rendering. Kept while there is room.
+        texture->used_submission_count() >= kFrequentUseSubmissions &&
+        unused_for_ms < idle_eviction_ms * kFrequentUseIdleMultiplier) {
+      // Drawn with often enough to be part of the scene, and recently enough
+      // for that to still be true. Kept while there is room.
+      //
+      // Protecting it outright - which is what this did at first - protects it
+      // forever, and almost everything qualifies: a pass then found 1 to 18
+      // textures where thousands had aged out, so nothing was released at all
+      // and the cache ran to 1968 MB before the core had to claw back 1800 MB
+      // under pressure. Being drawn eight times an hour ago is not being part
+      // of the working set. So the frequently-used get a LONGER lease, not an
+      // unlimited one.
       texture = next;
       continue;
     }
