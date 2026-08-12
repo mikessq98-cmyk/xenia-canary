@@ -140,6 +140,13 @@ DECLARE_bool(readback_resolve_half_pixel_offset);
 #if XE_PLATFORM_WINRT
 DECLARE_bool(d3d12_serialize_draws_for_hang_diagnosis);
 DECLARE_bool(d3d12_verify_new_draws);
+// Reported alongside a GPU hang - the settings that shape the translated
+// control flow are the prime suspects, so a log of a hang has to carry them.
+DECLARE_bool(dxbc_switch);
+DECLARE_bool(dxbc_switch_break_dispatch);
+DECLARE_int32(dxbc_switch_chunk_labels);
+DECLARE_int32(dxbc_switch_max_labels);
+DECLARE_int32(dxbc_main_loop_guard_iterations);
 #endif  // XE_PLATFORM_WINRT
 
 namespace xe {
@@ -4049,6 +4056,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     }
     EndSubmission(false);
     if (!AwaitAllQueueOperationsCompletion()) {
+      // Every hang so far has blamed a DIFFERENT shader pair - four titles,
+      // four distinct culprits - which is what a systemic miscompilation looks
+      // like, not a handful of bad shaders. Quarantining them one device loss
+      // at a time can only ever keep pace with that, never end it. So record
+      // the SHAPE of what hung as well as its identity: if the shapes agree
+      // across deaths, the dispatcher that generates them is the answer and
+      // the quarantine list is a symptom.
+      XELOGE(
+          "Hang shape: VS {:016X} has {} control-flow labels, PS {:016X} has "
+          "{}; dxbc_switch={} break_dispatch={} chunk_labels={} max_labels={} "
+          "guard={}",
+          draw_vs_hash, vertex_shader->label_addresses().size(), draw_ps_hash,
+          pixel_shader ? pixel_shader->label_addresses().size() : size_t(0),
+          cvars::dxbc_switch, cvars::dxbc_switch_break_dispatch,
+          cvars::dxbc_switch_chunk_labels, cvars::dxbc_switch_max_labels,
+          cvars::dxbc_main_loop_guard_iterations);
       // Nothing else was in flight, so this is not a suspect - it is the draw
       // that hung the GPU. Quarantine it here, while the run that proved it is
       // still alive.
