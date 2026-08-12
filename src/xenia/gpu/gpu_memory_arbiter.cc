@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+#include "xenia/base/xbox_console.h"
 
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
@@ -62,18 +64,70 @@ const char* GpuMemoryArbiter::GetPressureName(Pressure pressure) {
   }
 }
 
-uint64_t GpuMemoryArbiter::QueryFreeHostBytes() {
+const char* GpuMemoryArbiter::GetCeilingName(Ceiling ceiling) {
+  switch (ceiling) {
+    case Ceiling::kSystemCommit:
+      return "commit charge";
+    case Ceiling::kAppPartition:
+      return "app memory partition";
+    case Ceiling::kGpuBudget:
+      return "GPU budget";
+    default:
+      return "unknown";
+  }
+}
+
+void GpuMemoryArbiter::SetHostGpuBudgetQuery(HostGpuBudgetQuery query) {
+  host_gpu_budget_query_ = std::move(query);
+}
+
+uint64_t GpuMemoryArbiter::QueryFreeHostBytes() const {
+  // Three pools, three ceilings, and running out of ANY of them fails an
+  // allocation. The core used to watch only the first, which is why a session
+  // could be told there was a gigabyte free right up to the moment the driver
+  // refused a 336 MB region: the gigabyte was in a pool the resource was never
+  // going to come from.
+  uint64_t free_bytes = UINT64_MAX;
+  Ceiling binding = Ceiling::kSystemCommit;
+  last_system_commit_free_bytes_ = 0;
+  last_app_partition_free_bytes_ = 0;
+  last_gpu_budget_free_bytes_ = 0;
+
 #if XE_PLATFORM_WIN32
   MEMORYSTATUSEX status = {sizeof(status)};
-  if (!GlobalMemoryStatusEx(&status)) {
-    return UINT64_MAX;
+  if (GlobalMemoryStatusEx(&status)) {
+    // Commit, not physical: on the console allocations fail against the commit
+    // charge while free physical RAM still looks plentiful.
+    last_system_commit_free_bytes_ = status.ullAvailPageFile;
+    free_bytes = status.ullAvailPageFile;
   }
-  // Commit, not physical: on the console allocations fail against the commit
-  // charge while free physical RAM still looks plentiful.
-  return status.ullAvailPageFile;
-#else
-  return UINT64_MAX;
 #endif  // XE_PLATFORM_WIN32
+
+  // What is left of the partition this PROCESS was granted, which on a console
+  // is not the same question as what the system has left.
+  uint64_t app_free_bytes = xe::QueryAppMemoryHeadroomBytes();
+  if (app_free_bytes != UINT64_MAX) {
+    last_app_partition_free_bytes_ = app_free_bytes;
+    if (app_free_bytes < free_bytes) {
+      free_bytes = app_free_bytes;
+      binding = Ceiling::kAppPartition;
+    }
+  }
+
+  if (host_gpu_budget_query_) {
+    uint64_t budget = 0, usage = 0;
+    if (host_gpu_budget_query_(budget, usage) && budget) {
+      uint64_t gpu_free_bytes = usage >= budget ? 0 : budget - usage;
+      last_gpu_budget_free_bytes_ = gpu_free_bytes;
+      if (gpu_free_bytes < free_bytes) {
+        free_bytes = gpu_free_bytes;
+        binding = Ceiling::kGpuBudget;
+      }
+    }
+  }
+
+  binding_ceiling_ = binding;
+  return free_bytes;
 }
 
 void GpuMemoryArbiter::RegisterConsumer(ConsumerKind kind, UsageFunction usage,
@@ -115,7 +169,43 @@ uint64_t GpuMemoryArbiter::GetReserveBytes() const {
   // grows to match, without anyone having configured either case.
   uint64_t largest = largest_allocation_bytes_;
   uint64_t reserve = kUnmanagedMarginBytes + largest + largest / 2;
+  // Whichever of the two instruments asks for more. A title with one enormous
+  // allocation is covered by the first; a title with a hundred thousand small
+  // ones is covered by the second, and neither is a special case of the other.
+  reserve = std::max(reserve, kUnmanagedMarginBytes + demand_reserve_bytes_);
   return std::clamp(reserve, kMinReserveBytes, kMaxReserveBytes);
+}
+
+void GpuMemoryArbiter::UpdateConsumerDemand(uint64_t now_ms) {
+  uint64_t usage = GetTotalUsage();
+  if (last_consumer_usage_bytes_ == UINT64_MAX ||
+      now_ms <= last_consumer_usage_time_ms_) {
+    last_consumer_usage_bytes_ = usage;
+    last_consumer_usage_time_ms_ = now_ms;
+    return;
+  }
+  double elapsed_seconds =
+      double(now_ms - last_consumer_usage_time_ms_) / 1000.0;
+  if (elapsed_seconds < kTrendWindowSeconds) {
+    // Same baseline as the trend, and for the same reason: caches are trimmed
+    // and refilled constantly, so anything shorter measures the wobble.
+    return;
+  }
+  double delta = double(int64_t(usage) - int64_t(last_consumer_usage_bytes_));
+  last_consumer_usage_bytes_ = usage;
+  last_consumer_usage_time_ms_ = now_ms;
+  double rate = delta / elapsed_seconds;
+  consumer_growth_bytes_per_second_ =
+      consumer_growth_bytes_per_second_ * (1.0 - kRateSmoothing) +
+      rate * kRateSmoothing;
+  if (consumer_growth_bytes_per_second_ <= 0.0) {
+    // Caches shrinking or flat - they are asking for nothing.
+    demand_reserve_bytes_ = 0;
+    return;
+  }
+  double wanted = consumer_growth_bytes_per_second_ * kDemandCoverSeconds;
+  demand_reserve_bytes_ =
+      std::min(uint64_t(wanted), kMaxDemandReserveBytes);
 }
 
 void GpuMemoryArbiter::NoteAllocationSize(uint64_t bytes, uint64_t now_ms) {
@@ -158,17 +248,27 @@ void GpuMemoryArbiter::LogStatistics() const {
   uint64_t free_bytes = last_free_bytes_;
   XELOGI(
       "[MEM] gpu memory core: pressure {}, {} MB free (settles at {} MB, "
-      "reserving {} MB for allocations of up to {} MB), using {} MB/s | "
+      "reserving {} MB for allocations of up to {} MB and {} MB/s of cache "
+      "demand), using {} MB/s | "
       "released on sight {} MB, forced trims {} freeing {} MB, {} passes "
       "skipped as flat, {} allocation failures reclaimed {} MB",
       GetPressureName(pressure()),
       free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
       settled_free_bytes_ == UINT64_MAX ? 0 : (settled_free_bytes_ >> 20),
       GetReserveBytes() >> 20, largest_allocation_bytes_ >> 20,
+      int64_t(consumer_growth_bytes_per_second_) >> 20,
       int64_t(consumption_bytes_per_second_) >> 20,
       total_freed_immediately_bytes_ >> 20, total_trims_,
       total_released_bytes_ >> 20, total_flat_skips_,
       total_allocation_failures_, total_reserved_for_allocations_bytes_ >> 20);
+  // Which pool the free figure above came from, and what the others said. The
+  // three disagree by more than a gigabyte in practice, so "free" without this
+  // is not an answer to any question worth asking.
+  XELOGI(
+      "[MEM]   nearest ceiling is the {}: commit {} MB, partition {} MB, GPU "
+      "budget {} MB",
+      GetCeilingName(binding_ceiling_), last_system_commit_free_bytes_ >> 20,
+      last_app_partition_free_bytes_ >> 20, last_gpu_budget_free_bytes_ >> 20);
   for (const Consumer& consumer : consumers_) {
     if (!consumer.usage) {
       continue;
@@ -392,6 +492,9 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   // Nothing allocated this poll is still an observation: it lets a size the
   // title has stopped needing decay out of the reserve.
   NoteAllocationSize(0, now_ms);
+  // And how fast the caches themselves are filling, which is what the reserve
+  // has to cover for a title that never makes a large allocation.
+  UpdateConsumerDemand(now_ms);
 
   // Whatever is genuinely dead goes back now, at any pressure. Keeping it
   // costs the emulation nothing to lose and brings the shortage closer - and
@@ -438,7 +541,8 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
   // the band falls back to the unmanaged margin, so the level signal never
   // disappears entirely.
   uint64_t elevated_band =
-      std::max(largest_allocation_bytes_, kUnmanagedMarginBytes);
+      std::max(std::max(largest_allocation_bytes_, kUnmanagedMarginBytes),
+               demand_reserve_bytes_);
   Pressure by_level;
   if (free_bytes <= reserve) {
     by_level = Pressure::kCritical;

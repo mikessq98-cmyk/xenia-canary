@@ -597,6 +597,15 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
       XELOGI("[MEM] texture content duplicates: {}", duplicates);
     }
   }
+  if (shared_memory_) {
+    // The other half of the texture-load story: how much of the reloading
+    // above was caused by writes that only shared a 256 KB block with the
+    // texture rather than touching it.
+    std::string invalidation = shared_memory_->GetInvalidationReport();
+    if (!invalidation.empty()) {
+      XELOGI("[MEM] guest writes: {}", invalidation);
+    }
+  }
 }
 
 void D3D12CommandProcessor::InitializeShaderStorage(
@@ -4610,6 +4619,14 @@ void D3D12CommandProcessor::RegisterMemoryArbiterConsumers() {
       [this](uint64_t bytes_to_free) -> uint64_t {
         return texture_cache_->ReleaseTextureResourcePoolForArbiter(
             bytes_to_free);
+      });
+
+  // The adapter's own budget. Every resource the caches above hold is charged
+  // against it, and on the console it runs out well before the commit charge
+  // does - so without this the core was watching the wrong number.
+  memory_arbiter_.SetHostGpuBudgetQuery(
+      [this](uint64_t& budget_out, uint64_t& usage_out) {
+        return GetD3D12Provider().QueryVideoMemoryUsage(budget_out, usage_out);
       });
 }
 

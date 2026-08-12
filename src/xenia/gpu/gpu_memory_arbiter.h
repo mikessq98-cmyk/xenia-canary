@@ -108,6 +108,22 @@ class GpuMemoryArbiter {
                         bool trim_safe_mid_submission = false);
   void UnregisterConsumers();
 
+  // Reports the OS-granted GPU memory budget and what is currently charged
+  // against it, in bytes; returns false when the platform cannot answer.
+  //
+  // This is a SEPARATE and usually smaller ceiling than the commit charge, and
+  // it is the one D3D12 resource creation actually hits: a Dark Souls II
+  // session read 2380 MB used of a 4147 MB budget while the commit charge
+  // still showed 1090 MB free of 5120, so the two disagree by more than a
+  // gigabyte about how much room there is. The core polled only the commit
+  // charge and the budget was queried for the periodic report and nothing
+  // else, which is why an allocation could fail "although the OS reported
+  // room" - the OS had reported room in the wrong pool. The backend that owns
+  // the adapter installs this at setup.
+  using HostGpuBudgetQuery =
+      std::function<bool(uint64_t& budget_out, uint64_t& usage_out)>;
+  void SetHostGpuBudgetQuery(HostGpuBudgetQuery query);
+
   // Called once per submission from the command processor. Polls the host at
   // most every kPollIntervalSubmissions submissions (the OS query is not free
   // and its answer does not change meaningfully between draws), updates the
@@ -188,9 +204,29 @@ class GpuMemoryArbiter {
                          bool mid_submission);
 
   static const char* GetConsumerName(ConsumerKind kind);
-  // Reads free host commit (the binding limit on the console - allocations
-  // fail on the commit charge, not on free physical RAM).
-  static uint64_t QueryFreeHostBytes();
+
+  // Which of the ceilings the core watches is the nearest one. Recorded so the
+  // periodic report can name it: "1090 MB free" means something quite
+  // different depending on which pool ran out, and a session where the GPU
+  // budget binds needs different attention from one where the commit charge
+  // does.
+  enum class Ceiling {
+    kSystemCommit,
+    kAppPartition,
+    kGpuBudget,
+  };
+  static const char* GetCeilingName(Ceiling ceiling);
+  // The smallest headroom any ceiling the core knows about reports, and which
+  // one that was. UINT64_MAX when nothing can be queried.
+  uint64_t QueryFreeHostBytes() const;
+
+  HostGpuBudgetQuery host_gpu_budget_query_;
+  mutable Ceiling binding_ceiling_ = Ceiling::kSystemCommit;
+  // What each ceiling reported at the last poll, for the report. Zero when
+  // that ceiling could not be queried at all.
+  mutable uint64_t last_system_commit_free_bytes_ = 0;
+  mutable uint64_t last_app_partition_free_bytes_ = 0;
+  mutable uint64_t last_gpu_budget_free_bytes_ = 0;
 
   std::vector<Consumer> consumers_;
 
@@ -274,6 +310,36 @@ class GpuMemoryArbiter {
   // to cover. Zero until anything reports one.
   uint64_t largest_allocation_bytes_ = 0;
   uint64_t largest_allocation_time_ms_ = 0;
+
+  // THE SECOND INSTRUMENT.
+  //
+  // Deriving the reserve from the largest single allocation has a blind spot,
+  // and it was found by measurement rather than argument: Black Ops at 1x1
+  // never allocates anything large - it takes the same memory in tens of
+  // thousands of small textures instead - so the observed maximum stays near
+  // zero, the reserve sits on its floor, and the report reads "reserving 256
+  // MB for allocations of up to 0 MB". Every warning the core could give then
+  // depends on the trend alone.
+  //
+  // What that title does have is DEMAND: its caches grow steadily, and the
+  // aggregate they will take before the core looks again is exactly what the
+  // reserve exists to keep room for. That is a different measurement from the
+  // trend, which nets cache growth against everything else the process gives
+  // back, and can therefore read flat while the caches are filling.
+  void UpdateConsumerDemand(uint64_t now_ms);
+  uint64_t last_consumer_usage_bytes_ = UINT64_MAX;
+  uint64_t last_consumer_usage_time_ms_ = 0;
+  double consumer_growth_bytes_per_second_ = 0.0;
+  // What that growth translates into as a reserve, recomputed each poll so
+  // GetReserveBytes stays a cheap read.
+  uint64_t demand_reserve_bytes_ = 0;
+  // How far ahead of the caches to stay. Long enough to cover several polls,
+  // short enough that a title filling its caches quickly at startup does not
+  // reserve a gigabyte it will never need.
+  static constexpr double kDemandCoverSeconds = 8.0;
+  // The demand term alone must not be able to convince the core it is out of
+  // memory - it is a floor under the reserve, not a competitor to the clamp.
+  static constexpr uint64_t kMaxDemandReserveBytes = UINT64_C(384) << 20;
 
   std::atomic<Pressure> pressure_{Pressure::kNone};
   // Consecutive polls that wanted a lower level - see the hysteresis in
