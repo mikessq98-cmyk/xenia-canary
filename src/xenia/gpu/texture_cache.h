@@ -683,7 +683,11 @@ class TextureCache {
   uint64_t total_textures_loaded_ = 0;
   uint64_t total_loaded_guest_bytes_ = 0;
 
-  void MeasureTextureContentDuplicate(Texture& texture);
+  // `known_base_hash` is the hash of the base level if something on this path
+  // has already computed it (SkipUnchangedTextureUpload does, over exactly the
+  // same bytes), or zero to compute it here.
+  void MeasureTextureContentDuplicate(Texture& texture,
+                                      uint64_t known_base_hash);
   // Content hash -> the texture that first presented it. Which texture matters:
   // a hash that comes back on the SAME key is the guest overwriting a streaming
   // buffer with bytes it already held, and the fix for that is to skip the

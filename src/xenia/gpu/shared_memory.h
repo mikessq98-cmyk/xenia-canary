@@ -10,6 +10,10 @@
 #ifndef XENIA_GPU_SHARED_MEMORY_H_
 #define XENIA_GPU_SHARED_MEMORY_H_
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "xenia/memory.h"
 
 namespace xe {
@@ -117,6 +121,12 @@ class SharedMemory {
   // Public so a caller holding only a SharedMemory can read the guest bytes it
   // mirrors - the texture cache does, to hash what a texture was built from.
   Memory& memory() const { return memory_; }
+
+  // One line for the periodic memory report: how much of what the guest wrote
+  // was actually invalidated, and how often the widening below was refused
+  // because the extra pages were being watched. Empty until something has been
+  // invalidated at all.
+  std::string GetInvalidationReport() const;
 
  protected:
   SharedMemory(Memory& memory);
@@ -227,6 +237,41 @@ class SharedMemory {
   uint64_t *system_page_flags_valid_ = nullptr,
            *system_page_flags_valid_and_gpu_written_ = nullptr;
   unsigned num_system_page_flags_ = 0;
+
+  // HOW MANY WATCHED RANGES TOUCH EACH 64-PAGE INVALIDATION BLOCK.
+  //
+  // A guest write that arrives through an access violation is widened out to
+  // the whole 64-page (256 KB with 4 KB pages) block it landed in, because
+  // catching a fault per page costs far more than uploading some extra guest
+  // bytes. That reasoning is sound for the shared memory buffer and wrong for
+  // everything watching it: widening also fires every watch in those 256 KB,
+  // and a texture watch firing means the texture is reloaded, reconverted and
+  // re-uploaded on the command processor thread. A Dark Souls II session
+  // loaded 159428 textures and proved 125723 of those loads byte-identical to
+  // what was already there - work caused by writes that never touched them.
+  //
+  // So the widening is now told where it costs something. A block that no
+  // watch covers is widened exactly as before; a block that a watch covers is
+  // left alone, and the invalidation stays the size of the write. The pages
+  // that are not widened into stay protected, so a later write there still
+  // faults and still fires its watch - the invariant "every page made writable
+  // has had its watches fired" is what makes this safe, and it is preserved by
+  // narrowing the returned range together with the fired one.
+  std::vector<uint16_t> invalidation_block_watch_counts_;
+  void AddWatchRangeToBlockCounts(uint32_t page_first, uint32_t page_last);
+  void RemoveWatchRangeFromBlockCounts(uint32_t page_first, uint32_t page_last);
+  bool IsInvalidationBlockWatched(uint32_t block) const {
+    return block < invalidation_block_watch_counts_.size() &&
+           invalidation_block_watch_counts_[block] != 0;
+  }
+
+  // Telemetry for the above - the trade it makes has to be visible, because
+  // the cost lands as access violations and the saving lands as texture loads
+  // that never happen, and those are counted in different places.
+  uint64_t invalidations_ = 0;
+  uint64_t invalidated_pages_ = 0;
+  uint64_t invalidation_widenings_refused_ = 0;
+  uint64_t invalidation_pages_not_widened_ = 0;
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length,
       bool exact_range);

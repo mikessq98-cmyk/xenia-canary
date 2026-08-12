@@ -9,10 +9,39 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+
+#include "third_party/fmt/include/fmt/format.h"
+
+// On the console the widening is a bad trade and the measurement says so; on
+// the desktop, where the access-violation cost this exists to avoid was
+// measured in the first place, upstream behaviour is left alone.
+#if XE_PLATFORM_WINRT
+static constexpr bool kGpuInvalidationRespectsWatchesDefault = true;
+#else
+static constexpr bool kGpuInvalidationRespectsWatchesDefault = false;
+#endif  // XE_PLATFORM_WINRT
+
+DEFINE_bool(
+    gpu_invalidation_respects_watches, kGpuInvalidationRespectsWatchesDefault,
+    "Do not widen a guest write's invalidation into 256 KB blocks that "
+    "something is watching. Widening exists to avoid the cost of catching a "
+    "page fault per page, and for plain guest memory it is worth it - but a "
+    "widened invalidation also fires every texture watch in those 256 KB, and "
+    "each of those is a texture reloaded, reconverted and re-uploaded on the "
+    "command processor thread for a write that never touched it. With this on, "
+    "blocks nothing is watching are still widened and blocks that are watched "
+    "are invalidated only as far as the write actually reached. Costs more "
+    "access violations near texture memory; watch \"guest writes invalidated\" "
+    "in the memory report.",
+    "GPU");
 
 namespace xe {
 namespace gpu {
@@ -47,6 +76,10 @@ bool SharedMemory::InitializeCommon() {
   memset(system_page_flags_valid_, 0, 8 * num_system_page_flags_entries);
   memset(system_page_flags_valid_and_gpu_written_, 0,
          8 * num_system_page_flags_entries);
+  // One counter per 64-page invalidation block - the same indexing as the page
+  // flags above, so a block index is interchangeable between them. 2048 entries
+  // on Windows.
+  invalidation_block_watch_counts_.assign(num_system_page_flags_entries, 0);
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(
           MemoryInvalidationCallbackThunk, this);
@@ -105,6 +138,8 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_ = nullptr;
   system_page_flags_valid_and_gpu_written_ = nullptr;
   num_system_page_flags_ = 0;
+  invalidation_block_watch_counts_.clear();
+  invalidation_block_watch_counts_.shrink_to_fit();
 }
 
 void SharedMemory::ClearCache() {
@@ -124,6 +159,12 @@ void SharedMemory::ClearCache() {
     delete[] pool;
   }
   watch_range_pools_.clear();
+  // Every range was unlinked by the FireWatches above, so the counters are
+  // already zero - reset them anyway, because the pools have just been thrown
+  // away wholesale and a count left standing would suppress widening over
+  // memory nothing watches for the rest of the session.
+  std::fill(invalidation_block_watch_counts_.begin(),
+            invalidation_block_watch_counts_.end(), uint16_t(0));
   SetSystemPageBlocksValidWithGpuDataWritten();
 }
 
@@ -196,6 +237,7 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(
   range->callback_argument = callback_argument;
   range->page_first = watch_page_first;
   range->page_last = watch_page_last;
+  AddWatchRangeToBlockCounts(watch_page_first, watch_page_last);
 
   // Allocate and link the nodes.
   WatchNode* node_previous = nullptr;
@@ -348,7 +390,39 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
   }
 }
 
+void SharedMemory::AddWatchRangeToBlockCounts(uint32_t page_first,
+                                              uint32_t page_last) {
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  uint32_t block_count = uint32_t(invalidation_block_watch_counts_.size());
+  for (uint32_t i = block_first; i <= block_last && i < block_count; ++i) {
+    uint16_t& count = invalidation_block_watch_counts_[i];
+    // Saturating: with tens of thousands of small textures a block could in
+    // principle be covered more times than the counter holds, and a count that
+    // wrapped to zero would silently re-enable widening over watched memory.
+    // Sticking at the maximum only means the block is never widened into
+    // again, which is the safe direction.
+    if (count != UINT16_MAX) {
+      ++count;
+    }
+  }
+}
+
+void SharedMemory::RemoveWatchRangeFromBlockCounts(uint32_t page_first,
+                                                   uint32_t page_last) {
+  uint32_t block_first = page_first >> 6;
+  uint32_t block_last = page_last >> 6;
+  uint32_t block_count = uint32_t(invalidation_block_watch_counts_.size());
+  for (uint32_t i = block_first; i <= block_last && i < block_count; ++i) {
+    uint16_t& count = invalidation_block_watch_counts_[i];
+    if (count != 0 && count != UINT16_MAX) {
+      --count;
+    }
+  }
+}
+
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+  RemoveWatchRangeFromBlockCounts(range->page_first, range->page_last);
   uint32_t bucket =
       range->page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   WatchNode* node = range->node_first;
@@ -563,21 +637,52 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     // software-rendered game) runs at 4 FPS on Intel Core i7-3770, with 64 KB,
     // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's
     // 0.7 ms.
+    //
+    // That trade weighs an access violation against re-uploading guest bytes,
+    // and for a block nothing is watching those are indeed the only two costs.
+    // Where a watch covers the block the widening buys the same saving and
+    // pays a much larger bill - every watch in the 256 KB fires, and a texture
+    // watch firing is a full reload of a texture the write never reached. So
+    // the widening stops at a watched block; those pages stay protected, so a
+    // write that does reach them still faults and still fires their watches.
+    const bool respect_watches = cvars::gpu_invalidation_respects_watches;
+    bool refused_widening = false;
+    uint32_t unwidened_page_first = page_first, unwidened_page_last = page_last;
     if (page_first & 63) {
-      uint64_t gpu_written_start =
-          system_page_flags_valid_and_gpu_written_[block_first];
-      gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
-      page_first =
-          (page_first & ~uint32_t(63)) + (64 - xe::lzcnt(gpu_written_start));
+      if (respect_watches && IsInvalidationBlockWatched(block_first)) {
+        refused_widening = true;
+      } else {
+        uint64_t gpu_written_start =
+            system_page_flags_valid_and_gpu_written_[block_first];
+        gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
+        page_first =
+            (page_first & ~uint32_t(63)) + (64 - xe::lzcnt(gpu_written_start));
+      }
     }
     if ((page_last & 63) != 63) {
-      uint64_t gpu_written_end =
-          system_page_flags_valid_and_gpu_written_[block_last];
-      gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
-      page_last = (page_last & ~uint32_t(63)) +
-                  (std::max(xe::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+      if (respect_watches && IsInvalidationBlockWatched(block_last)) {
+        refused_widening = true;
+      } else {
+        uint64_t gpu_written_end =
+            system_page_flags_valid_and_gpu_written_[block_last];
+        gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+        page_last = (page_last & ~uint32_t(63)) +
+                    (std::max(xe::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+      }
+    }
+    if (refused_widening) {
+      ++invalidation_widenings_refused_;
+      // What the widening would have taken beyond the write itself, which is
+      // the work this saved - as pages, so it can be compared directly with
+      // the pages that were invalidated.
+      uint32_t widened_first = unwidened_page_first & ~uint32_t(63);
+      uint32_t widened_last = unwidened_page_last | uint32_t(63);
+      invalidation_pages_not_widened_ +=
+          (widened_last - widened_first + 1) - (page_last - page_first + 1);
     }
   }
+  ++invalidations_;
+  invalidated_pages_ += page_last - page_first + 1;
 
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t invalidate_bits = UINT64_MAX;
@@ -595,6 +700,19 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   return std::make_pair(page_first << page_size_log2_,
                         (page_last - page_first + 1) << page_size_log2_);
+}
+
+std::string SharedMemory::GetInvalidationReport() const {
+  if (!invalidations_) {
+    return std::string();
+  }
+  uint32_t page_size_kb = uint32_t(1) << (page_size_log2_ - 10);
+  return fmt::format(
+      "{} guest writes invalidated {} MB of shared memory | widening refused "
+      "{} times over watched memory, sparing {} MB (page {} KB)",
+      invalidations_, (invalidated_pages_ * page_size_kb) >> 10,
+      invalidation_widenings_refused_,
+      (invalidation_pages_not_widened_ * page_size_kb) >> 10, page_size_kb);
 }
 
 void SharedMemory::PrepareForTraceDownload() {

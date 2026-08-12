@@ -1028,14 +1028,16 @@ bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
         memory.TranslatePhysical(texture.key().base_page << 12);
     if (size && data) {
       uint64_t hash = XXH3_64bits(data, size);
+      // Carried out in both cases. When the upload is skipped the caller must
+      // not store it (nothing was uploaded - see CommitUploadedTextureHashes),
+      // but the duplicate measurement wants the same number and would
+      // otherwise hash the same bytes a second time on this thread.
+      base_hash_out = hash;
       if (texture.uploaded_base_hash_ == hash) {
         load_base = false;
         skipped_any = true;
         ++skipped_upload_count_;
         skipped_upload_bytes_ += size;
-      } else {
-        // Carried out, not stored - see CommitUploadedTextureHashes.
-        base_hash_out = hash;
       }
     }
   }
@@ -1048,20 +1050,20 @@ bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
         memory.TranslatePhysical(texture.key().mip_page << 12);
     if (size && data) {
       uint64_t hash = XXH3_64bits(data, size);
+      mips_hash_out = hash;
       if (texture.uploaded_mips_hash_ == hash) {
         load_mips = false;
         skipped_any = true;
         ++skipped_upload_count_;
         skipped_upload_bytes_ += size;
-      } else {
-        mips_hash_out = hash;
       }
     }
   }
   return skipped_any && !load_base && !load_mips;
 }
 
-void TextureCache::MeasureTextureContentDuplicate(Texture& texture) {
+void TextureCache::MeasureTextureContentDuplicate(Texture& texture,
+                                                  uint64_t known_base_hash) {
   if (!cvars::texture_cache_measure_content_duplicates) {
     return;
   }
@@ -1069,15 +1071,24 @@ void TextureCache::MeasureTextureContentDuplicate(Texture& texture) {
   if (!base_size) {
     return;
   }
-  const uint8_t* guest_data = shared_memory().memory().TranslatePhysical(
-      texture.key().base_page << 12);
-  if (!guest_data) {
-    return;
-  }
   // The base level only. It is the bulk of a texture and enough to tell "the
   // same picture again" from "a different picture"; hashing the mip chain too
   // would double the cost of the measurement for nothing.
-  uint64_t content_hash = XXH3_64bits(guest_data, base_size);
+  //
+  // And when the upload-skip check has already hashed exactly these bytes on
+  // this thread, its answer is reused. With both switched on - which is how
+  // the console is being run - this was hashing every texture's base level
+  // twice per load, on the command processor thread, mid-frame, for a
+  // measurement that only has to agree with itself.
+  uint64_t content_hash = known_base_hash;
+  if (!content_hash) {
+    const uint8_t* guest_data = shared_memory().memory().TranslatePhysical(
+        texture.key().base_page << 12);
+    if (!guest_data) {
+      return;
+    }
+    content_hash = XXH3_64bits(guest_data, base_size);
+  }
   uint64_t host_bytes = texture.GetHostMemoryUsage();
   ++measured_texture_count_;
   measured_texture_bytes_ += host_bytes;
@@ -1257,7 +1268,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     }
     CommitUploadedTextureHashes(texture, load_base ? pending_base_hash : 0,
                                 load_mips ? pending_mips_hash : 0);
-    MeasureTextureContentDuplicate(texture);
+    MeasureTextureContentDuplicate(texture, pending_base_hash);
 
     // reque for makeuptodatandwatch
     textures[i] = &texture;
