@@ -53,6 +53,23 @@ DEFINE_uint32(
     "memory back when it needs it.",
     "GPU");
 DEFINE_bool(
+    texture_cache_skip_unchanged_uploads, true,
+    "Skip re-uploading a texture when the guest wrote the memory it watches "
+    "but the bytes did not actually change.\n"
+    "Measured, not assumed: a Black Ops session uploaded 68 GB of texture data "
+    "against a resident cache of 1877 MB, and a quarter of those uploads were "
+    "byte-identical to something already loaded. WHY the guest rewrites "
+    "unchanged bytes is not established - candidates are the game re-staging "
+    "content its streaming manager already had, and the memory watch firing at "
+    "page granularity for a write to something that merely shares a page with "
+    "the texture. This skip is worth the same under either, because it acts on "
+    "the bytes rather than on a theory about them. Hashing costs a linear read "
+    "of guest memory that is already resident, which is less than the format "
+    "conversion and GPU upload it avoids - and those land on the command "
+    "processor thread, mid-frame.\n"
+    "Disable to always re-upload on a write, as before.",
+    "GPU");
+DEFINE_bool(
     texture_cache_measure_content_duplicates, false,
     "Diagnostic: hash the guest bytes of every texture as it is loaded and "
     "report how many of them were byte-identical to a texture already loaded, "
@@ -935,6 +952,67 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
   return scale_bits;
 }
 
+bool TextureCache::SkipUnchangedTextureUpload(Texture& texture,
+                                              bool& load_base,
+                                              bool& load_mips) {
+  if (!cvars::texture_cache_skip_unchanged_uploads ||
+      (!load_base && !load_mips)) {
+    return false;
+  }
+  // A texture is reloaded when the guest WRITES the memory it watches - and a
+  // quarter of those writes were measured to put back bytes that were already
+  // there. What causes that is NOT established. It could be the game re-staging
+  // content its streaming manager already had (plausible when the host reads
+  // finish far sooner than the disc they were written for), or the watch firing
+  // at page granularity for a write to something that merely shares a page with
+  // the texture, or the game double-buffering into alternating slots. Nothing
+  // here has to know: the check is on the bytes, so it is worth the same under
+  // all of them, and it cannot be wrong the way a theory can.
+  //
+  // Hashing costs a linear read of guest memory that is already resident, at
+  // several GB/s. Converting and uploading the same data costs more than that,
+  // and the upload also lands on the command processor thread in the middle of
+  // a frame - so when the bytes match, this is pure saving.
+  const Memory& memory = shared_memory().memory();
+  bool skipped_any = false;
+  if (load_base) {
+    uint32_t size = texture.GetGuestBaseSize();
+    const uint8_t* data =
+        memory.TranslatePhysical(texture.key().base_page << 12);
+    if (size && data) {
+      uint64_t hash = XXH3_64bits(data, size);
+      if (texture.uploaded_base_hash_ == hash) {
+        load_base = false;
+        skipped_any = true;
+        ++skipped_upload_count_;
+        skipped_upload_bytes_ += size;
+      } else {
+        texture.uploaded_base_hash_ = hash;
+      }
+    }
+  }
+  // The mip chain is checked separately: the game may genuinely replace one and
+  // not the other, and skipping the wrong half would leave the texture showing
+  // stale data.
+  if (load_mips) {
+    uint32_t size = texture.GetGuestMipsSize();
+    const uint8_t* data =
+        memory.TranslatePhysical(texture.key().mip_page << 12);
+    if (size && data) {
+      uint64_t hash = XXH3_64bits(data, size);
+      if (texture.uploaded_mips_hash_ == hash) {
+        load_mips = false;
+        skipped_any = true;
+        ++skipped_upload_count_;
+        skipped_upload_bytes_ += size;
+      } else {
+        texture.uploaded_mips_hash_ = hash;
+      }
+    }
+  }
+  return skipped_any && !load_base && !load_mips;
+}
+
 void TextureCache::MeasureTextureContentDuplicate(Texture& texture) {
   if (!cvars::texture_cache_measure_content_duplicates) {
     return;
@@ -971,6 +1049,15 @@ void TextureCache::MeasureTextureContentDuplicate(Texture& texture) {
     ++measured_shared_content_count_;
     measured_shared_content_bytes_ += host_bytes;
   }
+}
+
+std::string TextureCache::GetSkippedUploadReport() const {
+  if (!skipped_upload_count_) {
+    return std::string();
+  }
+  return fmt::format(
+      "{} uploads skipped, {} MB of guest data the game rewrote unchanged",
+      skipped_upload_count_, skipped_upload_bytes_ >> 20);
 }
 
 std::string TextureCache::GetContentDuplicateReport() const {
@@ -1102,10 +1189,20 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       }
     }
 
+    // The guest wrote the memory this texture watches - but on this console it
+    // very often wrote the SAME BYTES back. See SkipUnchangedTextureUpload.
+    bool load_base = (index_base_outdated & (1ULL << i)) != 0;
+    bool load_mips = (index_mips_outdated & (1ULL << i)) != 0;
+    if (SkipUnchangedTextureUpload(texture, load_base, load_mips)) {
+      // Nothing to upload, but the watch still has to be re-armed, so the
+      // texture goes through the rest of the pass as if it had been loaded.
+      textures[i] = &texture;
+      continue;
+    }
+
     // Actually load the texture data.
-    if (!LoadTextureDataFromResidentMemoryImpl(
-            texture, (index_base_outdated & (1ULL << i)) != 0,
-            (index_mips_outdated & (1ULL << i)) != 0)) {
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base,
+                                               load_mips)) {
       continue;
     }
     MeasureTextureContentDuplicate(texture);
@@ -1138,6 +1235,13 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
         1000.0 / double(xe::Clock::QueryHostTickFrequency());
     double load_ms =
         double(xe::Clock::QueryHostTickCount() - load_start_ticks) * kTicksToMs;
+    // The TOTAL, not only the outliers. Six warning lines and 23 ms was all a
+    // whole session reported while it uploaded 68 GB of texture data, because
+    // every individual pass was under the warning threshold - so there was no
+    // way to tell whether the loading was costing anything overall.
+    total_texture_load_ms_ += load_ms;
+    total_textures_loaded_ += loaded_count;
+    total_loaded_guest_bytes_ += loaded_guest_bytes;
     if (load_ms >= 8.0) {
       XELOGW(
           "Texture cache: loaded {} textures ({} KB of guest data) in {:.1f} ms "
@@ -1145,6 +1249,17 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
           loaded_count, loaded_guest_bytes >> 10, load_ms);
     }
   }
+}
+
+std::string TextureCache::GetLoadCostReport() const {
+  if (!total_textures_loaded_) {
+    return std::string();
+  }
+  return fmt::format(
+      "{} textures loaded, {} MB of guest data, {:.0f} ms total on the command "
+      "processor thread",
+      total_textures_loaded_, total_loaded_guest_bytes_ >> 20,
+      total_texture_load_ms_);
 }
 bool TextureCache::LoadTextureData(Texture& texture) {
   // Lockless pre-check: if texture appears up-to-date, skip the lock.

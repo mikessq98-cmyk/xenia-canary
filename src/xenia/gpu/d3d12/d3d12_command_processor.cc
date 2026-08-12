@@ -571,6 +571,14 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   }
 #endif  // XE_PLATFORM_WINRT
   if (texture_cache_) {
+    std::string load_cost = texture_cache_->GetLoadCostReport();
+    if (!load_cost.empty()) {
+      XELOGI("[MEM] texture loading: {}", load_cost);
+    }
+    std::string skipped = texture_cache_->GetSkippedUploadReport();
+    if (!skipped.empty()) {
+      XELOGI("[MEM] texture uploads avoided: {}", skipped);
+    }
     std::string duplicates = texture_cache_->GetContentDuplicateReport();
     if (!duplicates.empty()) {
       XELOGI("[MEM] texture content duplicates: {}", duplicates);

@@ -374,6 +374,10 @@ class TextureCache {
     // Hash of the guest bytes this texture was last built from, 0 when never
     // measured. Only maintained while the duplicate measurement is on.
     uint64_t measured_content_hash_ = 0;
+    // Hashes of what was last actually UPLOADED to the host, per half. A guest
+    // write that leaves these unchanged did not change the picture.
+    uint64_t uploaded_base_hash_ = 0;
+    uint64_t uploaded_mips_hash_ = 0;
     Texture* used_previous_;
     Texture* used_next_;
     // Whether this texture is in the usage tracking list (for LRU eviction).
@@ -660,6 +664,18 @@ class TextureCache {
   // holds thousands of small textures (5114 destroyed in one pass, 1593 MB), so
   // it is a fair question; the cost of a texture on this console is the host
   // resource, 10-38 ms of driver time, which dedup would also save.
+  // Clears load_base / load_mips for whichever half of the texture the guest
+  // rewrote with the bytes it already held, and returns true when that leaves
+  // nothing to upload at all. See the definition for why that case is common
+  // here and was not on the original console.
+  bool SkipUnchangedTextureUpload(Texture& texture, bool& load_base,
+                                  bool& load_mips);
+  uint64_t skipped_upload_count_ = 0;
+  uint64_t skipped_upload_bytes_ = 0;
+  double total_texture_load_ms_ = 0.0;
+  uint64_t total_textures_loaded_ = 0;
+  uint64_t total_loaded_guest_bytes_ = 0;
+
   void MeasureTextureContentDuplicate(Texture& texture);
   // Content hash -> the texture that first presented it. Which texture matters:
   // a hash that comes back on the SAME key is the guest overwriting a streaming
@@ -679,6 +695,10 @@ class TextureCache {
  public:
   // One line for the periodic memory report; empty when the measurement is off.
   std::string GetContentDuplicateReport() const;
+  // How much work was avoided because the guest rewrote textures unchanged.
+  std::string GetSkippedUploadReport() const;
+  // What loading textures cost this session in total, not just the outliers.
+  std::string GetLoadCostReport() const;
 
   // Back to the access this section had - everything below was protected, and
   // closing with `private` here silently took it away from the backends.
