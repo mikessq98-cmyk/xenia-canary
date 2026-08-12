@@ -22,6 +22,16 @@
 namespace xe {
 namespace ui {
 
+// The height the swap chain is capped to, resolved once from
+// uwp_present_max_height and, when that is left on automatic, from which
+// console this is. Zero means no cap.
+//
+// Both the surface (which decides the swap chain size) and the window (which
+// decides the layout size) have to reach the same answer or the guest output is
+// composed at one size and presented at another, so neither reads the cvar
+// directly any more.
+uint32_t GetUWPPresentMaxHeight();
+
 // A presentation surface backed by the application's CoreWindow. The graphics
 // provider turns this into a swap chain via IDXGIFactory2::
 // CreateSwapChainForCoreWindow. We only store the raw IUnknown ABI pointer of

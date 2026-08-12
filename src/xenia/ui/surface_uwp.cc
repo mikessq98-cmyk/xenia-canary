@@ -16,11 +16,45 @@
 #include <gamingdeviceinformation.h>
 
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/xbox_console.h"
 
 DECLARE_int32(uwp_present_max_height);
 
 namespace xe {
 namespace ui {
+
+uint32_t GetUWPPresentMaxHeight() {
+  // Resolved once. The console profile does not change during a run, and a cap
+  // that changed between the surface and the window would be worse than either
+  // value on its own.
+  static const uint32_t height = []() -> uint32_t {
+    int32_t configured = cvars::uwp_present_max_height;
+    if (configured > 0) {
+      return uint32_t(configured);
+    }
+    if (configured == 0) {
+      // An explicit "never cap" - the display's own resolution.
+      return 0;
+    }
+    // Automatic. The whole post chain (SMAA, then scaling and sharpening) runs
+    // at this size on every presented frame, so on a console that cannot
+    // afford 4K it is the largest fixed GPU cost in the session - and at a 2x2
+    // resolution scale of a 720p title the guest output is 1440p anyway, so a
+    // 1440 cap discards nothing that was rendered.
+    const XboxConsoleProfile& profile = GetXboxConsoleProfile();
+    uint32_t recommended = profile.recommended_present_max_height;
+    if (recommended) {
+      XELOGI(
+          "Presentation: capping the swap chain to {} rows for {} "
+          "(uwp_present_max_height is automatic; set it to 0 for the display's "
+          "own resolution, or to a height of your own)",
+          recommended, profile.model_name());
+    }
+    return recommended;
+  }();
+  return height;
+}
 
 bool UWPCoreWindowSurface::GetSizeImpl(uint32_t& width_out,
                                        uint32_t& height_out) const {
@@ -44,11 +78,10 @@ bool UWPCoreWindowSurface::GetSizeImpl(uint32_t& width_out,
 
   // This size is what the presenter creates the swap chain with, so the cap
   // must be applied here (the window size alone doesn't affect the swap chain).
-  if (cvars::uwp_present_max_height > 0 &&
-      height_out > uint32_t(cvars::uwp_present_max_height)) {
-    const uint32_t capped_height = uint32_t(cvars::uwp_present_max_height);
-    width_out = uint32_t(uint64_t(width_out) * capped_height / height_out);
-    height_out = capped_height;
+  const uint32_t max_height = GetUWPPresentMaxHeight();
+  if (max_height && height_out > max_height) {
+    width_out = uint32_t(uint64_t(width_out) * max_height / height_out);
+    height_out = max_height;
   }
 
   return width_out != 0 && height_out != 0;

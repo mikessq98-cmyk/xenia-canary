@@ -33,6 +33,7 @@
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/xbox_console.h"
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
@@ -224,6 +225,13 @@ X_STATUS Emulator::Setup(
   // Before we can set thread affinity we must enable the process to use all
   // logical processors.
   xe::threading::EnableAffinityConfiguration();
+
+  // Which console this is, and what it granted us. Reported before anything
+  // allocates, because the most common way for a session to go wrong on Xbox
+  // is being launched into the small App memory partition, and until now
+  // nothing said so - the run simply failed later, out of memory, for no
+  // visible reason.
+  LogXboxConsoleProfile();
 
   XELOGI("{}: Initializing Memory...", __func__);
   // Create memory system first, as it is required for other systems.

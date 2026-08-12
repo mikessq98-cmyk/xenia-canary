@@ -57,10 +57,13 @@ DEFINE_bool(
     "UWP");
 
 DEFINE_int32(
-    uwp_present_max_height, 0,
-    "Cap the UWP swap-chain height in physical pixels (0 = use the native HDMI "
-    "mode). Set to 1080, 1440 or 2160 to lower GPU/bandwidth cost on Xbox "
-    "Series S; width is derived from the native aspect ratio.",
+    uwp_present_max_height, -1,
+    "Cap the UWP swap-chain height in physical pixels. -1 chooses from the "
+    "console this is running on (1440 on a Series S, 1080 on an Xbox One, the "
+    "display's own resolution on a Series X), 0 always uses the native HDMI "
+    "mode, and any other value is that height. The whole post-processing chain "
+    "runs at this size every presented frame, so it is the largest fixed GPU "
+    "cost there is; width is derived from the native aspect ratio.",
     "GPU");
 
 namespace xe {
@@ -145,11 +148,11 @@ bool UWPWindow::OpenImpl() {
 
   // Optional GPU-load cap: scale down to the requested height keeping the
   // native aspect ratio (e.g. render/scan-out at 1080p on a 4K Series S).
-  if (cvars::uwp_present_max_height > 0 &&
-      height > uint32_t(cvars::uwp_present_max_height)) {
+  const uint32_t present_max_height = GetUWPPresentMaxHeight();
+  if (present_max_height && height > present_max_height) {
     const uint32_t native_width = width;
     const uint32_t native_height = height;
-    const uint32_t capped_height = uint32_t(cvars::uwp_present_max_height);
+    const uint32_t capped_height = present_max_height;
     const uint32_t capped_width =
         uint32_t(uint64_t(native_width) * capped_height / native_height);
     // Keep dimensions even for chroma/scaler friendliness.
