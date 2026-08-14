@@ -61,13 +61,16 @@ float4 XeSwizzle(float4 v, uint swizzle) {
                 v[(swizzle >> 4) & 3], v[(swizzle >> 6) & 3]);
 }
 
-float4 main(float4 position : SV_Position,
-            float4 interpolators[4] : TEXCOORD0) : SV_Target {
+// Only SV_Position, so this pairs with the fullscreen vertex shader the probe
+// is created with. A real interpreter takes interpolators; seeding the first
+// registers from the position instead costs the same four writes and keeps the
+// loop from being folded away, which is all this probe needs of them.
+float4 main(float4 position : SV_Position) : SV_Target {
   // The register file. Dynamically indexed, which is the structural cost this
   // probe exists to price - it becomes an indexable temp array in DXBC.
   float4 regs[kXeMaxRegisters];
   [unroll] for (uint init = 0; init < 4; ++init) {
-    regs[init] = interpolators[init];
+    regs[init] = position * float(init + 1);
   }
   [loop] for (uint clear = 4; clear < kXeMaxRegisters; ++clear) {
     regs[clear] = float4(0.0, 0.0, 0.0, 0.0);
