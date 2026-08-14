@@ -254,7 +254,10 @@ class PipelineCache {
   // WHEN it is needed, so a pipeline the game is waiting on right now can sit
   // behind hundreds that were queued earlier and are not needed yet.
   // Command processor thread only.
-  void PrioritizePipelineForPendingDraw(void* handle);
+  // `completes_mesh` puts it ahead of other pending draws: it is the last
+  // pipeline state a mesh is waiting on, so building it finishes that mesh.
+  void PrioritizePipelineForPendingDraw(void* handle,
+                                        bool completes_mesh = false);
 
   // Adds creation threads while the queue is deep enough for the extra
   // parallelism to be worth the cores. Command processor thread only.

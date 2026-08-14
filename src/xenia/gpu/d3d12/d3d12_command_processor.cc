@@ -3924,7 +3924,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         // The game is waiting on this pipeline right now - move it to the
         // front of the creation queue, ahead of everything queued earlier that
         // nothing is blocked on.
-        pipeline_cache_->PrioritizePipelineForPendingDraw(pipeline_handle);
+        // A mesh that is short of only this one state stops flickering the
+        // moment it is built; one short of four changes nothing until all four
+        // are. Ask for it first.
+        pipeline_cache_->PrioritizePipelineForPendingDraw(
+            pipeline_handle, GpuCensus::Get().IsObjectOneStateShort(object_key));
         // Perfectly normal while pipelines compile in the background, and can
         // happen thousands of times per second - throttle the log heavily.
         uint32_t n = draws_skipped_.fetch_add(1, std::memory_order_relaxed);

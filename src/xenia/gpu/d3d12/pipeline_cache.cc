@@ -2021,23 +2021,27 @@ bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
   return queue_depth >= kCreationQueueBurstDepth;
 }
 
-void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
+void PipelineCache::PrioritizePipelineForPendingDraw(void* handle,
+                                                     bool completes_mesh) {
   Pipeline* pipeline = reinterpret_cast<Pipeline*>(handle);
   if (pipeline->state.load(std::memory_order_acquire)) {
     return;
   }
-  if (pipeline->priority >= pipeline_util::kPriorityPendingDraw) {
-    // Already at the front - re-queueing it every skipped draw would fill the
-    // queue with duplicates of the same pipeline.
+  uint8_t wanted_priority = completes_mesh
+                                ? pipeline_util::kPriorityCompletesMesh
+                                : pipeline_util::kPriorityPendingDraw;
+  if (pipeline->priority >= wanted_priority) {
+    // Already at least this far forward - re-queueing it every skipped draw
+    // would fill the queue with duplicates of the same pipeline.
     return;
   }
   {
     std::lock_guard<xe_mutex> lock(creation_request_lock_);
     if (pipeline->state.load(std::memory_order_acquire) ||
-        pipeline->priority >= pipeline_util::kPriorityPendingDraw) {
+        pipeline->priority >= wanted_priority) {
       return;
     }
-    pipeline->priority = pipeline_util::kPriorityPendingDraw;
+    pipeline->priority = wanted_priority;
     // A draw has now been skipped for this pipeline, so it leaves the frozen
     // tier: it is no longer speculative, something on screen is missing
     // without it, and it is admitted ahead of everything that is.

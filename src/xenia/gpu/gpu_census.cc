@@ -360,6 +360,14 @@ GpuCensus::ObjectEntry* GpuCensus::FindObject(uint64_t object_key) {
   if (it != objects_.end()) {
     return it->second.get();
   }
+  // Bounded: a title that streams geometry through a ring buffer produces a
+  // new key per frame, and one Black Ops session reached 387467 of them - of
+  // which 208311 were drawn once or twice and accounted for 1.5% of the draws.
+  // Past the cap the tail is simply not tracked; the 7% of keys carrying 98.5%
+  // of the work are all long-lived and already in.
+  if (objects_.size() >= kMaxTrackedObjects) {
+    return nullptr;
+  }
   auto entry = std::make_unique<ObjectEntry>();
   ObjectEntry* raw = entry.get();
   objects_.emplace(object_key, std::move(entry));
@@ -374,6 +382,9 @@ void GpuCensus::RecordObjectDraw(uint64_t object_key, uint32_t vertex_base,
     return;
   }
   ObjectEntry* entry = FindObject(object_key);
+  if (!entry) {
+    return;
+  }
   (pipeline_ready ? entry->draws : entry->draws_skipped)
       .fetch_add(1, std::memory_order_relaxed);
   uint64_t pair[2] = {vs_hash, ps_hash};
@@ -390,6 +401,32 @@ void GpuCensus::RecordObjectDraw(uint64_t object_key, uint32_t vertex_base,
   if (pipeline_ready && entry->states_ready.size() < 64) {
     entry->states_ready.insert(state_key);
   }
+}
+
+bool GpuCensus::IsObjectOneStateShort(uint64_t object_key) {
+  if (!enabled_ || !object_key) {
+    return false;
+  }
+  ObjectEntry* entry = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(objects_lock_);
+    auto it = objects_.find(object_key);
+    if (it == objects_.end()) {
+      return false;
+    }
+    entry = it->second.get();
+  }
+  std::lock_guard<std::mutex> entry_lock(entry->lock);
+  // Drawn enough times to be a mesh rather than a slot in a ring buffer: the
+  // arenas produce keys drawn once or twice, real geometry is drawn hundreds
+  // of times. 98.5% of all draws come from keys past this line.
+  if (entry->draws.load(std::memory_order_relaxed) +
+          entry->draws_skipped.load(std::memory_order_relaxed) <
+      kObjectEstablishedDraws) {
+    return false;
+  }
+  size_t wanted = entry->states_wanted.size();
+  return wanted > 1 && entry->states_ready.size() + 1 == wanted;
 }
 
 std::string GpuCensus::GetObjectReport() {

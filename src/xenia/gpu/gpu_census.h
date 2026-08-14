@@ -128,6 +128,11 @@ class GpuCensus {
                         uint64_t vs_hash, uint64_t ps_hash, uint64_t state_key,
                         bool pipeline_ready);
   std::string GetObjectReport();
+  // Whether this mesh has already been seen in several pipeline states and is
+  // short of exactly one of them. Not "missing one state": a key seen for the
+  // first time is missing its only state, and 140694 of those appear in a
+  // session, so that test would put everything at the front and mean nothing.
+  bool IsObjectOneStateShort(uint64_t object_key);
 
   // ---- reporting ---------------------------------------------------------
   // A handful of lines for the periodic log: the worst offender in each
@@ -250,6 +255,8 @@ class GpuCensus {
     std::atomic<uint64_t> draws{0};
     std::atomic<uint64_t> draws_skipped{0};
   };
+  static constexpr size_t kMaxTrackedObjects = 65536;
+  static constexpr uint64_t kObjectEstablishedDraws = 10;
   ObjectEntry* FindObject(uint64_t object_key);
   std::mutex objects_lock_;
   std::unordered_map<uint64_t, std::unique_ptr<ObjectEntry>> objects_;
