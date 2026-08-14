@@ -205,7 +205,7 @@ DEFINE_bool(
     "D3D12");
 
 DEFINE_string(
-    d3d12_substitute_scope, "strict",
+    d3d12_substitute_scope, "any",
     "Xbox UWP: how different a stand-in pipeline may be from the one a draw "
     "asked for while that one is still compiling. A stand-in always has the "
     "same vertex shader, root signature and render state, so the geometry is "

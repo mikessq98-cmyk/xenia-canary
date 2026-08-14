@@ -3532,9 +3532,11 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
                                             : 0.0;
 
   if (skipped_fraction > kGovernorSkippedFractionFloor) {
-    // One step per sample, not straight to the maximum - the driver charges
-    // more per pipeline the more compilers ask at once.
-    if (permits < max_permits) {
+    // Two at most, whatever the queue looks like. The driver charges more per
+    // pipeline the more compilers ask at once - 517 ms at one, 712 at two,
+    // 1002 at five - and catching up at four cost more frames than the missing
+    // objects were worth (19.5 fps against 39.5 with one).
+    if (permits < std::min(max_permits, kGovernorMaxCatchUpPermits)) {
       pipeline_cache_->SetCreationPermits(permits + 1);
     }
     governor_catching_up_ = true;

@@ -504,6 +504,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint64_t governor_last_drawn_ = 0;
   bool governor_catching_up_ = false;
   static constexpr uint32_t kGovernorSamplesBeforeReleasing = 2;
+  static constexpr uint32_t kGovernorMaxCatchUpPermits = 2;
   uint32_t governor_caught_up_samples_ = 0;
   uint64_t governor_last_ticks_ = 0;
   uint64_t governor_last_frames_ = 0;
