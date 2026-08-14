@@ -34,7 +34,6 @@
 #include "xenia/base/threading.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
-#include "xenia/gpu/d3d12/pipeline_blob_cache.h"
 #include "xenia/gpu/d3d12/toxic_shader_solver.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -97,16 +96,29 @@ class PipelineCache {
                                   uint64_t pixel_shader_hash) {
     solver_.ExecutionJournalDraw(vertex_shader_hash, pixel_shader_hash);
   }
-  // Whether this pair has never been seen to survive execution.
+  // Whether this pair, in this pipeline state, has never been seen to survive
+  // execution. `state_key` is the pipeline's description hash - see
+  // GetPipelineStateKeyByHandle.
   bool SolverNeedsExecutionVerification(uint64_t vertex_shader_hash,
-                                        uint64_t pixel_shader_hash) {
+                                        uint64_t pixel_shader_hash,
+                                        uint64_t state_key) {
     return solver_.NeedsExecutionVerification(vertex_shader_hash,
-                                              pixel_shader_hash);
+                                              pixel_shader_hash, state_key);
   }
   // The pair drew without hanging the GPU. Remembered across launches.
   void SolverMarkExecutionVerified(uint64_t vertex_shader_hash,
-                                   uint64_t pixel_shader_hash) {
-    solver_.MarkExecutionVerified(vertex_shader_hash, pixel_shader_hash);
+                                   uint64_t pixel_shader_hash,
+                                   uint64_t state_key) {
+    solver_.MarkExecutionVerified(vertex_shader_hash, pixel_shader_hash,
+                                  state_key);
+  }
+  // The identity of the exact pipeline STATE behind a handle. Zero when the
+  // handle is not a guest pipeline. The same guest shaders are translated into
+  // several modifications - different DXBC out of our own translator - so a
+  // pair proven safe in one of them has not been proven in another.
+  uint64_t GetPipelineStateKeyByHandle(void* handle) const {
+    return handle ? reinterpret_cast<const Pipeline*>(handle)->description_hash
+                  : 0;
   }
   void SolverQuarantineExecutionSuspect(uint64_t vertex_shader_hash,
                                         uint64_t pixel_shader_hash) {
@@ -131,15 +143,37 @@ class PipelineCache {
     return solver_.verified_this_run();
   }
 #endif  // XE_PLATFORM_WINRT
-  // How much pipeline compilation the stored driver blobs saved this launch.
-  std::string GetPipelineBlobCacheReport() const {
-    return blob_cache_.GetReport();
+
+  // What the creation side has cost the CPU this session: thread time, the
+  // split between our translator and the driver's compiler, and how long
+  // pipelines wait in the queue. One line for the periodic memory report.
+  std::string GetCreationCostReport() const;
+  // CPU consumed by the compilers so far, for the process-wide CPU split.
+  uint64_t creation_cpu_100ns() const {
+    return creation_cpu_100ns_.load(std::memory_order_relaxed);
   }
+  // What the shader storage has committed to disk this session.
+  std::string GetShaderStorageWriteReport() {
+    return storage_writer_.GetWriteReport();
+  }
+
+  // The guest finished a frame - compilation may pay down its debt.
+  void NoteGuestFrameForCreationBudget() {
 #if XE_PLATFORM_WINRT
+    RefillCreationBudget();
 #endif  // XE_PLATFORM_WINRT
+  }
+  // One line for the periodic report: what the governor is doing and why.
+  std::string GetCreationGovernorReport() const;
 
   void EndSubmission();
   bool IsCreatingPipelines();
+  // How many compilers are inside the driver right now. Sampled by the texture
+  // cache around its own driver calls, to find out whether the two contend.
+  uint32_t GetPipelinesBeingCreated() {
+    std::lock_guard<xe_mutex> lock(creation_request_lock_);
+    return uint32_t(creation_threads_busy_);
+  }
   // Waits for any pipeline creation needed by the current draw path to finish
   // before state is consumed. This was added so strict ZPD query paths stop
   // racing pipeline compilation and then blocking work on incomplete state.
@@ -526,11 +560,6 @@ class PipelineCache {
   ToxicShaderSolver solver_;
 #endif  // XE_PLATFORM_WINRT
 
-  // What the driver produced for each pipeline last launch, so it does not
-  // have to produce it again. Not WINRT-only: nothing about a per-pipeline
-  // cached blob is console-specific, and a desktop driver benefits from it for
-  // the same reason.
-  PipelineBlobCache blob_cache_;
 
   // Sum of resident translated shader bytecode sizes (incremented on a
   // successful translation, decremented when released under memory pressure).
@@ -605,6 +634,16 @@ class PipelineCache {
     // Submission of the last unsuccessful substitute search, so the search
     // runs at most once per submission per pipeline.
     uint64_t substitute_search_submission = UINT64_MAX;
+    // Hash of the whole description - the identity of this exact pipeline
+    // STATE, as opposed to the shader pair it draws with. The execution
+    // verification uses it: the same guest shaders are translated into several
+    // different modifications (interpolator layout, early-Z hint, param-gen),
+    // which is DIFFERENT DXBC produced by our own translator, and a pair proven
+    // safe in one of them says nothing about another.
+    uint64_t description_hash = 0;
+    // Set once a draw has been skipped for want of this pipeline. Until then
+    // it is speculative and belongs to the frozen tier - see CreationAdmitted.
+    std::atomic<bool> demanded{false};
 #endif  // XE_PLATFORM_WINRT
     // For background creation: stores the untranslated shaders.
     // Background thread translates both VS and PS together, then creates the
@@ -614,6 +653,10 @@ class PipelineCache {
     // Priority for async compilation (higher = compiled sooner).
     // Pipelines that write to visible render targets get higher priority.
     uint8_t priority{0};
+    // When this pipeline was first put in the creation queue, so the wait
+    // before a thread picks it up can be measured. Every submission it spends
+    // waiting is a submission where its draws are skipped.
+    uint64_t queued_tick{0};
   };
 
   // Marks the pipeline's translations as referenced by a queued or in-flight
@@ -697,33 +740,80 @@ class PipelineCache {
   // index).
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
 
-  // Driver-level pipeline cache. The shader storage above only records WHAT to
-  // build; without this the driver recompiles every pipeline from scratch on
-  // every launch, which is what fills the creation queue with hundreds of
-  // entries while a level streams in (and makes draws whose pipeline isn't
-  // ready yet get skipped). The library holds the driver's compiled result, so
-  // a second launch creates them almost instantly.
-  void InitializePipelineLibrary(const std::filesystem::path& root,
-                                 uint32_t title_id);
-  void SavePipelineLibrary();
-  void ShutdownPipelineLibrary();
-  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> pipeline_library_;
-  // The blob the library was created from MUST stay alive and unmodified for
-  // as long as the library exists - the runtime reads from it lazily.
-  std::vector<uint8_t> pipeline_library_blob_;
-  std::filesystem::path pipeline_library_path_;
-  // ID3D12PipelineLibrary is not free-threaded, and pipelines are created on
-  // the creation threads.
-  std::mutex pipeline_library_mutex_;
-  // Whether anything was stored since the last serialization. Set on the
-  // creation threads, polled by EndSubmission on the command processor one.
-  std::atomic<bool> pipeline_library_dirty_{false};
-  // Submissions since the library was last written out (see EndSubmission).
-  uint32_t submissions_since_library_save_ = 0;
-  // Pipelines served by the library vs. compiled by the driver this run -
-  // telemetry that shows whether the cache is doing its job.
-  std::atomic<uint32_t> pipeline_library_hits_{0};
-  std::atomic<uint32_t> pipeline_library_misses_{0};
+  // WHERE THE CPU GOES ON THE CREATION SIDE.
+  //
+  // This target is CPU-bound (measured 75-80% CPU against 10-20% GPU) and every
+  // one of these threads competes with the guest recompiler for the same seven
+  // cores. Scheduling them well is not possible without knowing what they cost,
+  // so the cost is counted: total CPU consumed by the creation threads, and the
+  // wall time split between OUR translator and the DRIVER's compiler, which are
+  // two entirely different problems with two entirely different fixes.
+  std::atomic<uint64_t> creation_cpu_100ns_{0};
+  std::atomic<uint64_t> translation_ticks_{0};
+  std::atomic<uint64_t> driver_compile_ticks_{0};
+  std::atomic<uint64_t> driver_compile_count_{0};
+  // How long a pipeline sat in the queue before a thread picked it up - the
+  // number that says whether the queue is starved of threads or of time.
+  std::atomic<uint64_t> queue_wait_ticks_{0};
+  std::atomic<uint64_t> queue_wait_count_{0};
+  std::atomic<uint32_t> queue_depth_peak_{0};
+
+#if XE_PLATFORM_WINRT
+ public:
+  // How many compilers may be working at this instant. The threads exist
+  // either way; this is a permit count they take before picking work up, so
+  // changing it is instant and costs no thread creation. Set by the governor
+  // in the command processor, which is the only place that can see the two
+  // things the decision depends on - the guest frame rate and how much of the
+  // console is already busy.
+  void SetCreationPermits(uint32_t permits);
+  // Whether speculative (never-yet-demanded) pipelines may be built right now.
+  void SetFrozenTierAllowed(bool allowed);
+  uint32_t creation_permits() const {
+    return creation_permits_.load(std::memory_order_relaxed);
+  }
+  uint32_t creation_queue_depth() const {
+    return creation_queue_depth_hint_.load(std::memory_order_relaxed);
+  }
+  // Ceiling the governor may raise permits to.
+  uint32_t max_creation_permits() const {
+    return uint32_t(creation_threads_.size());
+  }
+
+ private:
+  // Consulted with creation_request_lock_ held, from the creation threads only.
+  bool CreationAdmitted(bool candidate_demanded);
+  // Whether speculative work may be built right now. The governor clears it
+  // when it has had to back off, so the frozen tier only runs on headroom the
+  // guest is not using.
+  std::atomic<bool> frozen_tier_allowed_{true};
+  // Called once per guest frame by the command processor.
+  void RefillCreationBudget();
+  // THE BUDGET IS A DEBT, NOT AN ALLOWANCE.
+  //
+  // It used to be reset to zero every guest frame, which meant a single 700 ms
+  // compile - the measured cost of one pipeline on this driver - overshot the
+  // whole frame's allowance and then had the overshoot forgiven. "2 ms per
+  // frame" therefore behaved as "one compile started per frame", and measured
+  // WORSE than no budget at all (29.8 fps against 33.5). Carrying the debt is
+  // what the cvar always claimed to do: at 2 ms per frame and 30 fps it is
+  // 60 ms of compiler time per second, a 6% duty cycle, and a 700 ms item
+  // simply parks the compilers until it is paid off.
+  int64_t creation_budget_debt_ticks_ = 0;
+  uint64_t creation_budget_exhausted_frames_ = 0;
+  double ticks_per_millisecond_ =
+      double(xe::Clock::QueryHostTickFrequency()) / 1000.0;
+  static constexpr uint32_t kInitialCreationPermits = 2;
+  std::atomic<uint32_t> creation_permits_{~uint32_t(0)};
+  // Governor telemetry, for the periodic report.
+  std::atomic<uint32_t> governor_permits_{0};
+  std::atomic<uint32_t> governor_backoffs_{0};
+  std::atomic<uint32_t> governor_expansions_{0};
+#endif  // XE_PLATFORM_WINRT
+  // Per-thread previous GetThreadTimes sample; only creation threads index it,
+  // and their count is bounded by the burst logic well below this.
+  static constexpr size_t kMaxTrackedCreationThreads = 16;
+  uint64_t thread_last_cpu_100ns_[kMaxTrackedCreationThreads] = {};
 
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);

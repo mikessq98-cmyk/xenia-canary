@@ -42,6 +42,7 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include "xenia/gpu/gpu_census.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc.h"
@@ -64,10 +65,26 @@ DEFINE_bool(
     "D3D12");
 DEFINE_int32(
     d3d12_pipeline_creation_threads, -1,
-    "Number of threads used for graphics pipeline creation. -1 to calculate "
-    "automatically (75% of logical CPU cores), a positive number to specify "
-    "the number of threads explicitly (up to the number of logical CPU cores), "
-    "0 to disable multithreaded pipeline creation.",
+    "Number of threads used for graphics pipeline creation. A positive number "
+    "fixes it (up to the number of logical CPU cores), 0 disables "
+    "multithreaded creation, and -1 (the default) hands the decision to a "
+    "governor that adjusts it while the game runs.\n"
+    "WHAT THE GOVERNOR DOES, AND WHY IT GOES THE WAY IT DOES. Once a second it "
+    "compares the guest frame rate against the best this title has actually "
+    "managed (a decaying maximum - a fixed 60 fps target would condemn every "
+    "title that cannot reach it and never let a compiler run). Below 75% of "
+    "that, it takes a compiler away immediately. Above 90%, with more than 1.5 "
+    "cores genuinely spare, and only after three consecutive samples agree, it "
+    "gives one back. Backing off is instant, expanding is slow: a lost frame "
+    "is felt now, while a pipeline built later is only geometry appearing "
+    "later.\n"
+    "It is deliberately the opposite of growing with the queue. A deep queue "
+    "means a level is streaming in, which is exactly when the guest threads "
+    "need the console most - and on 2026-08-13, on the same scene with every "
+    "other cvar identical, five compilers gave 15.3 fps and two gave 33.5. "
+    "More compilers did not even compile faster in proportion: the driver "
+    "serialises internally, taking 1002 ms per pipeline under five threads "
+    "against 712 ms under two.",
     "D3D12");
 DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
@@ -140,23 +157,37 @@ DEFINE_bool(
     "D3D12");
 
 #if XE_PLATFORM_WINRT
-DEFINE_bool(
-    d3d12_pipeline_library, false,
-    "Keep the driver's COMPILED pipelines in a D3D12 pipeline library on disk, "
-    "next to the shader storage, and reuse them on later launches.\n"
-    "The shader storage alone only records which pipelines a game needs - the "
-    "driver still compiles every one of them from scratch on every launch, "
-    "which on a console fills the creation queue with hundreds of entries "
-    "while a level streams in and leaves draws without a pipeline to use. With "
-    "the library, a second launch of the same game creates them almost "
-    "instantly.\n"
-    "The library is rejected by the runtime after a driver update (its "
-    "contents are driver-specific); that is detected and it is simply rebuilt.\n"
-    "OFF by default because it still crashes this console's driver even with "
-    "the D3D12_FEATURE_SHADER_CACHE support query that was added after it first "
-    "killed the device before the first draw. The query says the feature is "
-    "supported and it dies anyway, so there is nothing left to check before "
-    "using it - only a report that it works.",
+DEFINE_int32(
+    d3d12_pipeline_creation_in_flight, 0,
+    "Xbox UWP: how many pipelines may be inside the driver's compiler at once. "
+    "0 (the default) is no limit - as many as there are creation threads.\n"
+    "The threads stay warm either way; this bounds only the concurrency handed "
+    "to the driver, which may serialise them behind its own lock regardless, "
+    "in which case the extra threads cost their scheduling and buy nothing. On "
+    "a console where the guest recompiler is the bottleneck (measured at "
+    "75-80% CPU against 10-20% GPU) that is not a good trade.\n"
+    "1 means strictly one at a time. Be careful with it: the toxic solver's "
+    "safe mode already shows what fully serialised creation costs - 2.9 "
+    "million skipped draws in ninety seconds of a level load, i.e. most of the "
+    "geometry missing while it catches up. Prefer the time budget below.",
+    "D3D12");
+
+DEFINE_double(
+    d3d12_pipeline_creation_budget_ms_per_frame, 0.0,
+    "Xbox UWP: milliseconds of pipeline compilation allowed per guest frame. "
+    "0 (the default) leaves the pacing to the governor - see "
+    "d3d12_pipeline_creation_threads.\n"
+    "It is a DEBT, not an allowance: one pipeline costs this driver 700-1000 "
+    "ms, so a single item overshoots any per-frame figure by orders of "
+    "magnitude, and the overshoot is carried and paid down at the stated rate "
+    "instead of being forgiven at the frame boundary. 2 ms per frame at 30 fps "
+    "therefore means 60 ms of compiler time per second - a 6% duty cycle - and "
+    "one 700 ms compile parks the compilers until it is paid off.\n"
+    "Forgiving it at each frame is what the first version did, and it measured "
+    "WORSE than no budget at all (29.8 fps against 33.5): it degenerated into "
+    "'one compile started per frame' while the queue grew from 512 to 768.\n"
+    "The cost of setting it too low is draws skipped for longer - a pipeline "
+    "not yet built is geometry not yet drawn.",
     "D3D12");
 
 DEFINE_bool(
@@ -332,29 +363,14 @@ bool PipelineCache::Initialize() {
       creation_thread_count =
           std::max(logical_processor_count * 3 / 4, uint32_t(1));
 #if XE_PLATFORM_WINRT
-      // Xbox Series: the app sees only ~6-7 cores and the emulator already
-      // runs the guest CPU threads, the GPU command processor, audio and the
-      // XMA decoder on them. 75% of cores compiling pipelines mid-game is
-      // oversubscription that shows up as frame drops whenever a burst of new
-      // pipelines arrives, even at below-normal priority. Three below-normal
-      // compilers: two could not keep up with permutation-heavy titles (Black
-      // Ops: 200+ pipelines backlogged and GROWING, every affected draw
-      // skipped = black objects on screen); the blocking storage prewarm
-      // spawns its own temporary extra threads anyway (when nothing else is
-      // running), so initial load speed is unaffected.
-      creation_thread_count = std::min(creation_thread_count, size_t(3));
+      // The POOL, not how many of them may work at once - that is the
+      // governor's permit count, which starts at kInitialCreationPermits and
+      // moves with the frame rate. The pool only has to be big enough for the
+      // governor to have somewhere to expand to, and every thread in it costs
+      // nothing while it has no permit.
+      creation_thread_count = std::min(creation_thread_count, size_t(4));
 #endif  // XE_PLATFORM_WINRT
-      // While a level streams in, the queue goes hundreds deep and everything
-      // in it is a draw waiting to be drawn - see
-      // EnsureCreationThreadsForQueueDepth.
-      creation_thread_burst_count_ =
-          std::max(creation_thread_count,
-                   size_t(std::max(logical_processor_count * 3 / 4,
-                                   uint32_t(1))));
-#if XE_PLATFORM_WINRT
-      creation_thread_burst_count_ =
-          std::min(creation_thread_burst_count_, size_t(5));
-#endif  // XE_PLATFORM_WINRT
+      creation_thread_burst_count_ = creation_thread_count;
     } else {
       creation_thread_count =
           std::min(uint32_t(cvars::d3d12_pipeline_creation_threads),
@@ -376,6 +392,21 @@ bool PipelineCache::Initialize() {
 #endif  // XE_PLATFORM_WINRT
       creation_threads_.push_back(std::move(creation_thread));
     }
+#if XE_PLATFORM_WINRT
+    // Two is where the measurement landed: on the same Black Ops scene with
+    // every other cvar identical, five compilers gave 15.3 fps and two gave
+    // 33.5. The governor moves it from here, and only upward when the frame
+    // rate is holding and the cores are genuinely spare.
+    creation_permits_.store(
+        cvars::d3d12_pipeline_creation_threads < 0
+            ? std::min<uint32_t>(kInitialCreationPermits,
+                                 uint32_t(creation_threads_.size()))
+            : uint32_t(creation_threads_.size()),
+        std::memory_order_relaxed);
+    governor_permits_.store(
+        creation_permits_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+#endif  // XE_PLATFORM_WINRT
   }
   return true;
 }
@@ -403,7 +434,6 @@ void PipelineCache::Shutdown() {
   // Clean teardown (threads already joined above, so no creation is in flight):
   // discard the crash journal so a normal exit isn't mistaken for a crash.
   solver_.Shutdown(/*clean_exit=*/true);
-  blob_cache_.Shutdown(/*clean_exit=*/true);
 #endif  // XE_PLATFORM_WINRT
 
   // Destroy all pipelines.
@@ -503,14 +533,11 @@ void PipelineCache::InitializeShaderStorage(
     std::filesystem::path solver_root = GetShaderStorageRoot(cache_root);
     std::error_code solver_ec;
     std::filesystem::create_directories(solver_root, solver_ec);
-    InitializePipelineLibrary(solver_root, title_id);
     solver_.Initialize(solver_root, title_id);
   }
-  // Before any pipeline is created below, so the prewarm - which creates all
-  // of them - is exactly what the stored blobs serve.
-  blob_cache_.Initialize(GetShaderStorageRoot(cache_root), title_id,
-                         command_processor_.GetD3D12Provider());
 #endif  // XE_PLATFORM_WINRT
+  GpuCensus::Get().Initialize(GetShaderStorageRoot(cache_root) / "census",
+                              title_id);
 
   // Create the pipelines.
   if (!pipeline_stored_descriptions.empty()) {
@@ -763,10 +790,6 @@ void PipelineCache::InitializeShaderStorage(
         "Pipeline cache loaded: {} created, {} already exist, {} total stored",
         pipelines_created, pipelines_already_exist,
         pipeline_stored_descriptions.size());
-    // The prewarm is what the stored blobs exist for. Past it they are tens of
-    // megabytes doing nothing, on a budget where that matters - and having got
-    // this far without dying, they are cleared of having caused a crash.
-    blob_cache_.ReleaseLoadedBlobs();
     if (pipelines_vs_not_found || pipelines_vs_translation_missing ||
         pipelines_ps_not_found || pipelines_ps_translation_missing ||
         pipelines_root_sig_failed) {
@@ -793,10 +816,7 @@ void PipelineCache::InitializeShaderStorage(
 }
 
 void PipelineCache::ShutdownShaderStorage() {
-  // Persist the driver's compiled pipelines before anything else - this is
-  // what spares the next launch the whole compilation.
-  ShutdownPipelineLibrary();
-
+  GpuCensus::Get().Shutdown();
   // Shut down the storage writer (closes files, stops write thread).
   storage_writer_.ShutdownShaderStorage();
   shader_storage_file_flush_needed_ = false;
@@ -804,20 +824,182 @@ void PipelineCache::ShutdownShaderStorage() {
   shader_storage_title_id_ = 0;
 }
 
-void PipelineCache::EndSubmission() {
-  // Periodically persist the pipeline library. A console application is often
-  // terminated by the system rather than shut down cleanly, and everything
-  // compiled since the last save would be lost - which would put the next
-  // launch right back to compiling hundreds of pipelines. Serialization is not
-  // cheap, so this is rare and only happens when something new was stored.
-  if (pipeline_library_dirty_) {
-    static constexpr uint32_t kSubmissionsPerLibrarySave = 600;
-    if (++submissions_since_library_save_ >= kSubmissionsPerLibrarySave) {
-      submissions_since_library_save_ = 0;
-      SavePipelineLibrary();
-    }
+#if XE_PLATFORM_WINRT
+bool PipelineCache::CreationAdmitted(bool candidate_demanded) {
+  // Called with creation_request_lock_ held.
+  //
+  // THE FROZEN TIER.
+  //
+  // A pipeline is "demanded" once a draw has actually been skipped for want of
+  // it. Everything else in the queue was created speculatively - the storage
+  // prewarm builds every pipeline the title has ever used, and a scene needs a
+  // fraction of them - and measured cold on Black Ops, 60% of what the
+  // compiler produced was never drawn with at all, while half of all draws
+  // waited for something that was.
+  //
+  // So undemanded work is frozen rather than dropped. Dropping it would be
+  // wrong for exactly the reason it looks tempting: the pipeline nothing needs
+  // in this scene is often the one the next scene opens with, its shaders are
+  // already translated, and a PSO cannot be adjusted after the fact - it can
+  // only be built or not built. Frozen entries keep their place, keep their
+  // translations, and are built the moment either a draw asks for them (which
+  // promotes them out of the tier) or nothing demanded is left to do.
+  //
+  // "Nothing demanded is left" needs no bookkeeping: kPriorityPendingDraw is
+  // the highest priority there is, so a demanded pipeline always sorts above
+  // every speculative one. The candidate here IS the top of the queue, so if
+  // it is not demanded, nothing in the queue is.
+  //
+  // Except while something is explicitly waiting for the queue to drain - the
+  // blocking storage prewarm, or a caller in AwaitPipelineCompletion. Freezing
+  // then would hold back the very work the waiter is blocked on, and the
+  // prewarm's whole purpose is to build speculative pipelines before the guest
+  // needs them.
+  if (!candidate_demanded && !creation_completion_set_event_ &&
+      !frozen_tier_allowed_.load(std::memory_order_relaxed)) {
+    return false;
   }
 
+  // The permit count is the governor's decision and the in-flight cvar is the
+  // manual override of the same thing; whichever is tighter wins.
+  uint32_t permits = creation_permits_.load(std::memory_order_relaxed);
+  int32_t in_flight_limit = cvars::d3d12_pipeline_creation_in_flight;
+  if (in_flight_limit > 0) {
+    permits = std::min(permits, uint32_t(in_flight_limit));
+  }
+  if (creation_threads_busy_ >= size_t(permits)) {
+    return false;
+  }
+  if (cvars::d3d12_pipeline_creation_budget_ms_per_frame > 0.0 &&
+      creation_budget_debt_ticks_ > 0) {
+    ++creation_budget_exhausted_frames_;
+    return false;
+  }
+  return true;
+}
+
+void PipelineCache::RefillCreationBudget() {
+  double budget_ms = cvars::d3d12_pipeline_creation_budget_ms_per_frame;
+  if (budget_ms <= 0.0) {
+    return;
+  }
+  bool freed = false;
+  {
+    std::lock_guard<xe_mutex> lock(creation_request_lock_);
+    if (creation_budget_debt_ticks_ > 0) {
+      creation_budget_debt_ticks_ -=
+          int64_t(budget_ms * ticks_per_millisecond_);
+      freed = creation_budget_debt_ticks_ <= 0;
+    }
+  }
+  if (freed) {
+    // Threads parked on the debt have to be told it is paid off.
+    creation_request_cond_.notify_all();
+  }
+}
+
+std::string PipelineCache::GetCreationGovernorReport() const {
+  if (cvars::d3d12_pipeline_creation_threads >= 0) {
+    return std::string();
+  }
+  size_t queued = 0, demanded = 0;
+  {
+    std::lock_guard<xe_mutex> lock(
+        const_cast<xe_mutex&>(creation_request_lock_));
+    queued = creation_queue_.size();
+    demanded = queued && creation_queue_.top()->demanded.load(
+                             std::memory_order_relaxed)
+                   ? 1
+                   : 0;
+  }
+  return fmt::format(
+      "{} of {} compiler(s) admitted, {} backed off, {} expanded | queue {}, "
+      "speculative work {} (a draw is {}waiting)",
+      governor_permits_.load(std::memory_order_relaxed),
+      creation_threads_.size(),
+      governor_backoffs_.load(std::memory_order_relaxed),
+      governor_expansions_.load(std::memory_order_relaxed), queued,
+      frozen_tier_allowed_.load(std::memory_order_relaxed) ? "running"
+                                                           : "FROZEN",
+      demanded ? "" : "not ");
+}
+
+void PipelineCache::SetFrozenTierAllowed(bool allowed) {
+  if (frozen_tier_allowed_.exchange(allowed, std::memory_order_relaxed) ==
+      allowed) {
+    return;
+  }
+  if (allowed) {
+    creation_request_cond_.notify_all();
+  }
+}
+
+void PipelineCache::SetCreationPermits(uint32_t permits) {
+  uint32_t previous = creation_permits_.exchange(std::max(permits, uint32_t(1)),
+                                                 std::memory_order_relaxed);
+  if (permits > previous) {
+    governor_expansions_.fetch_add(1, std::memory_order_relaxed);
+    // Threads parked because there were no permits have to be woken.
+    creation_request_cond_.notify_all();
+  } else if (permits < previous) {
+    governor_backoffs_.fetch_add(1, std::memory_order_relaxed);
+  }
+  governor_permits_.store(permits, std::memory_order_relaxed);
+}
+#endif  // XE_PLATFORM_WINRT
+
+std::string PipelineCache::GetCreationCostReport() const {
+  uint64_t driver_count = driver_compile_count_.load(std::memory_order_relaxed);
+  uint64_t cpu_100ns = creation_cpu_100ns_.load(std::memory_order_relaxed);
+  if (!driver_count && !cpu_100ns) {
+    return std::string();
+  }
+  double ticks_to_ms = 1000.0 / double(xe::Clock::QueryHostTickFrequency());
+  double translation_ms =
+      double(translation_ticks_.load(std::memory_order_relaxed)) * ticks_to_ms;
+  double driver_ms =
+      double(driver_compile_ticks_.load(std::memory_order_relaxed)) *
+      ticks_to_ms;
+  uint64_t waits = queue_wait_count_.load(std::memory_order_relaxed);
+  double average_wait_ms =
+      waits ? double(queue_wait_ticks_.load(std::memory_order_relaxed)) *
+                  ticks_to_ms / double(waits)
+            : 0.0;
+  size_t threads;
+  size_t queued;
+  {
+    std::lock_guard<xe_mutex> lock(
+        const_cast<xe_mutex&>(creation_request_lock_));
+    threads = creation_threads_.size();
+    queued = creation_queue_.size();
+  }
+  std::string report = fmt::format(
+      "{:.0f} ms of CPU on {} creation thread(s) | {} compiled: {:.0f} ms in "
+      "the translator, {:.0f} ms in the driver's compiler ({:.0f} ms each) | "
+      "queue {} now, {} peak, waited {:.0f} ms on average before being picked "
+      "up",
+      double(cpu_100ns) * 1.0e-4, threads, driver_count, translation_ms,
+      driver_ms, driver_count ? driver_ms / double(driver_count) : 0.0, queued,
+      queue_depth_peak_.load(std::memory_order_relaxed), average_wait_ms);
+#if XE_PLATFORM_WINRT
+  // Only worth a line when a limit is actually set - otherwise it reports that
+  // nothing was limited, every thirty seconds, forever.
+  if (cvars::d3d12_pipeline_creation_in_flight > 0 ||
+      cvars::d3d12_pipeline_creation_budget_ms_per_frame > 0.0) {
+    report += fmt::format(
+        " | admission: at most {} in flight, {:.1f} ms per guest frame, budget "
+        "ran out in {} frame(s)",
+        cvars::d3d12_pipeline_creation_in_flight > 0
+            ? std::to_string(cvars::d3d12_pipeline_creation_in_flight)
+            : std::string("any number"),
+        cvars::d3d12_pipeline_creation_budget_ms_per_frame,
+        creation_budget_exhausted_frames_);
+  }
+#endif  // XE_PLATFORM_WINRT
+  return report;
+}
+
+void PipelineCache::EndSubmission() {
   if (shader_storage_file_flush_needed_ ||
       pipeline_storage_file_flush_needed_) {
     storage_writer_.RequestFlush(shader_storage_file_flush_needed_,
@@ -825,6 +1007,7 @@ void PipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
+
   // Releasing translated bytecode under memory pressure used to be decided
   // here, against this cache's own threshold. It is now the memory arbiter's
   // call (see GpuMemoryArbiter): five caches each polling the host and each
@@ -1207,6 +1390,7 @@ bool PipelineCache::ConfigurePipeline(
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
 #if XE_PLATFORM_WINRT
+  new_pipeline->description_hash = hash;
   if (substitute_mode_ != SubstituteMode::kOff) {
     // Index every pipeline by what a stand-in must match, so a pipeline that
     // is still compiling can find a ready one to draw with (and so this one
@@ -1265,7 +1449,12 @@ bool PipelineCache::ConfigurePipeline(
     {
       std::lock_guard<xe_mutex> lock(creation_request_lock_);
       AcquirePipelineTranslationsForCreation(new_pipeline);
+      new_pipeline->queued_tick = xe::Clock::QueryHostTickCount();
       creation_queue_.push(new_pipeline);
+      queue_depth_peak_.store(
+          std::max(queue_depth_peak_.load(std::memory_order_relaxed),
+                   uint32_t(creation_queue_.size())),
+          std::memory_order_relaxed);
     }
     creation_request_cond_.notify_one();
   } else {
@@ -1289,163 +1478,6 @@ bool PipelineCache::ConfigurePipeline(
   return true;
 }
 
-void PipelineCache::InitializePipelineLibrary(
-    const std::filesystem::path& root, uint32_t title_id) {
-  ShutdownPipelineLibrary();
-  if (!cvars::d3d12_pipeline_library) {
-    return;
-  }
-  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-
-  // Ask whether the driver supports pipeline libraries AT ALL before touching
-  // one. Calling CreatePipelineLibrary on a driver that does not took the
-  // console's device down with DXGI_ERROR_DRIVER_INTERNAL_ERROR before a
-  // single draw - every later call, including the library creation itself,
-  // then returned DXGI_ERROR_DEVICE_REMOVED. A capability query cannot do
-  // that.
-  D3D12_FEATURE_DATA_SHADER_CACHE shader_cache_support = {};
-  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_CACHE,
-                                         &shader_cache_support,
-                                         sizeof(shader_cache_support))) ||
-      !(shader_cache_support.SupportFlags &
-        D3D12_SHADER_CACHE_SUPPORT_LIBRARY)) {
-    XELOGI(
-        "Pipeline library: not supported by this driver (shader cache "
-        "support 0x{:X}) - compiled pipelines will not be cached between "
-        "launches",
-        uint32_t(shader_cache_support.SupportFlags));
-    return;
-  }
-
-  Microsoft::WRL::ComPtr<ID3D12Device1> device1;
-  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
-    XELOGW(
-        "Pipeline library: ID3D12Device1 unavailable - compiled pipelines "
-        "will not be cached between launches");
-    return;
-  }
-
-  // Driver-compiled contents are specific to the shader translation, so the
-  // resolution scale (which changes it) gets its own library, exactly like the
-  // toxic-shader solver's state.
-  std::string scale_suffix;
-  if (cvars::draw_resolution_scale_x > 1 || cvars::draw_resolution_scale_y > 1) {
-    scale_suffix = fmt::format(".{}x{}", cvars::draw_resolution_scale_x,
-                               cvars::draw_resolution_scale_y);
-  }
-  pipeline_library_path_ =
-      root / fmt::format("{:08X}.d3d12{}.pso_library", title_id, scale_suffix);
-
-  // The blob must outlive the library - the runtime reads from it lazily, so
-  // it is kept in pipeline_library_blob_ untouched until shutdown.
-  {
-    std::ifstream library_file(pipeline_library_path_,
-                               std::ios::binary | std::ios::ate);
-    if (library_file) {
-      std::streamsize size = library_file.tellg();
-      if (size > 0) {
-        pipeline_library_blob_.resize(size_t(size));
-        library_file.seekg(0);
-        if (!library_file.read(
-                reinterpret_cast<char*>(pipeline_library_blob_.data()), size)) {
-          pipeline_library_blob_.clear();
-        }
-      }
-    }
-  }
-
-  HRESULT hr = device1->CreatePipelineLibrary(
-      pipeline_library_blob_.data(), pipeline_library_blob_.size(),
-      IID_PPV_ARGS(&pipeline_library_));
-  if (FAILED(hr)) {
-    // E_INVALIDARG / D3D12_ERROR_DRIVER_VERSION_MISMATCH / ADAPTER_NOT_FOUND
-    // all mean the same thing in practice: this blob was written by a
-    // different driver or adapter and cannot be used. Start over rather than
-    // giving up on caching.
-    if (!pipeline_library_blob_.empty()) {
-      XELOGI(
-          "Pipeline library: the stored library is not usable by this driver "
-          "(0x{:08X}) - rebuilding it",
-          uint32_t(hr));
-      pipeline_library_blob_.clear();
-      hr = device1->CreatePipelineLibrary(nullptr, 0,
-                                          IID_PPV_ARGS(&pipeline_library_));
-    }
-    if (FAILED(hr)) {
-      XELOGW(
-          "Pipeline library: unavailable (0x{:08X}) - the driver will compile "
-          "every pipeline on every launch",
-          uint32_t(hr));
-      pipeline_library_.Reset();
-      pipeline_library_blob_.clear();
-      return;
-    }
-  }
-  XELOGI("Pipeline library: {} ({} KB restored from {})",
-         pipeline_library_blob_.empty() ? "started empty" : "loaded",
-         pipeline_library_blob_.size() >> 10,
-         xe::path_to_utf8(pipeline_library_path_));
-}
-
-void PipelineCache::SavePipelineLibrary() {
-  std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
-  if (!pipeline_library_ || !pipeline_library_dirty_ ||
-      pipeline_library_path_.empty()) {
-    return;
-  }
-  pipeline_library_dirty_ = false;
-  size_t serialized_size = pipeline_library_->GetSerializedSize();
-  if (!serialized_size) {
-    return;
-  }
-  std::vector<uint8_t> serialized(serialized_size);
-  if (FAILED(pipeline_library_->Serialize(serialized.data(),
-                                          serialized_size))) {
-    XELOGW("Pipeline library: serialization failed - not saving");
-    return;
-  }
-  // Written through a temporary and moved into place: a partially written
-  // library would be rejected on the next launch, throwing away everything.
-  std::filesystem::path temp_path = pipeline_library_path_;
-  temp_path += ".tmp";
-  {
-    std::ofstream library_file(temp_path, std::ios::binary | std::ios::trunc);
-    if (!library_file ||
-        !library_file.write(reinterpret_cast<const char*>(serialized.data()),
-                            std::streamsize(serialized_size))) {
-      XELOGW("Pipeline library: could not write {}",
-             xe::path_to_utf8(temp_path));
-      return;
-    }
-  }
-  std::error_code ec;
-  std::filesystem::rename(temp_path, pipeline_library_path_, ec);
-  if (ec) {
-    std::filesystem::remove(pipeline_library_path_, ec);
-    std::filesystem::rename(temp_path, pipeline_library_path_, ec);
-  }
-  XELOGI(
-      "Pipeline library: saved {} KB ({} pipeline(s) served from it this run, "
-      "{} compiled by the driver)",
-      serialized_size >> 10,
-      pipeline_library_hits_.load(std::memory_order_relaxed),
-      pipeline_library_misses_.load(std::memory_order_relaxed));
-}
-
-void PipelineCache::ShutdownPipelineLibrary() {
-  SavePipelineLibrary();
-  {
-    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
-    pipeline_library_.Reset();
-    // Only safe to release once the library is gone.
-    pipeline_library_blob_.clear();
-    pipeline_library_blob_.shrink_to_fit();
-    pipeline_library_path_.clear();
-    pipeline_library_dirty_ = false;
-  }
-  pipeline_library_hits_.store(0, std::memory_order_relaxed);
-  pipeline_library_misses_.store(0, std::memory_order_relaxed);
-}
 
 #if XE_PLATFORM_WINRT
 uint64_t PipelineCache::ComputeSubstituteKey(
@@ -1628,6 +1660,25 @@ bool PipelineCache::TranslateAnalyzedShader(
     XELOGE("Shader {:016X} translation failed; marking as ignored",
            shader.ucode_data_hash());
     return false;
+  }
+
+  {
+    // One guest shader becomes a separate DXBC program per modification, and
+    // each of those is its own trip through the driver's compiler. Recording
+    // the shape alongside the count is what makes the table answer "why does
+    // this one have thirty variants" rather than only "it does".
+    GpuCensus::ShaderShape shape;
+    shape.is_pixel_shader = shader.type() == xenos::ShaderType::kPixel;
+    shape.ucode_instructions = uint32_t(shader.ucode_dword_count());
+    shape.control_flow_labels = uint32_t(shader.label_addresses().size());
+    shape.texture_fetches = uint32_t(shader.texture_bindings().size());
+    shape.vertex_fetches = uint32_t(shader.vertex_bindings().size());
+    shape.memexport = shader.memexport_eM_written() != 0;
+    shape.kills_pixels = shader.kills_pixels();
+    shape.writes_depth = shader.writes_depth();
+    GpuCensus::Get().RecordShaderTranslated(shader.ucode_data_hash(), shape,
+                                            translation.modification(),
+                                            translation.translated_binary().size());
   }
 
   const char* host_shader_type;
@@ -1909,12 +1960,16 @@ uint32_t PipelineCache::GetSharedInterpolatorMask(
 }
 
 bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
-  // Steady state uses few threads on purpose: the console has ~6-7 usable
-  // cores carrying 30+ emulator threads, and compilation competing with them
-  // is felt as stutter. But when a level streams in, the queue goes hundreds
-  // deep and every entry in it is a draw that will be skipped until it is
-  // built - there, finishing sooner matters more, and the threads run at
-  // below-normal priority so they still yield to the guest.
+  // The thread pool is now fixed and it is the PERMIT count that moves - see
+  // SetCreationPermits and the governor in the command processor. Spawning and
+  // joining threads to follow the load was both slower to react (a join has to
+  // wait out whatever compile the thread is inside, up to a second on this
+  // driver) and pointed the wrong way: it added compilers exactly when the
+  // queue was deep, which is when a level is streaming and the guest threads
+  // need the console most.
+  //
+  // All that is left here is publishing the depth for the governor to read and
+  // telling the threads there is work.
   size_t queue_depth;
   {
     std::lock_guard<xe_mutex> lock(creation_request_lock_);
@@ -1922,74 +1977,7 @@ bool PipelineCache::EnsureCreationThreadsForQueueDepth() {
   }
   creation_queue_depth_hint_.store(uint32_t(std::min<size_t>(queue_depth, ~0u)),
                                    std::memory_order_relaxed);
-  bool backlog_deep = queue_depth >= kCreationQueueBurstDepth;
-  if (cvars::d3d12_pipeline_creation_threads >= 0) {
-    // An explicit count is the user's decision - don't override it.
-    return backlog_deep;
-  }
-  size_t wanted_threads = creation_threads_.size();
-  if (backlog_deep) {
-    wanted_threads = creation_thread_burst_count_;
-    creation_threads_idle_submissions_ = 0;
-  } else if (creation_threads_.size() > creation_thread_base_count_) {
-    // The burst is over. Threads spawned for it must not stay: they are extra
-    // runnable threads on a console with ~6-7 usable cores already carrying
-    // 30+ emulator threads, and keeping them costs the guest even while they
-    // have nothing to build. Wait a while first so a stuttering backlog
-    // doesn't make them come and go every few submissions, and require a
-    // completely empty queue - joining a thread that is inside the driver's
-    // compiler would block the submission for the whole compilation.
-    if (queue_depth != 0) {
-      creation_threads_idle_submissions_ = 0;
-      return false;
-    }
-    if (++creation_threads_idle_submissions_ >=
-        kCreationThreadIdleSubmissions) {
-      creation_threads_idle_submissions_ = 0;
-      size_t shut_down_from = creation_thread_base_count_;
-      {
-        std::lock_guard<xe_mutex> lock(creation_request_lock_);
-        creation_threads_shutdown_from_ = shut_down_from;
-      }
-      creation_request_cond_.notify_all();
-      for (size_t i = shut_down_from; i < creation_threads_.size(); ++i) {
-        // They are waiting on the condition variable with nothing queued, so
-        // this returns as soon as each observes the shutdown index.
-        xe::threading::Wait(creation_threads_[i].get(), false);
-      }
-      creation_threads_.resize(shut_down_from);
-      {
-        std::lock_guard<xe_mutex> lock(creation_request_lock_);
-        creation_threads_shutdown_from_ = SIZE_MAX;
-      }
-      XELOGI(
-          "Pipeline cache: back to {} creation threads, the backlog is gone",
-          creation_threads_.size());
-    }
-    return false;
-  }
-  if (wanted_threads <= creation_threads_.size()) {
-    return backlog_deep;
-  }
-  while (creation_threads_.size() < wanted_threads) {
-    size_t creation_thread_index = creation_threads_.size();
-    std::unique_ptr<xe::threading::Thread> creation_thread =
-        xe::threading::Thread::Create({}, [this, creation_thread_index]() {
-          CreationThread(creation_thread_index);
-        });
-    if (!creation_thread) {
-      break;
-    }
-    creation_thread->set_name("D3D12 Pipelines");
-#if XE_PLATFORM_WINRT
-    creation_thread->set_priority(-1);
-#endif  // XE_PLATFORM_WINRT
-    creation_threads_.push_back(std::move(creation_thread));
-  }
-  XELOGI(
-      "Pipeline cache: {} creation threads while {} pipelines are queued",
-      creation_threads_.size(), queue_depth);
-  return backlog_deep;
+  return queue_depth >= kCreationQueueBurstDepth;
 }
 
 void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
@@ -2009,6 +1997,10 @@ void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
       return;
     }
     pipeline->priority = pipeline_util::kPriorityPendingDraw;
+    // A draw has now been skipped for this pipeline, so it leaves the frozen
+    // tier: it is no longer speculative, something on screen is missing
+    // without it, and it is admitted ahead of everything that is.
+    pipeline->demanded.store(true, std::memory_order_relaxed);
     // std::priority_queue cannot re-sort in place, so the pipeline is pushed
     // again with its new priority. The duplicate is harmless: whichever copy
     // is popped first builds it, and the creation path skips a pipeline that
@@ -2016,7 +2008,9 @@ void PipelineCache::PrioritizePipelineForPendingDraw(void* handle) {
     AcquirePipelineTranslationsForCreation(pipeline);
     creation_queue_.push(pipeline);
   }
-  creation_request_cond_.notify_one();
+  // Everything parked on the frozen tier has to be woken: this is the one
+  // event that can turn a thread's "nothing I may build" into work.
+  creation_request_cond_.notify_all();
 }
 
 uint64_t PipelineCache::ReleaseTranslationsForArbiter(uint64_t bytes_to_free) {
@@ -2210,6 +2204,14 @@ void PipelineCache::TranslateShadersForStorage(
     auto thread = xe::threading::Thread::Create({}, translate_function);
     if (thread) {
       thread->set_name("Shader Translation");
+#if XE_PLATFORM_WINRT
+      // Same reasoning as the creation threads, which have run below normal
+      // since the stutter they caused was traced to them: seven translation
+      // threads at NORMAL priority is the heaviest single moment this
+      // emulator asks of the console's seven cores, and it lands while the
+      // guest is being brought up.
+      thread->set_priority(-1);
+#endif  // XE_PLATFORM_WINRT
       translation_threads.push_back(std::move(thread));
     }
   }
@@ -4392,42 +4394,23 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   }
   ToxicShaderSolver::CreationProbe solver_probe(solver_, vs_hash, ps_hash);
   uint64_t description_hash = XXH3_64bits(&description, sizeof(description));
-  // Ask the pipeline library first - a hit skips the driver's compiler
-  // entirely, which is the whole point of keeping it.
-  std::wstring library_name;
-  if (pipeline_library_) {
-    library_name = fmt::format(L"{:016X}", description_hash);
-    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
-    if (SUCCEEDED(pipeline_library_->LoadGraphicsPipeline(
-            library_name.c_str(), &state_desc, IID_PPV_ARGS(&state)))) {
-      pipeline_library_hits_.fetch_add(1, std::memory_order_relaxed);
-      return state;
-    }
-  }
-
-  // Hand the driver back what it produced for this exact pipeline last time,
-  // if we have it - that is the difference between loading a pipeline and
-  // compiling one, and compiling is 6-8 per second on this driver.
-  bool used_cached_blob = blob_cache_.ApplyTo(description_hash, state_desc);
 
   DWORD creation_exception_code = 0;
+  uint64_t driver_compile_start = xe::Clock::QueryHostTickCount();
   HRESULT hr = CreateGraphicsPipelineStateGuarded(
       device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
-  if (used_cached_blob && (FAILED(hr) || creation_exception_code != 0)) {
-    // The runtime refused the blob (a driver update, or it simply does not
-    // like it), or the driver fell over on it. Either way this pipeline is
-    // fine - only its stored blob is not. Drop it and compile normally; this
-    // per-pipeline recovery is the whole reason for preferring cached blobs
-    // over ID3D12PipelineLibrary, where the same event takes everything down.
-    blob_cache_.Discard(description_hash);
-    state = nullptr;
-    state_desc.CachedPSO.pCachedBlob = nullptr;
-    state_desc.CachedPSO.CachedBlobSizeInBytes = 0;
-    creation_exception_code = 0;
-    used_cached_blob = false;
-    hr = CreateGraphicsPipelineStateGuarded(
-        device, &state_desc, IID_PPV_ARGS(&state), &creation_exception_code);
-  }
+  // The driver's compiler, timed on its own. The other half of a creation is
+  // our translator, timed in EnsurePipelineShadersTranslated - which of the two
+  // to attack is not answerable without both numbers.
+  uint64_t driver_compile_ticks =
+      xe::Clock::QueryHostTickCount() - driver_compile_start;
+  driver_compile_ticks_.fetch_add(driver_compile_ticks,
+                                  std::memory_order_relaxed);
+  driver_compile_count_.fetch_add(1, std::memory_order_relaxed);
+  GpuCensus::Get().RecordPipelineCompiled(
+      vs_hash, ps_hash, description_hash,
+      double(driver_compile_ticks) * 1000.0 /
+          double(xe::Clock::QueryHostTickFrequency()));
   if (creation_exception_code != 0) {
     // The compiler crashed and the exception was contained. Whether that means
     // the pair is toxic or simply that the process is out of memory is the
@@ -4607,34 +4590,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.vertex_shader->shader().ucode_data_hash());
   }
   state->SetName(name.c_str());
-
-  // Keep what the driver just produced, unless it came from a stored blob in
-  // the first place - re-storing that would only rewrite what is already
-  // there.
-  if (!used_cached_blob) {
-    blob_cache_.Store(description_hash, state);
-  }
-
-  // Hand the freshly compiled pipeline to the library so the next launch does
-  // not have to compile it again.
-  if (pipeline_library_ && !library_name.empty()) {
-    pipeline_library_misses_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(pipeline_library_mutex_);
-    HRESULT store_hr =
-        pipeline_library_->StorePipeline(library_name.c_str(), state);
-    if (SUCCEEDED(store_hr)) {
-      pipeline_library_dirty_ = true;
-    } else if (store_hr != E_INVALIDARG) {
-      // E_INVALIDARG just means this name is already stored (a pipeline whose
-      // description hash collides with an existing entry, or a re-creation
-      // after a cache clear) - not worth reporting.
-      static std::atomic<bool> store_failure_logged{false};
-      if (!store_failure_logged.exchange(true)) {
-        XELOGW("Pipeline library: StorePipeline failed (0x{:08X})",
-               uint32_t(store_hr));
-      }
-    }
-  }
   return state;
 }
 
@@ -4711,6 +4666,20 @@ void PipelineCache::CreationThread(size_t thread_index) {
       // until the pipeline is created - other threads must be able to dequeue
       // requests, but can't set the completion event until the pipelines are
       // fully created (rather than just started creating).
+#if XE_PLATFORM_WINRT
+      // ADMISSION CONTROL. Both limits hold the work in the queue rather than
+      // dropping it - a pipeline not built is a draw skipped, so delaying is a
+      // real cost, and the point is to pay it in a controlled amount instead
+      // of taking whatever the machine happens to have.
+      if (!CreationAdmitted(creation_queue_.top()->demanded.load(
+              std::memory_order_relaxed))) {
+        // Wait rather than spin: the budget is refilled by the command
+        // processor at the start of a frame, and an in-flight slot by whichever
+        // thread finishes first. Both notify this condition.
+        creation_request_cond_.wait(lock);
+        continue;
+      }
+#endif  // XE_PLATFORM_WINRT
       pipeline_to_create = creation_queue_.top();
       creation_queue_.pop();
       if (pipeline_to_create->state.load(std::memory_order_acquire)) {
@@ -4721,8 +4690,15 @@ void PipelineCache::CreationThread(size_t thread_index) {
         ReleasePipelineTranslationsFromCreation(pipeline_to_create);
         continue;
       }
+      if (pipeline_to_create->queued_tick) {
+        queue_wait_ticks_.fetch_add(
+            xe::Clock::QueryHostTickCount() - pipeline_to_create->queued_tick,
+            std::memory_order_relaxed);
+        queue_wait_count_.fetch_add(1, std::memory_order_relaxed);
+      }
       ++creation_threads_busy_;
     }
+    uint64_t work_item_start_tick = xe::Clock::QueryHostTickCount();
 
     // Translation and pipeline creation allocate freely (the DXBC buffers, the
     // translator's containers, the driver's own allocations). On the
@@ -4736,11 +4712,15 @@ void PipelineCache::CreationThread(size_t thread_index) {
     bool creation_out_of_memory = false;
     try {
       // Translate pending shaders and update root signature.
+      uint64_t translation_start = xe::Clock::QueryHostTickCount();
       EnsurePipelineShadersTranslated(pipeline_to_create, translator,
                                       ucode_disasm_buffer, dxbc_converter,
                                       dxc_utils, dxc_compiler,
                                       /*use_try_claim=*/true,
                                       /*handle_non_placeholder=*/true);
+      translation_ticks_.fetch_add(
+          xe::Clock::QueryHostTickCount() - translation_start,
+          std::memory_order_relaxed);
 
       // Create the D3D12 pipeline state object.
       new_state = CreateD3D12Pipeline(pipeline_to_create->description);
@@ -4785,6 +4765,46 @@ void PipelineCache::CreationThread(size_t thread_index) {
       std::lock_guard<xe_mutex> lock(creation_request_lock_);
       ReleasePipelineTranslationsFromCreation(pipeline_to_create);
       --creation_threads_busy_;
+#if XE_PLATFORM_WINRT
+      // Charge the budget with what this item actually took. Wall time, not
+      // CPU time: the budget bounds how much of a frame goes to compilation,
+      // and a compile that blocks in the driver has still spent the frame.
+      creation_budget_debt_ticks_ +=
+          int64_t(xe::Clock::QueryHostTickCount() - work_item_start_tick);
+#endif  // XE_PLATFORM_WINRT
+    }
+#if XE_PLATFORM_WINRT
+    // An in-flight slot just came free.
+    if (cvars::d3d12_pipeline_creation_in_flight > 0) {
+      creation_request_cond_.notify_one();
+    }
+#endif  // XE_PLATFORM_WINRT
+
+    // How much CPU this thread has actually consumed, sampled once per work
+    // item rather than accumulated per item: GetThreadTimes is a syscall, and
+    // one per pipeline is cheap against a compile measured in hundreds of
+    // milliseconds. Reported as a total across all creation threads, which is
+    // the number that says whether compilation is what the guest is competing
+    // with.
+    {
+      FILETIME creation_time, exit_time, kernel_time, user_time;
+      if (GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time,
+                         &kernel_time, &user_time)) {
+        uint64_t cpu_100ns =
+            (uint64_t(kernel_time.dwHighDateTime) << 32 |
+             kernel_time.dwLowDateTime) +
+            (uint64_t(user_time.dwHighDateTime) << 32 | user_time.dwLowDateTime);
+        // Each thread reports its own delta, so the total is a sum over
+        // threads that come and go with the burst logic.
+        if (thread_index < kMaxTrackedCreationThreads) {
+          uint64_t& last = thread_last_cpu_100ns_[thread_index];
+          if (cpu_100ns > last) {
+            creation_cpu_100ns_.fetch_add(cpu_100ns - last,
+                                          std::memory_order_relaxed);
+          }
+          last = cpu_100ns;
+        }
+      }
     }
   }
 }
