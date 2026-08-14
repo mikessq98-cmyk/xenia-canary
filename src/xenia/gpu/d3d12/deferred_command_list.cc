@@ -36,6 +36,11 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
   const uintmax_t* stream = (const uintmax_t*)command_stream_.data();
   size_t stream_remaining = command_stream_.size() / sizeof(uintmax_t);
   ID3D12PipelineState* current_pipeline_state = nullptr;
+  // Queried once - the dynamic-state commands are only ever recorded when the
+  // provider said the driver supports them, but asking per command would be a
+  // QueryInterface inside the replay loop.
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList9> command_list_9;
+  command_list->QueryInterface(IID_PPV_ARGS(&command_list_9));
   while (stream_remaining != 0) {
     const CommandHeader& header =
         *reinterpret_cast<const CommandHeader*>(stream);
@@ -168,6 +173,20 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kD3DOMSetStencilRef: {
         command_list->OMSetStencilRef(*reinterpret_cast<const UINT*>(stream));
+      } break;
+      case Command::kD3DRSSetDepthBias: {
+        auto& args = *reinterpret_cast<const DynamicDepthBiasArgs*>(stream);
+        if (command_list_9) {
+          command_list_9->RSSetDepthBias(args.depth_bias, args.depth_bias_clamp,
+                                         args.slope_scaled_depth_bias);
+        }
+      } break;
+      case Command::kD3DIASetIndexBufferStripCutValue: {
+        if (command_list_9) {
+          command_list_9->IASetIndexBufferStripCutValue(
+              *reinterpret_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*>(
+                  stream));
+        }
       } break;
       case Command::kD3DResourceBarrier: {
         static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));

@@ -204,6 +204,15 @@ DEFINE_bool(
     "change in place.",
     "D3D12");
 
+DEFINE_bool(
+    d3d12_dynamic_pipeline_state, true,
+    "Take the depth bias and the index buffer strip cut from the command list "
+    "rather than baking them into every pipeline, where the driver supports "
+    "it (D3D12_FEATURE_D3D12_OPTIONS16/15).\n"
+    "Each field removed is a dimension out of the pipeline count, and every "
+    "pipeline not created is most of a second of this console's driver "
+    "compiler. Off falls back to a pipeline per distinct value, as before.",
+    "D3D12");
 DEFINE_string(
     d3d12_substitute_scope, "any",
     "Xbox UWP: how different a stand-in pipeline may be from the one a draw "
@@ -335,6 +344,20 @@ bool PipelineCache::Initialize() {
 #if XE_PLATFORM_WINRT
   substitute_mode_ =
       ParseSubstituteMode(cvars::d3d12_substitute_pending_pipelines);
+  {
+    const ui::d3d12::D3D12Provider& provider =
+        command_processor_.GetD3D12Provider();
+    dynamic_depth_bias_ = cvars::d3d12_dynamic_pipeline_state &&
+                          provider.IsDynamicDepthBiasSupported();
+    dynamic_strip_cut_ = cvars::d3d12_dynamic_pipeline_state &&
+                         provider.IsDynamicIndexBufferStripCutSupported();
+    XELOGI(
+        "Dynamic pipeline state: depth bias {}, index buffer strip cut {} - "
+        "each one taken from the command list is a field pipelines are no "
+        "longer specialised for",
+        dynamic_depth_bias_ ? "yes" : "no",
+        dynamic_strip_cut_ ? "yes" : "no");
+  }
   substitute_scope_ = SubstituteScope::kStrict;
   if (cvars::d3d12_substitute_scope == "similar") {
     substitute_scope_ = SubstituteScope::kSimilar;
@@ -1527,6 +1550,57 @@ uint64_t PipelineCache::ComputeSubstituteKey(
   key_data.description.pixel_shader_hash = 0;
   key_data.description.pixel_shader_modification = 0;
   return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
+std::string PipelineCache::DescribeRenderState(
+    const PipelineDescription& description) {
+  // Every field of the description except the shaders, so two states that the
+  // hash separates are never the same line. The first version left out the
+  // render targets, the stencil detail and the slope-scaled bias, and 31 of 61
+  // states shared a line - which made the table useless for deciding what
+  // could be merged.
+  std::string text = fmt::format(
+      "topo {} cut {} gs {} wire {} cull {} ccw {} clip {} msaa {} "
+      "depth_fmt {} depth_func {} depth_write {} bias {} slope {:.4f} "
+      "stencil {}",
+      uint32_t(description.primitive_topology_type_or_tessellation_mode),
+      uint32_t(description.strip_cut_index),
+      uint32_t(description.geometry_shader),
+      uint32_t(description.fill_mode_wireframe), uint32_t(description.cull_mode),
+      uint32_t(description.front_counter_clockwise),
+      uint32_t(description.depth_clip),
+      uint32_t(description.host_msaa_samples),
+      uint32_t(description.depth_format), uint32_t(description.depth_func),
+      uint32_t(description.depth_write), description.depth_bias,
+      description.depth_bias_slope_scaled,
+      uint32_t(description.stencil_enable));
+  if (description.stencil_enable) {
+    text += fmt::format(
+        " sread {} swrite {} sf {}/{}/{}/{} sb {}/{}/{}/{}",
+        uint32_t(description.stencil_read_mask),
+        uint32_t(description.stencil_write_mask),
+        uint32_t(description.stencil_front_fail_op),
+        uint32_t(description.stencil_front_depth_fail_op),
+        uint32_t(description.stencil_front_pass_op),
+        uint32_t(description.stencil_front_func),
+        uint32_t(description.stencil_back_fail_op),
+        uint32_t(description.stencil_back_depth_fail_op),
+        uint32_t(description.stencil_back_pass_op),
+        uint32_t(description.stencil_back_func));
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    const PipelineRenderTarget& rt = description.render_targets[i];
+    if (!rt.used) {
+      continue;
+    }
+    text += fmt::format(" rt{}[fmt {} blend {}/{}/{} alpha {}/{}/{} mask {}]",
+                        i, uint32_t(rt.format), uint32_t(rt.src_blend),
+                        uint32_t(rt.dest_blend), uint32_t(rt.blend_op),
+                        uint32_t(rt.src_blend_alpha),
+                        uint32_t(rt.dest_blend_alpha),
+                        uint32_t(rt.blend_op_alpha), uint32_t(rt.write_mask));
+  }
+  return text;
 }
 
 PipelineCache::SubstituteQuality PipelineCache::GetSubstituteQuality(
@@ -2737,6 +2811,19 @@ void PipelineCache::NormalizePipelineDescription(
   // Polygon offset only exists for triangles, and only when it is non-zero.
   if (description.depth_bias == 0 && description.depth_bias_slope_scaled == 0.0f) {
     description.depth_bias_slope_scaled = 0.0f;  // normalize -0.0f
+  }
+  // With the driver able to take these from the command list, they stop being
+  // part of what a pipeline is specialised for - so they are zeroed out of the
+  // description and every value of them shares one pipeline.
+  if (dynamic_depth_bias_) {
+    pending_dynamic_depth_bias_ = description.depth_bias;
+    pending_dynamic_depth_bias_slope_ = description.depth_bias_slope_scaled;
+    description.depth_bias = 0;
+    description.depth_bias_slope_scaled = 0.0f;
+  }
+  if (dynamic_strip_cut_) {
+    pending_dynamic_strip_cut_ = description.strip_cut_index;
+    description.strip_cut_index = PipelineStripCutIndex::kNone;
   }
 }
 
@@ -4021,6 +4108,13 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // Root signature.
   state_desc.pRootSignature = runtime_description.root_signature;
 
+  if (dynamic_depth_bias_) {
+    state_desc.Flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+  }
+  if (dynamic_strip_cut_) {
+    state_desc.Flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+  }
+
   // Index buffer strip cut value.
   switch (description.strip_cut_index) {
     case PipelineStripCutIndex::kFFFF:
@@ -4453,21 +4547,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         description.vertex_shader_hash, description.vertex_shader_modification,
         description.pixel_shader_hash, description.pixel_shader_modification,
         XXH3_64bits(&state_only, sizeof(state_only)), description_hash,
-        fmt::format(
-            "topo {} cut {} gs {} wire {} cull {} ccw {} clip {} msaa {} "
-            "depth_fmt {} depth_func {} depth_write {} stencil {} bias {}",
-            uint32_t(description.primitive_topology_type_or_tessellation_mode),
-            uint32_t(description.strip_cut_index),
-            uint32_t(description.geometry_shader),
-            uint32_t(description.fill_mode_wireframe),
-            uint32_t(description.cull_mode),
-            uint32_t(description.front_counter_clockwise),
-            uint32_t(description.depth_clip),
-            uint32_t(description.host_msaa_samples),
-            uint32_t(description.depth_format),
-            uint32_t(description.depth_func),
-            uint32_t(description.depth_write),
-            uint32_t(description.stencil_enable), description.depth_bias));
+        DescribeRenderState(description));
   }
 
   DWORD creation_exception_code = 0;

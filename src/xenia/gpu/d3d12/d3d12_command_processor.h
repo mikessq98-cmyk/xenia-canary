@@ -712,6 +712,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // substitutions were only ever visible as individual rate-limited log lines,
   // which says a stall happened but not whether it is the shape of the whole
   // session - the question that decides what is worth optimizing.
+  // Dynamic pipeline state as last set on the command list, so an unchanged
+  // value is not re-sent. Reset with the rest of the command list state.
+  int32_t current_dynamic_depth_bias_ = 0;
+  float current_dynamic_depth_bias_slope_ = 0.0f;
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE current_dynamic_strip_cut_ =
+      D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+
   std::atomic<uint32_t> draws_skipped_{0};
   std::atomic<uint32_t> draws_substituted_{0};
   // Draws that reached the GPU, so the governor can weigh how much of what the

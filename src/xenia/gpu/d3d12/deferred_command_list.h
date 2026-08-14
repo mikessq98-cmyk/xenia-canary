@@ -294,6 +294,30 @@ class DeferredCommandList {
     arg = stencil_ref;
   }
 
+  // Only issued when the pipelines were created with the matching dynamic
+  // flag - see d3d12_dynamic_pipeline_state.
+  struct DynamicDepthBiasArgs {
+    INT depth_bias;
+    FLOAT depth_bias_clamp;
+    FLOAT slope_scaled_depth_bias;
+  };
+  void D3DRSSetDepthBias(INT depth_bias, FLOAT depth_bias_clamp,
+                         FLOAT slope_scaled_depth_bias) {
+    auto& args = *reinterpret_cast<DynamicDepthBiasArgs*>(WriteCommand(
+        Command::kD3DRSSetDepthBias, sizeof(DynamicDepthBiasArgs)));
+    args.depth_bias = depth_bias;
+    args.depth_bias_clamp = depth_bias_clamp;
+    args.slope_scaled_depth_bias = slope_scaled_depth_bias;
+  }
+
+  void D3DIASetIndexBufferStripCutValue(
+      D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut) {
+    auto& arg = *reinterpret_cast<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE*>(
+        WriteCommand(Command::kD3DIASetIndexBufferStripCutValue,
+                     sizeof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)));
+    arg = strip_cut;
+  }
+
   void D3DResourceBarrier(UINT num_barriers,
                           const D3D12_RESOURCE_BARRIER* barriers) {
     if (num_barriers == 0) {
@@ -501,6 +525,8 @@ class DeferredCommandList {
     kD3DOMSetBlendFactor,
     kD3DOMSetRenderTargets,
     kD3DOMSetStencilRef,
+    kD3DRSSetDepthBias,
+    kD3DIASetIndexBufferStripCutValue,
     kD3DResourceBarrier,
     kRSSetScissorRect,
     kRSSetViewport,

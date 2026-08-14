@@ -142,6 +142,12 @@ class D3D12Provider : public GraphicsProvider {
   bool AreUnalignedBlockTexturesSupported() const {
     return unaligned_block_textures_supported_;
   }
+  bool IsDynamicDepthBiasSupported() const {
+    return dynamic_depth_bias_supported_;
+  }
+  bool IsDynamicIndexBufferStripCutSupported() const {
+    return dynamic_index_buffer_strip_cut_supported_;
+  }
   uint32_t GetVirtualAddressBitsPerResource() const {
     return virtual_address_bits_per_resource_;
   }
@@ -233,6 +239,8 @@ class D3D12Provider : public GraphicsProvider {
   bool ps_specified_stencil_reference_supported_;
   bool rasterizer_ordered_views_supported_;
   bool unaligned_block_textures_supported_;
+  bool dynamic_depth_bias_supported_;
+  bool dynamic_index_buffer_strip_cut_supported_;
 };
 
 }  // namespace d3d12

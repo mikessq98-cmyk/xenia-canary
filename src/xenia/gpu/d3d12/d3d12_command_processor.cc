@@ -3963,6 +3963,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     root_signature = pipeline_cache_->GetRootSignatureByHandle(pipeline_handle);
   }
 
+  // State the pipelines were not specialised for has to come from here
+  // instead. Tracked so an unchanged value costs nothing.
+  if (pipeline_cache_->dynamic_depth_bias()) {
+    int32_t bias = pipeline_cache_->pending_dynamic_depth_bias();
+    float slope = pipeline_cache_->pending_dynamic_depth_bias_slope();
+    if (bias != current_dynamic_depth_bias_ ||
+        slope != current_dynamic_depth_bias_slope_) {
+      current_dynamic_depth_bias_ = bias;
+      current_dynamic_depth_bias_slope_ = slope;
+      deferred_command_list_.D3DRSSetDepthBias(bias, 0.0f, slope);
+    }
+  }
+  if (pipeline_cache_->dynamic_strip_cut()) {
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut =
+        pipeline_cache_->pending_dynamic_strip_cut();
+    if (strip_cut != current_dynamic_strip_cut_) {
+      current_dynamic_strip_cut_ = strip_cut;
+      deferred_command_list_.D3DIASetIndexBufferStripCutValue(strip_cut);
+    }
+  }
+
   // Update the textures - this may bind pipelines.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
@@ -5097,6 +5118,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     current_external_pipeline_ = nullptr;
     current_graphics_root_signature_ = nullptr;
     current_graphics_root_up_to_date_ = 0;
+    // A fresh command list has the API defaults, not whatever the last one
+    // was left holding.
+    current_dynamic_depth_bias_ = 0;
+    current_dynamic_depth_bias_slope_ = 0.0f;
+    current_dynamic_strip_cut_ = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     if (bindless_resources_used_) {
       deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
                                                 sampler_bindless_heap_current_);

@@ -507,6 +507,23 @@ bool D3D12Provider::Initialize() {
     programmable_sample_positions_tier_ =
         options2.ProgrammableSamplePositionsTier;
   }
+  // Fields a pipeline no longer has to be specialised for, if the driver can
+  // take them from the command list instead. Each one removed is a whole
+  // dimension out of the pipeline count.
+  dynamic_depth_bias_supported_ = false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16;
+  if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16,
+                                            &options16, sizeof(options16)))) {
+    dynamic_depth_bias_supported_ = bool(options16.DynamicDepthBiasSupported);
+  }
+  dynamic_index_buffer_strip_cut_supported_ = false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS15 options15;
+  if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15,
+                                            &options15, sizeof(options15)))) {
+    dynamic_index_buffer_strip_cut_supported_ =
+        bool(options15.DynamicIndexBufferStripCutSupported);
+  }
+
   D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8;
   if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8,
                                             &options8, sizeof(options8)))) {

@@ -551,7 +551,9 @@ class PipelineCache {
   // state that governs them (blend factors with the write mask closed, stencil
   // operations with the test off), so descriptions that differ only in dead
   // bits hash to the same pipeline instead of each compiling their own.
-  static void NormalizePipelineDescription(PipelineDescription& description);
+  // Not static: it also strips the fields the driver will take from the
+  // command list, which depends on what this device supports.
+  void NormalizePipelineDescription(PipelineDescription& description);
 
   static bool GetGeometryShaderKey(
       PipelineGeometryShader geometry_shader_type,
@@ -714,6 +716,9 @@ class PipelineCache {
     kSimilar,
     kAny,
   };
+  // Every field of the description except the shaders, for the census table.
+  static std::string DescribeRenderState(const PipelineDescription& description);
+
   SubstituteQuality GetSubstituteQuality(
       const PipelineRuntimeDescription& a, const PipelineRuntimeDescription& b);
   // All pipelines by substitute key, ready or not (readiness is checked when
@@ -724,6 +729,38 @@ class PipelineCache {
   // Parsed once at initialization - this is read per skipped draw.
   SubstituteMode substitute_mode_ = SubstituteMode::kOnce;
   SubstituteScope substitute_scope_ = SubstituteScope::kStrict;
+  // Fields the driver can take from the command list, so pipelines are not
+  // specialised for them - see d3d12_dynamic_pipeline_state.
+  bool dynamic_depth_bias_ = false;
+  bool dynamic_strip_cut_ = false;
+  // What the description would have carried, kept for the draw to set on the
+  // command list. Written and read on the command processor thread only.
+  int32_t pending_dynamic_depth_bias_ = 0;
+  float pending_dynamic_depth_bias_slope_ = 0.0f;
+  PipelineStripCutIndex pending_dynamic_strip_cut_ =
+      PipelineStripCutIndex::kNone;
+
+ public:
+  bool dynamic_depth_bias() const { return dynamic_depth_bias_; }
+  bool dynamic_strip_cut() const { return dynamic_strip_cut_; }
+  int32_t pending_dynamic_depth_bias() const {
+    return pending_dynamic_depth_bias_;
+  }
+  float pending_dynamic_depth_bias_slope() const {
+    return pending_dynamic_depth_bias_slope_;
+  }
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE pending_dynamic_strip_cut() const {
+    switch (pending_dynamic_strip_cut_) {
+      case PipelineStripCutIndex::kFFFF:
+        return D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+      case PipelineStripCutIndex::kFFFFFFFF:
+        return D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+      default:
+        return D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    }
+  }
+
+ private:
 #endif  // XE_PLATFORM_WINRT
 
   // Comparator for priority queue - higher priority first.
