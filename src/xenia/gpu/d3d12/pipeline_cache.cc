@@ -205,6 +205,27 @@ DEFINE_bool(
     "D3D12");
 
 DEFINE_string(
+    d3d12_substitute_scope, "strict",
+    "Xbox UWP: how different a stand-in pipeline may be from the one a draw "
+    "asked for while that one is still compiling. A stand-in always has the "
+    "same vertex shader, root signature and render state, so the geometry is "
+    "in the right place; the question is only how it is shaded.\n"
+    "  strict  - only a pixel shader that reads exactly the same textures and "
+    "samplers. Safe and rare: measured at 5476 substitutions against 5.7 "
+    "million skipped draws, so almost every waiting draw is still dropped.\n"
+    "  similar - also a different pixel shader that reads a different set of "
+    "the same SIZE. Wider, and the stand-in is more likely to be a comparable "
+    "material.\n"
+    "  any     - any ready pixel shader. Widest; objects appear immediately "
+    "but may be shaded with another material's textures until their own "
+    "pipeline is ready.\n"
+    "Beyond strict the draw binds the descriptors the STAND-IN asks for rather "
+    "than the ones the real shader asked for, which is what makes them safe - "
+    "a stand-in reading a descriptor nobody filled in is a page fault at VA 0 "
+    "and a lost device on this driver. All of them are temporary: the real "
+    "pipeline takes over the moment it finishes compiling.",
+    "D3D12");
+DEFINE_string(
     d3d12_substitute_pending_pipelines, "once",
     "Xbox UWP: what to do with a draw whose pipeline the (slow) console driver "
     "is still compiling. Skipping it shows up as black objects in multi-pass "
@@ -314,6 +335,15 @@ bool PipelineCache::Initialize() {
 #if XE_PLATFORM_WINRT
   substitute_mode_ =
       ParseSubstituteMode(cvars::d3d12_substitute_pending_pipelines);
+  substitute_scope_ = SubstituteScope::kStrict;
+  if (cvars::d3d12_substitute_scope == "similar") {
+    substitute_scope_ = SubstituteScope::kSimilar;
+  } else if (cvars::d3d12_substitute_scope == "any") {
+    substitute_scope_ = SubstituteScope::kAny;
+  } else if (cvars::d3d12_substitute_scope != "strict") {
+    XELOGW("Unknown d3d12_substitute_scope \"{}\" - using strict",
+           cvars::d3d12_substitute_scope);
+  }
 #endif  // XE_PLATFORM_WINRT
   const ui::d3d12::D3D12Provider& provider =
       command_processor_.GetD3D12Provider();
@@ -1557,23 +1587,34 @@ PipelineCache::SubstituteQuality PipelineCache::GetSubstituteQuality(
     // own constants say.
     const D3D12Shader& da12 = static_cast<const D3D12Shader&>(sa);
     const D3D12Shader& db12 = static_cast<const D3D12Shader&>(sb);
-    if (da12.GetUsedTextureMaskAfterTranslation() !=
-        db12.GetUsedTextureMaskAfterTranslation()) {
-      return SubstituteQuality::kUnusable;
-    }
     const auto& ta = da12.GetTextureBindingsAfterTranslation();
     const auto& tb = db12.GetTextureBindingsAfterTranslation();
-    if (ta.size() != tb.size() ||
-        (!ta.empty() && std::memcmp(ta.data(), tb.data(),
-                                    ta.size() * sizeof(ta[0])) != 0)) {
-      return SubstituteQuality::kUnusable;
+    bool same_reads =
+        da12.GetUsedTextureMaskAfterTranslation() ==
+            db12.GetUsedTextureMaskAfterTranslation() &&
+        ta.size() == tb.size() &&
+        (ta.empty() ||
+         std::memcmp(ta.data(), tb.data(), ta.size() * sizeof(ta[0])) == 0);
+    if (same_reads) {
+      const auto& ssa = da12.GetSamplerBindingsAfterTranslation();
+      const auto& ssb = db12.GetSamplerBindingsAfterTranslation();
+      same_reads =
+          ssa.size() == ssb.size() &&
+          (ssa.empty() || std::memcmp(ssa.data(), ssb.data(),
+                                      ssa.size() * sizeof(ssa[0])) == 0);
     }
-    const auto& ssa = da12.GetSamplerBindingsAfterTranslation();
-    const auto& ssb = db12.GetSamplerBindingsAfterTranslation();
-    if (ssa.size() != ssb.size() ||
-        (!ssa.empty() && std::memcmp(ssa.data(), ssb.data(),
-                                     ssa.size() * sizeof(ssa[0])) != 0)) {
-      return SubstituteQuality::kUnusable;
+    if (!same_reads) {
+      // Safe only because the caller binds for the substitute - anything less
+      // leaves the stand-in reading a descriptor nobody filled in, which on
+      // this driver is a page fault at VA 0 and a lost device.
+      if (substitute_scope_ == SubstituteScope::kStrict) {
+        return SubstituteQuality::kUnusable;
+      }
+      if (substitute_scope_ == SubstituteScope::kSimilar &&
+          ta.size() != tb.size()) {
+        return SubstituteQuality::kUnusable;
+      }
+      return SubstituteQuality::kOtherShaderOtherBindings;
     }
   }
   return SubstituteQuality::kOtherShaderSameBindings;

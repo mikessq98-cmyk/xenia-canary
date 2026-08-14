@@ -3873,6 +3873,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
               n + 1);
         }
         pipeline_handle = substitute_handle;
+        // Bind for what will actually run. Everything below - the used texture
+        // mask, RequestTextures, the descriptor tables - is driven by these
+        // two locals, so pointing them at the stand-in is what keeps its reads
+        // from landing on descriptors nobody filled in.
+        pixel_shader = pipeline_cache_->GetPixelShaderByHandle(pipeline_handle);
       } else
 #endif  // XE_PLATFORM_WINRT
       {

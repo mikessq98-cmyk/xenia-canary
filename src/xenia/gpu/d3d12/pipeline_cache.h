@@ -235,6 +235,17 @@ class PipelineCache {
   // been found, because a suitable pipeline is usually only finished AFTER
   // the pending one was first asked for.
   void* GetReadySubstituteByHandle(void* handle);
+  // The pixel shader a handle will actually execute with, so a draw taking a
+  // stand-in can bind for it rather than for the one it asked for.
+  D3D12Shader* GetPixelShaderByHandle(void* handle) const {
+    if (!handle) {
+      return nullptr;
+    }
+    D3D12Shader::D3D12Translation* translation =
+        reinterpret_cast<const Pipeline*>(handle)->description.pixel_shader;
+    return translation ? static_cast<D3D12Shader*>(&translation->shader())
+                       : nullptr;
+  }
 #endif  // XE_PLATFORM_WINRT
 
   // Tells the cache that a draw is being skipped for want of this pipeline, so
@@ -688,9 +699,19 @@ class PipelineCache {
     // through the same bindings. Shades the object with someone else's logic -
     // visible, but it cannot read a descriptor the draw didn't bind.
     kOtherShaderSameBindings,
+    // A different pixel shader reading different textures. Only usable because
+    // the draw writes the descriptors for the SUBSTITUTE's shaders, not the
+    // real ones - see d3d12_substitute_scope.
+    kOtherShaderOtherBindings,
     kUnusable,
   };
-  static SubstituteQuality GetSubstituteQuality(
+  // What may stand in - see the cvar.
+  enum class SubstituteScope {
+    kStrict,
+    kSimilar,
+    kAny,
+  };
+  SubstituteQuality GetSubstituteQuality(
       const PipelineRuntimeDescription& a, const PipelineRuntimeDescription& b);
   // All pipelines by substitute key, ready or not (readiness is checked when
   // picking one). Processor thread only.
@@ -699,6 +720,7 @@ class PipelineCache {
   std::atomic<uint32_t> substitutes_rejected_{0};
   // Parsed once at initialization - this is read per skipped draw.
   SubstituteMode substitute_mode_ = SubstituteMode::kOnce;
+  SubstituteScope substitute_scope_ = SubstituteScope::kStrict;
 #endif  // XE_PLATFORM_WINRT
 
   // Comparator for priority queue - higher priority first.
