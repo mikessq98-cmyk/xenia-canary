@@ -1601,9 +1601,19 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         }
         copied = true;
       } else {
-        XELOGE(
-            "D3D12RenderTargetCache: Failed to obtain the resolve destination "
-            "memory region");
+        // Throttled: at 3x3 a title that cannot fit its resolve destinations
+        // fails every resolve of every frame - 1671 identical lines in one DS2
+        // session, each one formatted and pushed through the log ring while the
+        // process was already out of memory.
+        static std::atomic<uint32_t> resolve_dest_failure_count{0};
+        uint32_t count =
+            resolve_dest_failure_count.fetch_add(1, std::memory_order_relaxed);
+        if (count < 4 || (count % 1024) == 0) {
+          XELOGE(
+              "D3D12RenderTargetCache: Failed to obtain the resolve "
+              "destination memory region (occurrence {})",
+              count + 1);
+        }
       }
     }
   } else {

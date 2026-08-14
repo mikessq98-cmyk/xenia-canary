@@ -25,6 +25,22 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
 #include "xenia/base/string.h"
+#include "xenia/base/xxhash.h"
+
+DEFINE_bool(
+    d3d12_verify_new_draws_per_state, true,
+    "Check a draw the first time it is made in each PIPELINE STATE, not just "
+    "the first time its pair of guest shaders is drawn at all.\n"
+    "One piece of guest microcode is translated into several modifications - a "
+    "different interpolator layout, an early-Z hint, param-gen - and each of "
+    "those is different DXBC produced by Xenia's own translator, which is what "
+    "is under suspicion for these hangs in the first place. A pair proven to "
+    "survive in one modification has proven nothing about another.\n"
+    "Costs one more GPU synchronization per distinct pipeline state per game "
+    "(roughly twice as many as per pair, measured), once, and they are "
+    "remembered on disk. Turn it off to go back to checking each shader pair "
+    "once.",
+    "D3D12");
 
 DECLARE_bool(d3d12_verify_new_draws);
 DECLARE_int32(draw_resolution_scale_x);
@@ -111,8 +127,12 @@ void ToxicShaderSolver::Initialize(
                                                title_id, scale_suffix);
   execution_hang_path_ =
       root / fmt::format("{:08X}.d3d12{}.exec-hang", title_id, scale_suffix);
+  // ".verified2": the entries are now one key per line rather than a shader
+  // pair, so an old file would be read as a list of vertex shader hashes and
+  // silently excuse the wrong draws from checking. A new name lets it be
+  // ignored instead of misread; the cost is re-proving a title once.
   verified_path_ =
-      root / fmt::format("{:08X}.d3d12{}.verified", title_id, scale_suffix);
+      root / fmt::format("{:08X}.d3d12{}.verified2", title_id, scale_suffix);
 
   // Load the persistent per-game skip list (confirmed-toxic pairs).
   {
@@ -273,9 +293,14 @@ void ToxicShaderSolver::Initialize(
       std::ifstream verified_file(verified_path_);
       std::string line;
       while (std::getline(verified_file, line)) {
-        uint64_t vs = 0, ps = 0;
-        if (ParseSolverLine(line, vs, ps)) {
-          verified_.emplace(vs, ps);
+        if (line.empty() || line[0] == '#') {
+          continue;
+        }
+        std::istringstream stream(line);
+        uint64_t key = 0;
+        stream >> std::hex >> key;
+        if (!stream.fail()) {
+          verified_.insert(key);
         }
       }
       verified_at_startup_ = verified_.size();
@@ -642,8 +667,13 @@ void ToxicShaderSolver::QuarantineIsolatedExecutionHang(
       "the culprit, not a guess. The pair is quarantined from now on, here and "
       "in {}; if this same vertex shader hangs with another pixel shader too, "
       "the shader as a whole goes. This run cannot continue: the OS has "
-      "already removed the GPU device, which no amount of skipping can undo.",
-      vertex_shader_hash, pixel_shader_hash, xe::path_to_utf8(toxic_path_));
+      "already removed the GPU device, which no amount of skipping can undo.\n"
+      "  To keep this across a redeploy - which wipes the whole cache "
+      "directory, and has already made this same pair hang twice - put it in "
+      "config.toml:\n"
+      "  d3d12_skip_shaders = \"[{:016X},{:016X}]\"",
+      vertex_shader_hash, pixel_shader_hash, xe::path_to_utf8(toxic_path_),
+      vertex_shader_hash, pixel_shader_hash);
 }
 
 void ToxicShaderSolver::MarkExecutionHang() {
@@ -673,18 +703,45 @@ void ToxicShaderSolver::MarkExecutionHang() {
       "launch will serialize draws to find which one did it");
 }
 
+uint64_t ToxicShaderSolver::MakeVerificationKey(uint64_t vertex_shader_hash,
+                                                uint64_t pixel_shader_hash,
+                                                uint64_t state_key) {
+  // WHAT COUNTS AS "THE SAME DRAW AGAIN".
+  //
+  // The pair of guest shaders was the whole key at first, and that leaves a
+  // hole: one piece of guest microcode is translated into SEVERAL
+  // modifications - a different interpolator layout, an early-Z hint, param-gen
+  // - and each of those is different DXBC out of our own translator. A pair
+  // proven to survive in one of them has proven nothing about the others, and
+  // the translator is exactly what is under suspicion for these hangs. So the
+  // pipeline's own description hash, which covers both modifications and the
+  // render state, is part of the key unless the cvar says otherwise.
+  struct {
+    uint64_t vs;
+    uint64_t ps;
+    uint64_t state;
+  } key_data = {vertex_shader_hash, pixel_shader_hash,
+                cvars::d3d12_verify_new_draws_per_state ? state_key : 0};
+  return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
 bool ToxicShaderSolver::NeedsExecutionVerification(uint64_t vertex_shader_hash,
-                                                   uint64_t pixel_shader_hash) {
+                                                   uint64_t pixel_shader_hash,
+                                                   uint64_t state_key) {
   if (!enabled_ || !cvars::d3d12_verify_new_draws || !execution_journal_file_) {
     return false;
   }
-  return verified_.find({vertex_shader_hash, pixel_shader_hash}) ==
+  return verified_.find(MakeVerificationKey(vertex_shader_hash,
+                                            pixel_shader_hash, state_key)) ==
          verified_.end();
 }
 
 void ToxicShaderSolver::MarkExecutionVerified(uint64_t vertex_shader_hash,
-                                              uint64_t pixel_shader_hash) {
-  if (!verified_.emplace(vertex_shader_hash, pixel_shader_hash).second) {
+                                              uint64_t pixel_shader_hash,
+                                              uint64_t state_key) {
+  uint64_t key =
+      MakeVerificationKey(vertex_shader_hash, pixel_shader_hash, state_key);
+  if (!verified_.insert(key).second) {
     return;
   }
   ++verified_this_run_;
@@ -693,9 +750,10 @@ void ToxicShaderSolver::MarkExecutionVerified(uint64_t vertex_shader_hash,
   }
   // Appended as it is learned, not written at shutdown: a run that ends in a
   // hang must still keep everything it proved safe beforehand, otherwise the
-  // next launch re-checks the whole game.
-  std::string line =
-      fmt::format("{:016X} {:016X}\n", vertex_shader_hash, pixel_shader_hash);
+  // next launch re-checks the whole game. The shader hashes ride along as a
+  // comment so the file is still readable by a human.
+  std::string line = fmt::format("{:016X} # VS {:016X} PS {:016X}\n", key,
+                                 vertex_shader_hash, pixel_shader_hash);
   std::fwrite(line.data(), 1, line.size(), verified_file_);
   std::fflush(verified_file_);
 }

@@ -1151,10 +1151,20 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
                                      vgt_draw_initiator.prim_type));
       if (!draw_succeeded) {
-        XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
-               vgt_draw_initiator.num_indices,
-               uint32_t(vgt_draw_initiator.prim_type),
-               uint32_t(vgt_draw_initiator.source_select));
+        // Throttled: when the backend starts refusing draws it refuses them in
+        // storms - 6056 of these in one DS2 session at 3x3, every one of them
+        // formatted and pushed through the log ring, on top of the backend's
+        // own (already throttled) explanation of WHY it refused. This line only
+        // says that one was refused, so a few of them is all anyone can use.
+        static std::atomic<uint32_t> draw_backend_failure_count{0};
+        uint32_t count =
+            draw_backend_failure_count.fetch_add(1, std::memory_order_relaxed);
+        if (count < 4 || (count % 4096) == 0) {
+          XELOGE("{}({}, {}, {}): Failed in backend (occurrence {})",
+                 opcode_name, vgt_draw_initiator.num_indices,
+                 uint32_t(vgt_draw_initiator.prim_type),
+                 uint32_t(vgt_draw_initiator.source_select), count + 1);
+        }
       }
     }
   }

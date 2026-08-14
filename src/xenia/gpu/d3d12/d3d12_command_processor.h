@@ -119,6 +119,11 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint64_t GetCurrentSubmission() const {
     return completion_timeline_->GetUpcomingSubmission();
   }
+  // Sampled by the texture cache around its driver calls - see GpuCensus.
+  uint32_t GetPipelinesBeingCreated();
+  uint32_t GetPipelineQueueDepth();
+  uint64_t GetHostMemoryFreeBytes();
+
   uint64_t GetCompletedSubmission() const override {
     return completion_timeline_->GetCompletedSubmissionFromLastUpdate();
   }
@@ -352,6 +357,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy_ReadbackResolvePath();
   void InitializeTrace() override;
 
+  // Refills the pipeline creation time budget - compilation is metered per
+  // guest frame so it cannot take an unbounded share of a CPU-bound console.
+  void OnGuestFrameBoundary() override {
+    if (pipeline_cache_) {
+      pipeline_cache_->NoteGuestFrameForCreationBudget();
+    }
+  }
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
@@ -453,6 +466,38 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Registers every GPU cache with the memory arbiter, in the order they
   // should be given up when the host runs short.
   void RegisterMemoryArbiterConsumers();
+
+#if XE_PLATFORM_WINRT
+  // Decides how many pipeline compilers may run, once per
+  // kGovernorIntervalSeconds, from the two things only this class can see: how
+  // fast the guest is running and how much of the console is already busy.
+  // Everything it needs is already being measured for the periodic report.
+  void UpdatePipelineCreationGovernor();
+  static uint64_t QueryProcessCpu100ns();
+  static constexpr double kGovernorIntervalSeconds = 1.0;
+  // Below this fraction of the title's own best frame rate, give a compiler
+  // back to the guest.
+  static constexpr double kGovernorHealthFloor = 0.75;
+  // Above this, and only with spare cores, consider taking one more.
+  static constexpr double kGovernorHealthCeiling = 0.90;
+  static constexpr double kGovernorSpareCores = 1.5;
+  static constexpr uint32_t kGovernorSamplesBeforeExpanding = 3;
+  static constexpr double kGovernorBestFpsDecay = 0.99;
+  // Samples to wait before trying to expand again after an expansion had to be
+  // taken back, doubling each time it fails - up to five minutes.
+  static constexpr uint32_t kGovernorCooldownSamplesAfterBackoff = 10;
+  static constexpr uint32_t kGovernorMaxCooldownSamples = 300;
+  // Below this much compiler CPU, a dropped frame rate has some other cause
+  // and taking a compiler away cannot help it.
+  static constexpr double kGovernorMinCompilerCoresToBlame = 0.5;
+  uint64_t governor_last_ticks_ = 0;
+  uint64_t governor_last_frames_ = 0;
+  uint64_t governor_last_cpu_100ns_ = 0;
+  uint64_t governor_last_compiler_cpu_100ns_ = 0;
+  double governor_best_fps_ = 0.0;
+  uint32_t governor_healthy_samples_ = 0;
+  uint32_t governor_expansion_cooldown_ = 0;
+#endif  // XE_PLATFORM_WINRT
 
   bool BeginSubmission(bool is_guest_command);
   // If is_swap is true, a full frame is closed - with, if needed, cache

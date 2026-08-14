@@ -243,9 +243,17 @@ class ShaderStorageWriter {
     // Read pipeline descriptions.
     const uint32_t pipeline_storage_version_swapped =
         xe::byte_swap(pipeline_config.version);
-    PipelineStorageFileHeader pipeline_header;
-    if (fread(&pipeline_header, sizeof(pipeline_header), 1,
-              pipeline_storage_file_) &&
+    int64_t pipeline_storage_size_before = 0;
+    if (xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END)) {
+      pipeline_storage_size_before =
+          xe::filesystem::Tell(pipeline_storage_file_);
+    }
+    xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
+    PipelineStorageFileHeader pipeline_header = {};
+    bool pipeline_header_read =
+        fread(&pipeline_header, sizeof(pipeline_header), 1,
+              pipeline_storage_file_) == 1;
+    if (pipeline_header_read &&
         pipeline_header.magic == kPipelineStorageMagic &&
         pipeline_header.magic_api == pipeline_config.api_magic &&
         pipeline_header.version_swapped == pipeline_storage_version_swapped) {
@@ -277,6 +285,15 @@ class ShaderStorageWriter {
           }
           ++valid_count;
         }
+        if (valid_count < pipeline_storage_told_count) {
+          XELOGW(
+              "Pipeline storage: the file holds {} description(s) but only {} "
+              "of them pass their own hash - discarding the remaining {}. The "
+              "run that wrote them was interrupted mid-write, or the entries "
+              "were written by a build with a different description layout.",
+              pipeline_storage_told_count, valid_count,
+              pipeline_storage_told_count - valid_count);
+        }
         pipeline_descriptions_out.resize(valid_count);
       }
       // Truncate to last valid description.
@@ -286,6 +303,18 @@ class ShaderStorageWriter {
                    sizeof(TPipelineStoredDescription) *
                        pipeline_descriptions_out.size()));
     } else {
+      if (pipeline_storage_size_before > 0) {
+        XELOGW(
+            "Pipeline storage: REJECTING an existing {} byte file - header {} "
+            "(magic {:08X}/{:08X} wanted {:08X}/{:08X}, version {} wanted {}). "
+            "Every pipeline the last run compiled is being thrown away.",
+            pipeline_storage_size_before,
+            pipeline_header_read ? "mismatched" : "unreadable",
+            pipeline_header.magic, pipeline_header.magic_api,
+            kPipelineStorageMagic, pipeline_config.api_magic,
+            xe::byte_swap(pipeline_header.version_swapped),
+            pipeline_config.version);
+      }
       // Write new header.
       xe::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
       pipeline_header.magic = kPipelineStorageMagic;
@@ -318,6 +347,16 @@ class ShaderStorageWriter {
     // Load shaders from storage.
     size_t shaders_loaded = 0;
     ShaderStorageFileHeader shader_header;
+    // How big the file was BEFORE anything here touched it. Three consecutive
+    // sessions read 0, 3 and 0 shaders while one of them created 598
+    // pipelines, and there was no way to tell an empty file from a rejected
+    // header from a file whose first entry was corrupt - all three print
+    // "Loaded 0 shaders" and then truncate, which destroys the evidence.
+    int64_t shader_storage_size_before = 0;
+    if (xe::filesystem::Seek(shader_storage_file_, 0, SEEK_END)) {
+      shader_storage_size_before = xe::filesystem::Tell(shader_storage_file_);
+    }
+    xe::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
     if (ValidateShaderStorageHeader(shader_storage_file_, shader_header)) {
       uint64_t shader_storage_valid_bytes = ReadShaderEntries(
           shader_storage_file_,
@@ -330,9 +369,29 @@ class ShaderStorageWriter {
             }
             return false;
           });
+      if (int64_t(shader_storage_valid_bytes) < shader_storage_size_before) {
+        XELOGW(
+            "Shader storage: the file is {} bytes but only {} of them are "
+            "readable - {} bytes are being discarded after {} shader(s). The "
+            "run that wrote it did not finish writing, or wrote something this "
+            "build cannot read.",
+            shader_storage_size_before, shader_storage_valid_bytes,
+            shader_storage_size_before - int64_t(shader_storage_valid_bytes),
+            shaders_loaded);
+      }
       xe::filesystem::TruncateStdioFile(shader_storage_file_,
                                         shader_storage_valid_bytes);
     } else {
+      if (shader_storage_size_before > 0) {
+        XELOGW(
+            "Shader storage: REJECTING an existing {} byte file - its header "
+            "is not this build's (magic {:08X} wanted {:08X}, version {} "
+            "wanted {}). Everything it held is being thrown away and the game "
+            "will compile from scratch.",
+            shader_storage_size_before, shader_header.magic,
+            kShaderStorageMagic, xe::byte_swap(shader_header.version_swapped),
+            ShaderStoredHeader::kVersion);
+      }
       // Write new header.
       xe::filesystem::TruncateStdioFile(shader_storage_file_, 0);
       if (!WriteShaderStorageHeader(shader_storage_file_)) {
@@ -418,6 +477,31 @@ class ShaderStorageWriter {
   FILE* shader_storage_file() const { return shader_storage_file_; }
   FILE* pipeline_storage_file() const { return pipeline_storage_file_; }
   bool is_active() const { return shader_storage_file_ != nullptr; }
+
+  // What has actually reached the files this session, and how big they are
+  // right now. Reported periodically rather than at shutdown: a console
+  // session usually ends with a device loss or the system terminating the
+  // app, and a number that is only printed on the way out is a number that is
+  // never printed.
+  std::string GetWriteReport() {
+    int64_t shader_bytes = 0, pipeline_bytes = 0;
+    // The write thread owns the file positions; only look while it is parked.
+    std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+    if (shader_storage_file_ &&
+        xe::filesystem::Seek(shader_storage_file_, 0, SEEK_END)) {
+      shader_bytes = xe::filesystem::Tell(shader_storage_file_);
+    }
+    if (pipeline_storage_file_ &&
+        xe::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END)) {
+      pipeline_bytes = xe::filesystem::Tell(pipeline_storage_file_);
+    }
+    return fmt::format(
+        "{} shader(s) and {} pipeline description(s) written this session, "
+        "files are {} and {} bytes, {} and {} still queued",
+        shaders_written_, pipelines_written_, shader_bytes, pipeline_bytes,
+        storage_write_shader_queue_.size(),
+        storage_write_pipeline_queue_.size());
+  }
   const std::filesystem::path& cache_root() const { return cache_root_; }
   uint32_t title_id() const { return title_id_; }
 
@@ -536,7 +620,11 @@ class ShaderStorageWriter {
         if (fwrite(&shader_header, sizeof(shader_header), 1,
                    shader_storage_file_) != 1) {
           XELOGE("Failed to write shader header to storage");
-        } else if (shader_header.ucode_dword_count) {
+          shader_header.ucode_dword_count = 0;
+        } else {
+          ++shaders_written_;
+        }
+        if (shader_header.ucode_dword_count) {
           ucode_guest_endian.resize(shader_header.ucode_dword_count);
           // Need to swap because the hash is calculated for the shader with
           // guest endianness.
@@ -555,6 +643,8 @@ class ShaderStorageWriter {
         if (fwrite(&pipeline_description, sizeof(pipeline_description), 1,
                    pipeline_storage_file_) != 1) {
           XELOGE("Failed to write pipeline description to storage");
+        } else {
+          ++pipelines_written_;
         }
       }
     }
@@ -566,6 +656,10 @@ class ShaderStorageWriter {
 
   FILE* shader_storage_file_ = nullptr;
   FILE* pipeline_storage_file_ = nullptr;
+  // Written this session, counted on the write thread and reported at
+  // shutdown against the resulting file sizes.
+  uint64_t shaders_written_ = 0;
+  uint64_t pipelines_written_ = 0;
 
   std::unique_ptr<xe::threading::Thread> storage_write_thread_;
   std::mutex storage_write_request_lock_;

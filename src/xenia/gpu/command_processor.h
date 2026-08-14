@@ -156,7 +156,11 @@ class CommandProcessor {
   // the backend may present fewer, and the presenter may repeat one.
   void NoteGuestFrame() {
     guest_frames_.fetch_add(1, std::memory_order_relaxed);
+    OnGuestFrameBoundary();
   }
+  // A guest frame just ended. Backends that meter background work per frame -
+  // the D3D12 pipeline creation budget - hang off this.
+  virtual void OnGuestFrameBoundary() {}
   // Frames per second since the previous call, and since the session started.
   // Only ever called from the telemetry thread, which owns the two members
   // below; the counter itself is written by the command processor thread.
@@ -557,6 +561,13 @@ class CommandProcessor {
   uint64_t frame_rate_report_last_frames_ = 0;
   uint64_t frame_rate_report_last_time_ms_ = 0;
   uint64_t frame_rate_report_start_time_ms_ = 0;
+
+  // Previous sample of the CPU-time report, which is a rate over the interval
+  // between two of them rather than a total since launch - a session that
+  // starts with a compile storm would otherwise report that storm forever.
+  uint64_t last_cpu_report_ticks_ = 0;
+  uint64_t last_process_cpu_100ns_ = 0;
+  uint64_t last_thread_cpu_100ns_ = 0;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

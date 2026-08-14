@@ -85,7 +85,16 @@ D3D12UploadBufferPool::CreatePageImplementation() {
   if (!provider_.CreateUploadResource(
           provider_.GetHeapFlagCreateNotZeroed(), &buffer_desc,
           D3D12_RESOURCE_STATE_GENERIC_READ, IID_PPV_ARGS(&buffer))) {
-    XELOGE("Failed to create a D3D upload buffer with {} bytes", page_size_);
+    // Throttled: this fails once per frame for as long as the process is out
+    // of memory, and the process being out of memory is exactly when the log
+    // must not be drowned - 1104 identical copies of this line in one DS2
+    // session at 3x3.
+    static std::atomic<uint32_t> upload_failure_count{0};
+    uint32_t count = upload_failure_count.fetch_add(1, std::memory_order_relaxed);
+    if (count < 4 || (count % 1024) == 0) {
+      XELOGE("Failed to create a D3D upload buffer with {} bytes (occurrence {})",
+             page_size_, count + 1);
+    }
     return nullptr;
   }
   D3D12_RANGE read_range;

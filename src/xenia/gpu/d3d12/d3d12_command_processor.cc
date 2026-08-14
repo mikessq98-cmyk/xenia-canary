@@ -29,6 +29,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/gpu/gpu_census.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -140,6 +141,7 @@ DECLARE_bool(readback_resolve_half_pixel_offset);
 #if XE_PLATFORM_WINRT
 DECLARE_bool(d3d12_serialize_draws_for_hang_diagnosis);
 DECLARE_bool(d3d12_verify_new_draws);
+DECLARE_int32(d3d12_pipeline_creation_threads);
 // Reported alongside a GPU hang - the settings that shape the translated
 // control flow are the prime suspects, so a log of a hang has to carry them.
 DECLARE_bool(dxbc_switch);
@@ -549,6 +551,84 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     XELOGI("[MEM] emulation speed: {}", frame_rate);
   }
 
+  // WHERE THE CPU ACTUALLY GOES.
+  //
+  // Everything else in this report measures the GPU side, and on 2026-08-13 a
+  // session was observed at 75-80% CPU against 10-20% GPU - so the report had
+  // no line for the half that was busy.
+  //
+  // The split is process against COMPILERS, not against this thread. This
+  // function runs on the telemetry thread, so asking GetCurrentThread() how
+  // busy it is answered a question nobody asked and printed it under the
+  // command processor's name. The compilers are tracked properly - each one
+  // samples its own GetThreadTimes around every work item - so that share is
+  // real, and what is left is the guest, the JIT and everything else.
+  {
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    uint64_t process_cpu_100ns = 0;
+    if (GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time,
+                        &kernel_time, &user_time)) {
+      process_cpu_100ns =
+          (uint64_t(kernel_time.dwHighDateTime) << 32 | kernel_time.dwLowDateTime) +
+          (uint64_t(user_time.dwHighDateTime) << 32 | user_time.dwLowDateTime);
+    }
+    uint64_t compiler_cpu_100ns =
+        pipeline_cache_ ? pipeline_cache_->creation_cpu_100ns() : 0;
+    uint64_t now_ticks = xe::Clock::QueryHostTickCount();
+    if (last_cpu_report_ticks_ && process_cpu_100ns >= last_process_cpu_100ns_) {
+      double elapsed_seconds = double(now_ticks - last_cpu_report_ticks_) /
+                               double(xe::Clock::QueryHostTickFrequency());
+      if (elapsed_seconds > 0.0) {
+        double process_cores =
+            double(process_cpu_100ns - last_process_cpu_100ns_) * 1.0e-7 /
+            elapsed_seconds;
+        double compiler_cores =
+            double(compiler_cpu_100ns - last_thread_cpu_100ns_) * 1.0e-7 /
+            elapsed_seconds;
+        uint32_t cores = std::max(xe::threading::logical_processor_count(), 1u);
+        XELOGI(
+            "[MEM] cpu: {:.0f}% of {} cores over the last {:.0f} s ({:.1f} "
+            "cores busy) | pipeline compilers {:.1f} cores, everything else "
+            "(guest code, the JIT, the driver, audio) {:.1f}",
+            process_cores / double(cores) * 100.0, cores, elapsed_seconds,
+            process_cores, compiler_cores,
+            std::max(process_cores - compiler_cores, 0.0));
+      }
+    }
+    last_cpu_report_ticks_ = now_ticks;
+    last_process_cpu_100ns_ = process_cpu_100ns;
+    last_thread_cpu_100ns_ = compiler_cpu_100ns;
+  }
+  if (pipeline_cache_) {
+    // The other half of the same question: of the CPU above, how much is the
+    // pipeline creation threads, and is it our translator or the driver's
+    // compiler that is spending it.
+    std::string creation_cost = pipeline_cache_->GetCreationCostReport();
+    if (!creation_cost.empty()) {
+      XELOGI("[MEM] pipeline creation: {}", creation_cost);
+    }
+    XELOGI("[MEM] shader storage: {}",
+           pipeline_cache_->GetShaderStorageWriteReport());
+    std::string governor = pipeline_cache_->GetCreationGovernorReport();
+    if (!governor.empty()) {
+      XELOGI("[MEM] pipeline governor: {}", governor);
+    }
+  }
+  {
+    std::string census = GpuCensus::Get().GetHighlights();
+    if (!census.empty()) {
+      XELOGI("[MEM] census: {}", census);
+    }
+    std::string creation = GpuCensus::Get().GetCreationReport();
+    if (!creation.empty()) {
+      XELOGI("[MEM] texture creation: {}", creation);
+    }
+    // Written every report rather than only at shutdown: the sessions worth
+    // reading the tables for are the ones that end in a device loss or with
+    // the system terminating the app, and neither reaches a shutdown path.
+    GpuCensus::Get().WriteTables();
+  }
+
   // What the memory core itself decided, and what it has had to take so far.
   // The lines above say how big each cache is; this one says whether that is a
   // problem, which is the question the caches used to each answer for
@@ -574,12 +654,6 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
       g_blocked_phase_totals.occurrences.load(std::memory_order_relaxed),
       pipeline_blocked_ms + texture_blocked_ms + submission_blocked_ms,
       pipeline_blocked_ms, texture_blocked_ms, submission_blocked_ms);
-  if (pipeline_cache_) {
-    std::string blobs = pipeline_cache_->GetPipelineBlobCacheReport();
-    if (!blobs.empty()) {
-      XELOGI("[MEM] pipeline blob cache: {}", blobs);
-    }
-  }
 #if XE_PLATFORM_WINRT
   if (pipeline_cache_) {
     // A pair that passes execution verification is silent by design, which
@@ -3374,6 +3448,162 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+#if XE_PLATFORM_WINRT
+void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
+  if (cvars::d3d12_pipeline_creation_threads >= 0) {
+    // An explicit thread count is the user's decision, not the governor's.
+    return;
+  }
+  uint64_t now_ticks = xe::Clock::QueryHostTickCount();
+  uint64_t tick_frequency = xe::Clock::QueryHostTickFrequency();
+  if (!governor_last_ticks_) {
+    governor_last_ticks_ = now_ticks;
+    governor_last_frames_ = guest_frames_.load(std::memory_order_relaxed);
+    governor_last_cpu_100ns_ = QueryProcessCpu100ns();
+    return;
+  }
+  double elapsed_seconds =
+      double(now_ticks - governor_last_ticks_) / double(tick_frequency);
+  if (elapsed_seconds < kGovernorIntervalSeconds) {
+    return;
+  }
+
+  uint64_t frames = guest_frames_.load(std::memory_order_relaxed);
+  uint64_t cpu_100ns = QueryProcessCpu100ns();
+  uint64_t compiler_cpu_100ns = pipeline_cache_->creation_cpu_100ns();
+  double fps = double(frames - governor_last_frames_) / elapsed_seconds;
+  double cores_busy = double(cpu_100ns - governor_last_cpu_100ns_) * 1.0e-7 /
+                      elapsed_seconds;
+  double compiler_cores =
+      double(compiler_cpu_100ns - governor_last_compiler_cpu_100ns_) * 1.0e-7 /
+      elapsed_seconds;
+  governor_last_ticks_ = now_ticks;
+  governor_last_frames_ = frames;
+  governor_last_cpu_100ns_ = cpu_100ns;
+  governor_last_compiler_cpu_100ns_ = compiler_cpu_100ns;
+
+  // WHAT "GOOD" MEANS FOR THIS TITLE, MEASURED RATHER THAN ASSUMED.
+  //
+  // A fixed 60 fps target would declare every title that cannot reach it to be
+  // permanently in trouble, and the governor would then never let a compiler
+  // run at all. So the reference is the best this title has actually managed,
+  // decaying slowly so that a good patch of one scene does not condemn the
+  // rest of the session. Same shape as the memory core's derived reserve.
+  if (fps > governor_best_fps_) {
+    governor_best_fps_ = fps;
+  } else {
+    governor_best_fps_ *= kGovernorBestFpsDecay;
+  }
+  double health = governor_best_fps_ > 1.0 ? fps / governor_best_fps_ : 1.0;
+
+  uint32_t queue_depth = pipeline_cache_->creation_queue_depth();
+  uint32_t max_permits = std::max(pipeline_cache_->max_creation_permits(), 1u);
+  uint32_t permits = pipeline_cache_->creation_permits();
+  permits = std::min(permits, max_permits);
+
+  if (!queue_depth) {
+    // Nothing to build. Leave the permit count where it is rather than letting
+    // it drift up while idle and then applying that to the next storm.
+    return;
+  }
+
+  uint32_t cores_total =
+      std::max(xe::threading::logical_processor_count(), 1u);
+  double cores_spare = double(cores_total) - cores_busy;
+
+  if (governor_expansion_cooldown_) {
+    --governor_expansion_cooldown_;
+  }
+
+  // A frame rate that has fallen is only the compilers' fault if the compilers
+  // are actually running. Measured on 2026-08-13: a Black Ops session collapsed
+  // from 46 fps to 1.2 while the compilers used 0.0-0.5 cores - the cause was
+  // the texture cache trimming its own working set every three seconds - and
+  // the governor cut permits from two to one anyway. That gave the guest
+  // nothing back, because there was nothing to give back, and it halved
+  // pipeline throughput at the exact moment 29574 draws were being skipped for
+  // want of one. Something else being wrong is not a reason to throttle this.
+  // Speculative work runs on headroom the guest is not using, and nothing
+  // else. This is a separate decision from the permit count: a title that is
+  // struggling should still get the pipeline a draw is waiting on as fast as
+  // the permits allow, and should not spend a single compile on one nothing
+  // has asked for yet.
+  pipeline_cache_->SetFrozenTierAllowed(health >= kGovernorHealthCeiling &&
+                                        cores_spare > kGovernorSpareCores);
+
+  if (health < kGovernorHealthFloor &&
+      compiler_cores < kGovernorMinCompilerCoresToBlame) {
+    governor_healthy_samples_ = 0;
+    return;
+  }
+
+  if (health < kGovernorHealthFloor) {
+    // The guest is doing measurably worse than this title's own best. Back off
+    // at once - one fewer compiler is felt within a frame, while the pipelines
+    // it would have built are only felt as geometry appearing later.
+    //
+    // This is the direction the old logic had backwards: it ADDED compilers
+    // when the queue went deep, and a deep queue is precisely a level
+    // streaming in, which is when the guest threads need the console most.
+    // Measured on 2026-08-13: five compilers gave 15.3 fps and two gave 33.5,
+    // on the same scene with the same everything else.
+    if (permits > 1) {
+      pipeline_cache_->SetCreationPermits(permits - 1);
+      // AND DO NOT IMMEDIATELY TRY AGAIN.
+      //
+      // Without this the loop hunts. The first session with the governor
+      // expanded 24 times and backed off 25, flapping between one and two
+      // compilers every couple of samples for four minutes. Each failed
+      // attempt now buys a longer wait before the next one, so a title that
+      // genuinely has no room to spare converges on leaving it alone instead
+      // of paying the cost of rediscovering that every few seconds.
+      governor_expansion_cooldown_ =
+          std::min(governor_expansion_cooldown_ * 2 +
+                       kGovernorCooldownSamplesAfterBackoff,
+                   kGovernorMaxCooldownSamples);
+    }
+    governor_healthy_samples_ = 0;
+    return;
+  }
+
+  // Expansion is the risky direction, so it needs the frame rate to be holding
+  // AND real spare capacity AND to have been true for several samples running
+  // AND the cooldown from the last failed attempt to have run out.
+  if (health > kGovernorHealthCeiling && cores_spare > kGovernorSpareCores &&
+      permits < max_permits && !governor_expansion_cooldown_) {
+    if (++governor_healthy_samples_ >= kGovernorSamplesBeforeExpanding) {
+      governor_healthy_samples_ = 0;
+      pipeline_cache_->SetCreationPermits(permits + 1);
+    }
+  } else {
+    governor_healthy_samples_ = 0;
+  }
+}
+
+uint32_t D3D12CommandProcessor::GetPipelinesBeingCreated() {
+  return pipeline_cache_ ? pipeline_cache_->GetPipelinesBeingCreated() : 0;
+}
+
+uint32_t D3D12CommandProcessor::GetPipelineQueueDepth() {
+  return pipeline_cache_ ? pipeline_cache_->creation_queue_depth() : 0;
+}
+
+uint64_t D3D12CommandProcessor::GetHostMemoryFreeBytes() {
+  return memory_arbiter_.last_free_bytes();
+}
+
+uint64_t D3D12CommandProcessor::QueryProcessCpu100ns() {
+  FILETIME creation_time, exit_time, kernel_time, user_time;
+  if (!GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time,
+                       &kernel_time, &user_time)) {
+    return 0;
+  }
+  return (uint64_t(kernel_time.dwHighDateTime) << 32 |
+          kernel_time.dwLowDateTime) +
+         (uint64_t(user_time.dwHighDateTime) << 32 | user_time.dwLowDateTime);
+}
+#endif  // XE_PLATFORM_WINRT
+
 namespace {
 // "Failed in backend" on its own says nothing about why a draw was dropped,
 // and these come in storms (tens of thousands in a session) - name the stage
@@ -3626,6 +3856,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         // Perfectly normal while pipelines compile in the background, and can
         // happen thousands of times per second - throttle the log heavily.
         uint32_t n = draws_skipped_.fetch_add(1, std::memory_order_relaxed);
+        GpuCensus::Get().RecordDrawSkipped(
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
         if (n < 10 || (n % 1000) == 0) {
           XELOGI(
               "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, "
@@ -4059,9 +4292,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // to diagnose a hang, the solver is recovering from one, or this pair has
   // never been proven to survive execution. The last is the common one and
   // costs a synchronization per DISTINCT pair - once per game, not per draw.
-  bool verifying_new_pair =
-      pipeline_cache_->SolverNeedsExecutionVerification(draw_vs_hash,
-                                                        draw_ps_hash);
+  GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);
+  uint64_t draw_state_key =
+      pipeline_cache_->GetPipelineStateKeyByHandle(pipeline_handle);
+  bool verifying_new_pair = pipeline_cache_->SolverNeedsExecutionVerification(
+      draw_vs_hash, draw_ps_hash, draw_state_key);
   if (cvars::d3d12_serialize_draws_for_hang_diagnosis || verifying_new_pair ||
       pipeline_cache_->solver_execution_safe_mode()) {
     // Written and flushed BEFORE the draw goes to the GPU, so if the device
@@ -4078,6 +4313,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
              draw_ps_hash);
       xe::FlushLog();
     }
+    // Timed, because this is a full GPU drain and there is one per unproven
+    // pipeline state. A scene that introduces many at once pays for all of
+    // them inside one frame, which is what a stutter on "new shaders" is made
+    // of - and until now nothing said so.
+    uint64_t verification_start = xe::Clock::QueryHostTickCount();
     EndSubmission(false);
     if (!AwaitAllQueueOperationsCompletion()) {
       // Every hang so far has blamed a DIFFERENT shader pair - four titles,
@@ -4096,6 +4336,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           cvars::dxbc_switch, cvars::dxbc_switch_break_dispatch,
           cvars::dxbc_switch_chunk_labels, cvars::dxbc_switch_max_labels,
           cvars::dxbc_main_loop_guard_iterations);
+      // WHAT THE DRAW WAS, not only what the shaders looked like. The one pair
+      // caught so far was a 192-dword vertex shader with no control flow and
+      // no texture fetches - there is nothing in a shader like that to hang on,
+      // which points at the geometry it was handed rather than the code. None
+      // of that was in the log.
+      XELOGE(
+          "Hang draw: primitive type {}, {} indices, {} ({}), vertex bindings "
+          "{}, texture fetches VS {} PS {}, memexport {}, state key {:016X}",
+          uint32_t(primitive_type), index_count,
+          index_buffer_info ? "indexed" : "auto-indexed",
+          index_buffer_info
+              ? (index_buffer_info->format == xenos::IndexFormat::kInt32
+                     ? "32-bit"
+                     : "16-bit")
+              : "-",
+          vertex_shader->vertex_bindings().size(),
+          vertex_shader->texture_bindings().size(),
+          pixel_shader ? pixel_shader->texture_bindings().size() : size_t(0),
+          vertex_shader->memexport_eM_written() ? "yes" : "no", draw_state_key);
       // Nothing else was in flight, so this is not a suspect - it is the draw
       // that hung the GPU. Quarantine it here, while the run that proved it is
       // still alive.
@@ -4105,9 +4364,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       return false;
     }
     if (verifying_new_pair) {
+      GpuCensus::Get().RecordVerificationSync(
+          draw_vs_hash, draw_ps_hash,
+          double(xe::Clock::QueryHostTickCount() - verification_start) *
+              1000.0 / double(xe::Clock::QueryHostTickFrequency()));
       // Survived. Remembered on disk, so this pair is never checked again -
       // here or on any later launch.
-      pipeline_cache_->SolverMarkExecutionVerified(draw_vs_hash, draw_ps_hash);
+      pipeline_cache_->SolverMarkExecutionVerified(draw_vs_hash, draw_ps_hash,
+                                                   draw_state_key);
     } else {
       XELOGW("HANGDIAG: draw VS {:016X} survived", draw_vs_hash);
     }
@@ -4876,6 +5140,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     pipeline_cache_->EndSubmission();
+#if XE_PLATFORM_WINRT
+    UpdatePipelineCreationGovernor();
+#endif  // XE_PLATFORM_WINRT
 
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.

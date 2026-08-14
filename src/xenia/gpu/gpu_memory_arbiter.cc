@@ -256,8 +256,13 @@ void GpuMemoryArbiter::LogStatistics() const {
       free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
       settled_free_bytes_ == UINT64_MAX ? 0 : (settled_free_bytes_ >> 20),
       GetReserveBytes() >> 20, largest_allocation_bytes_ >> 20,
-      int64_t(consumer_growth_bytes_per_second_) >> 20,
-      int64_t(consumption_bytes_per_second_) >> 20,
+      // Divided, not shifted: a right shift on a negative value rounds toward
+      // negative infinity, so any rate between -1 MB/s and zero - memory being
+      // slowly RELEASED, which is a perfectly normal state - printed as
+      // "-1 MB/s" and read like a defect. The policy below has always treated
+      // a negative rate as zero; only the report was lying about it.
+      int64_t(consumer_growth_bytes_per_second_) / (1 << 20),
+      int64_t(consumption_bytes_per_second_) / (1 << 20),
       total_freed_immediately_bytes_ >> 20, total_trims_,
       total_released_bytes_ >> 20, total_flat_skips_,
       total_allocation_failures_, total_reserved_for_allocations_bytes_ >> 20);
@@ -595,7 +600,7 @@ void GpuMemoryArbiter::Update(uint64_t submission_index) {
         GetPressureName(old_pressure), GetPressureName(new_pressure),
         free_bytes == UINT64_MAX ? 0 : (free_bytes >> 20),
         settled_free_bytes_ == UINT64_MAX ? 0 : (settled_free_bytes_ >> 20),
-        reserve >> 20, int64_t(consumption_bytes_per_second_) >> 20,
+        reserve >> 20, int64_t(consumption_bytes_per_second_) / (1 << 20),
         seconds_to_reserve >= 1.0e8 ? -1 : int64_t(seconds_to_reserve),
         GetPressureName(by_trend), GetPressureName(by_level),
         GetPressureName(by_failure));

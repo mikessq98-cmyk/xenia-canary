@@ -159,10 +159,11 @@ class ToxicShaderSolver {
   // survive are remembered on disk and never checked again - so the cost is one
   // synchronization per distinct pair per game, not per draw.
   bool NeedsExecutionVerification(uint64_t vertex_shader_hash,
-                                  uint64_t pixel_shader_hash);
+                                  uint64_t pixel_shader_hash,
+                                  uint64_t state_key);
   // The pair drew without hanging the GPU. Remembered across launches.
   void MarkExecutionVerified(uint64_t vertex_shader_hash,
-                             uint64_t pixel_shader_hash);
+                             uint64_t pixel_shader_hash, uint64_t state_key);
   // Quarantines a pipeline identified as an execution-side hang suspect (the
   // most recently bound pipeline when the device was removed with
   // DXGI_ERROR_DEVICE_HUNG). The suspect may be innocent - the hang can lag the
@@ -287,7 +288,11 @@ class ToxicShaderSolver {
   // Pairs already observed to execute without hanging the GPU, kept across
   // launches so a game is only ever checked once per pair. Command processor
   // thread only.
-  std::set<std::pair<uint64_t, uint64_t>> verified_;
+  // Keys, not pairs - see MakeVerificationKey.
+  static uint64_t MakeVerificationKey(uint64_t vertex_shader_hash,
+                                      uint64_t pixel_shader_hash,
+                                      uint64_t state_key);
+  std::set<uint64_t> verified_;
   std::filesystem::path verified_path_;
   std::FILE* verified_file_ = nullptr;
   size_t verified_at_startup_ = 0;
