@@ -257,6 +257,20 @@ class Processor {
 
   // Which debug features are enabled in generated code.
   uint32_t debug_info_flags_ = 0;
+
+ public:
+  // What translating guest code has cost so far. It runs on the guest thread
+  // that first calls a function, so it is a stall in the guest's execution.
+  uint64_t translation_ticks() const {
+    return translation_ticks_.load(std::memory_order_relaxed);
+  }
+  uint64_t translation_count() const {
+    return translation_count_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t> translation_ticks_{0};
+  std::atomic<uint64_t> translation_count_{0};
   // If specified, the file trace data gets written to when running.
   std::filesystem::path functions_trace_path_;
   std::unique_ptr<ChunkedMappedMemoryWriter> functions_trace_file_;

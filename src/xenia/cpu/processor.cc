@@ -351,9 +351,18 @@ bool Processor::DemandFunction(Function* function) {
     // Symbol is undefined, so define now.
     assert_true(function->is_guest());
     bool definition_out_of_memory = false;
-    if (!frontend_->DefineFunction(static_cast<GuestFunction*>(function),
-                                   debug_info_flags_,
-                                   &definition_out_of_memory)) {
+    uint64_t translation_start = xe::Clock::QueryHostTickCount();
+    bool defined = frontend_->DefineFunction(
+        static_cast<GuestFunction*>(function), debug_info_flags_,
+        &definition_out_of_memory);
+    // Translating a guest function happens on the thread that first calls it,
+    // so it is a stall in the guest's own execution - the CPU-side equivalent
+    // of a pipeline the GPU is waiting for, and until now unmeasured.
+    translation_ticks_.fetch_add(
+        xe::Clock::QueryHostTickCount() - translation_start,
+        std::memory_order_relaxed);
+    translation_count_.fetch_add(1, std::memory_order_relaxed);
+    if (!defined) {
       if (definition_out_of_memory) {
         // Transient - the host may have memory again once the caches are
         // trimmed, so put the symbol back to declared and let a later call

@@ -112,6 +112,11 @@ class GraphicsSystem {
   void MarkVblank();
 
   Memory* memory_ = nullptr;
+  // Per-guest-thread CPU, for the periodic report.
+  void LogGuestCpuStatistics();
+  uint64_t last_guest_cpu_sample_ticks_ = 0;
+  std::unordered_map<uint32_t, uint64_t> guest_thread_cpu_100ns_;
+
   cpu::Processor* processor_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
   ui::WindowedAppContext* app_context_ = nullptr;

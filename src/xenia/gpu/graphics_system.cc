@@ -183,6 +183,9 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                         code_cache->indirection_committed_bytes() >> 20,
                         code_cache->function_count());
                   }
+                  if (processor_) {
+                    LogGuestCpuStatistics();
+                  }
                 }
               }
 
@@ -453,6 +456,80 @@ void GraphicsSystem::RequestFrameTrace() {
 
 void GraphicsSystem::BeginTracing() {
   command_processor_->BeginTracing(cvars::trace_gpu_prefix);
+}
+
+void GraphicsSystem::LogGuestCpuStatistics() {
+  // Which guest threads are actually burning the console. The process-wide
+  // line already says how many cores are busy and how few of them are the
+  // pipeline compilers; this says which of the thirty-odd guest threads the
+  // rest of it is.
+  double ticks_to_ms = 1000.0 / double(Clock::QueryHostTickFrequency());
+  double translation_ms =
+      double(processor_->translation_ticks()) * ticks_to_ms;
+  XELOGI("[MEM] guest cpu: {} functions translated, {:.0f} ms on the guest "
+         "threads that first called them",
+         processor_->translation_count(), translation_ms);
+
+  if (!kernel_state_) {
+    return;
+  }
+  struct ThreadCost {
+    std::string name;
+    double cores;
+  };
+  std::vector<ThreadCost> costs;
+  double total_cores = 0.0;
+  uint64_t now = Clock::QueryHostTickCount();
+  double elapsed_seconds =
+      last_guest_cpu_sample_ticks_
+          ? double(now - last_guest_cpu_sample_ticks_) /
+                double(Clock::QueryHostTickFrequency())
+          : 0.0;
+  last_guest_cpu_sample_ticks_ = now;
+  for (const auto& thread : kernel_state_->object_table()
+                                ->GetObjectsByType<kernel::XThread>()) {
+    if (!thread || !thread->is_guest_thread() || !thread->thread()) {
+      continue;
+    }
+    HANDLE handle = HANDLE(thread->thread()->native_handle());
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!handle || !GetThreadTimes(handle, &creation_time, &exit_time,
+                                   &kernel_time, &user_time)) {
+      continue;
+    }
+    uint64_t cpu_100ns =
+        (uint64_t(kernel_time.dwHighDateTime) << 32 |
+         kernel_time.dwLowDateTime) +
+        (uint64_t(user_time.dwHighDateTime) << 32 | user_time.dwLowDateTime);
+    uint32_t handle_value = thread->handle();
+    uint64_t& previous = guest_thread_cpu_100ns_[handle_value];
+    uint64_t delta = cpu_100ns >= previous ? cpu_100ns - previous : 0;
+    previous = cpu_100ns;
+    if (elapsed_seconds <= 0.0) {
+      continue;
+    }
+    double cores = double(delta) * 1.0e-7 / elapsed_seconds;
+    total_cores += cores;
+    if (cores >= 0.02) {
+      costs.push_back({thread->thread_name(), cores});
+    }
+  }
+  if (costs.empty()) {
+    return;
+  }
+  std::sort(costs.begin(), costs.end(),
+            [](const ThreadCost& a, const ThreadCost& b) {
+              return a.cores > b.cores;
+            });
+  std::string busiest;
+  for (size_t i = 0; i < costs.size() && i < 6; ++i) {
+    if (!busiest.empty()) {
+      busiest += ", ";
+    }
+    busiest += fmt::format("{} {:.2f}", costs[i].name, costs[i].cores);
+  }
+  XELOGI("[MEM] guest threads: {:.2f} cores across {} of them | busiest: {}",
+         total_cores, costs.size(), busiest);
 }
 
 void GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }
