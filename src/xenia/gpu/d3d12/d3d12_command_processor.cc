@@ -3912,6 +3912,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
               "compiles (occurrence {})",
               n + 1);
         }
+        // A served draw still wants its own pipeline: without this the real one
+        // is never marked demanded, stays in the frozen speculative tier and is
+        // never built, so the object wears the stand-in's shader for good and
+        // the queue only grows.
+        pipeline_cache_->PrioritizePipelineForPendingDraw(
+            pipeline_handle, GpuCensus::Get().IsObjectOneStateShort(object_key));
         pipeline_handle = substitute_handle;
         // Bind for what will actually run. Everything below - the used texture
         // mask, RequestTextures, the descriptor tables - is driven by these
