@@ -420,6 +420,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // Zero means no scale.
     uint32_t texture_integer_scale_bits[32];
 
+    // Where in guest memory the pixel shader's microcode starts, and how many
+    // ALU instructions it has. Only the microcode interpreter reads these -
+    // a translated shader has its code compiled in and never looks.
+    uint32_t interpreter_ucode_address;
+    uint32_t interpreter_ucode_alu_count;
+    uint32_t interpreter_padding[2];
+
    private:
     friend class DxbcShaderTranslator;
 

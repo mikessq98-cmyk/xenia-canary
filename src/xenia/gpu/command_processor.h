@@ -493,6 +493,10 @@ class CommandProcessor {
 
   virtual void InitializeTrace();
 
+ public:
+  Memory* memory() const { return memory_; }
+
+ protected:
   Memory* memory_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;

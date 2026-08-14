@@ -122,6 +122,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // How many draws ran on the interpreter instead of a translated shader.
   uint64_t interpreter_draws_ = 0;
   uint64_t interpreter_draws_declined_ = 0;
+  // The pixel shader this draw hands to the interpreter, if any - its guest
+  // microcode address goes into the system constants for it to read.
+  const DxbcShader* interpreter_pixel_shader_ = nullptr;
 
   // Sampled by the texture cache around its driver calls - see GpuCensus.
   uint32_t GetPipelinesBeingCreated();

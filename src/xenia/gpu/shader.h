@@ -874,6 +874,14 @@ class Shader {
   // Microcode dwords in host endianness.
   const std::vector<uint32_t>& ucode_data() const { return ucode_data_; }
   uint64_t ucode_data_hash() const { return ucode_data_hash_; }
+
+  // Where this microcode lives in guest memory. The microcode interpreter
+  // reads it from there rather than being handed a copy - it is guest data and
+  // guest memory is already bound to the shader.
+  uint32_t ucode_guest_address() const { return ucode_guest_address_; }
+  void set_ucode_guest_address(uint32_t address) {
+    ucode_guest_address_ = address;
+  }
   const uint32_t* ucode_dwords() const { return ucode_data_.data(); }
   size_t ucode_dword_count() const { return ucode_data_.size(); }
 
@@ -1054,6 +1062,7 @@ class Shader {
   xenos::ShaderType shader_type_;
   std::vector<uint32_t> ucode_data_;
   uint64_t ucode_data_hash_;
+  uint32_t ucode_guest_address_ = 0;
 
   // Whether info needed before translating has been gathered already - may be
   // needed to determine which modifications are actually needed and make sense

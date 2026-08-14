@@ -246,6 +246,14 @@ float XeExecuteScalar(uint opcode, float a, float b, inout float previous,
 }
 
 float4 main(float4 position : SV_Position) : SV_Target {
+  // Colour exports. A pixel shader writes its result by exporting to register
+  // 0-3 (ExportRegister::kPSColor0..3) rather than by falling out of a value,
+  // so they are kept apart from the temporaries and colour 0 is what leaves.
+  float4 exports[4];
+  [unroll] for (uint export_init = 0; export_init < 4; ++export_init) {
+    exports[export_init] = float4(0.0, 0.0, 0.0, 0.0);
+  }
+
   float4 regs[kXeMaxRegisters];
   [unroll] for (uint init = 0; init < 4; ++init) {
     regs[init] = position * float(init + 1);
@@ -319,31 +327,51 @@ float4 main(float4 position : SV_Position) : SV_Target {
     }
     previous_scalar = scalar_result;
 
-    uint vd = vector_dest & (kXeMaxRegisters - 1);
-    float4 v = regs[vd];
-    v.x = (vector_write_mask & 1) ? vector_result.x : v.x;
-    v.y = (vector_write_mask & 2) ? vector_result.y : v.y;
-    v.z = (vector_write_mask & 4) ? vector_result.z : v.z;
-    v.w = (vector_write_mask & 8) ? vector_result.w : v.w;
-    regs[vd] = v;
+    if (export_data) {
+      // Both halves write the same export, and only colours 0-3 mean anything
+      // to a pixel shader - the rest of the export space is depth and fog,
+      // which this does not carry yet.
+      uint ed = vector_dest & 3;
+      if (vector_dest < 4) {
+        float4 e = exports[ed];
+        e.x = (vector_write_mask & 1) ? vector_result.x : e.x;
+        e.y = (vector_write_mask & 2) ? vector_result.y : e.y;
+        e.z = (vector_write_mask & 4) ? vector_result.z : e.z;
+        e.w = (vector_write_mask & 8) ? vector_result.w : e.w;
+        e.x = (scalar_write_mask & 1) ? scalar_result : e.x;
+        e.y = (scalar_write_mask & 2) ? scalar_result : e.y;
+        e.z = (scalar_write_mask & 4) ? scalar_result : e.z;
+        e.w = (scalar_write_mask & 8) ? scalar_result : e.w;
+        exports[ed] = e;
+      }
+    } else {
+      uint vd = vector_dest & (kXeMaxRegisters - 1);
+      float4 v = regs[vd];
+      v.x = (vector_write_mask & 1) ? vector_result.x : v.x;
+      v.y = (vector_write_mask & 2) ? vector_result.y : v.y;
+      v.z = (vector_write_mask & 4) ? vector_result.z : v.z;
+      v.w = (vector_write_mask & 8) ? vector_result.w : v.w;
+      regs[vd] = v;
 
-    uint sd = export_data ? vd : (scalar_dest & (kXeMaxRegisters - 1));
-    float4 s = regs[sd];
-    s.x = (scalar_write_mask & 1) ? scalar_result : s.x;
-    s.y = (scalar_write_mask & 2) ? scalar_result : s.y;
-    s.z = (scalar_write_mask & 4) ? scalar_result : s.z;
-    s.w = (scalar_write_mask & 8) ? scalar_result : s.w;
-    regs[sd] = s;
+      uint sd = scalar_dest & (kXeMaxRegisters - 1);
+      float4 s = regs[sd];
+      s.x = (scalar_write_mask & 1) ? scalar_result : s.x;
+      s.y = (scalar_write_mask & 2) ? scalar_result : s.y;
+      s.z = (scalar_write_mask & 4) ? scalar_result : s.z;
+      s.w = (scalar_write_mask & 8) ? scalar_result : s.w;
+      regs[sd] = s;
+    }
   }
 
   if (kill) {
     discard;
   }
 
-  // No texture sampling yet, deliberately. Reading a bindless descriptor that
-  // the draw did not fill in is a page fault at VA 0 and a lost device on this
-  // driver, and that failure has already been paid for twice today. Colour
-  // comes from the interpreted arithmetic alone, so a first run says whether
-  // the ALU path is right without being able to die on descriptors.
-  return regs[0];
+  // Colour 0, where a pixel shader exports its result.
+  //
+  // No texture sampling yet, deliberately. Reading a bindless descriptor the
+  // draw did not fill in is a page fault at VA 0 and a lost device here, and
+  // that has been paid for twice today - so the arithmetic is proven first,
+  // where a mistake is a wrong colour rather than a dead console.
+  return exports[0];
 }

@@ -4020,6 +4020,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 #if XE_PLATFORM_WINRT
   uint64_t texture_phase_start_ticks = Clock::QueryHostTickCount();
 #endif  // XE_PLATFORM_WINRT
+  // Whether this draw's pixel shader is one the interpreter is running, so the
+  // system constants carry its microcode address.
+  if (cvars::d3d12_interpreter_render && pixel_shader &&
+      PipelineCache::InterpreterCanRun(*pixel_shader)) {
+    interpreter_pixel_shader_ = pixel_shader;
+    ++interpreter_draws_;
+  } else {
+    interpreter_pixel_shader_ = nullptr;
+    if (cvars::d3d12_interpreter_render && pixel_shader) {
+      ++interpreter_draws_declined_;
+    }
+  }
   texture_cache_->SetCurrentDrawShaders(
       vertex_shader ? vertex_shader->ucode_data_hash() : 0,
       pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -5831,6 +5843,22 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
   update_dirty_uint32_cmp(system_constants_.textures_resolution_scaled,
                           textures_resolution_scaled);
   system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+
+  // Where the microcode interpreter reads this draw's pixel shader from. Only
+  // it looks at these; a translated shader carries its code compiled in.
+  uint32_t interpreter_address = 0;
+  uint32_t interpreter_alu_count = 0;
+  if (cvars::d3d12_interpreter_render && interpreter_pixel_shader_) {
+    interpreter_address = interpreter_pixel_shader_->ucode_guest_address();
+    interpreter_alu_count =
+        uint32_t(interpreter_pixel_shader_->ucode_dword_count() / 3);
+  }
+  update_dirty_uint32_cmp(system_constants_.interpreter_ucode_address,
+                          interpreter_address);
+  system_constants_.interpreter_ucode_address = interpreter_address;
+  update_dirty_uint32_cmp(system_constants_.interpreter_ucode_alu_count,
+                          interpreter_alu_count);
+  system_constants_.interpreter_ucode_alu_count = interpreter_alu_count;
 
   // Log2 of sample count, for alpha to mask and with ROV, for EDRAM address
   // calculation with MSAA.

@@ -234,6 +234,10 @@ class PipelineCache {
   // search re-runs (at most once per submission) while no substitute has
   // been found, because a suitable pipeline is usually only finished AFTER
   // the pending one was first asked for.
+  // Whether this guest pixel shader is one the microcode interpreter can
+  // execute - see d3d12_interpreter_render.
+  static bool InterpreterCanRun(const Shader& shader);
+
   void* GetReadySubstituteByHandle(void* handle);
   // The pixel shader a handle will actually execute with, so a draw taking a
   // stand-in can bind for it rather than for the one it asked for.

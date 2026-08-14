@@ -278,6 +278,7 @@ DEFINE_bool(
 
 // Shader translation differs with resolution scaling, so the solver keeps
 // scale-specific state (see SolverInitialize).
+DECLARE_bool(d3d12_interpreter_render);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
 
@@ -1176,6 +1177,10 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type,
   // again.
   D3D12Shader* shader =
       new D3D12Shader(shader_type, data_hash, host_address, dword_count);
+  // Kept so the microcode interpreter can read this shader where it lies in
+  // guest memory instead of being given a copy of it.
+  shader->set_ucode_guest_address(
+      command_processor_.memory()->HostToGuestVirtual(host_address));
   shaders_.emplace(data_hash, shader);
   return shader;
 }
@@ -1657,6 +1662,33 @@ void PipelineCache::RunInterpreterProbe() {
       "charges 358-808 ms for a 23-62 KB translated material; a handful of "
       "these would replace hundreds of those.",
       sizeof(shaders::microcode_interpreter_ps), ms);
+}
+
+bool PipelineCache::InterpreterCanRun(const Shader& shader) {
+  if (!cvars::d3d12_interpreter_render) {
+    return false;
+  }
+  // Only what it actually implements, and the list is short on purpose: a
+  // shader handed to it that it cannot run is a wrong picture at best and a
+  // hung device at worst.
+  //
+  // No control flow - it walks a straight run of ALU instructions. No texture
+  // fetches - reading a bindless descriptor the draw did not fill in is a page
+  // fault at VA 0 on this driver. Nothing that kills pixels or writes depth,
+  // because those leave through paths it does not carry. And a length the
+  // shader's own loop bound can cover.
+  if (!shader.label_addresses().empty()) {
+    return false;
+  }
+  if (!shader.texture_bindings().empty()) {
+    return false;
+  }
+  if (shader.kills_pixels() || shader.writes_depth() ||
+      shader.memexport_eM_written()) {
+    return false;
+  }
+  size_t alu_instructions = shader.ucode_dword_count() / 3;
+  return alu_instructions > 0 && alu_instructions <= 512;
 }
 
 std::string PipelineCache::DescribeRenderState(
@@ -4383,10 +4415,19 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       assert_always();
       return nullptr;
     }
-    state_desc.PS.pShaderBytecode =
-        runtime_description.pixel_shader->translated_binary().data();
-    state_desc.PS.BytecodeLength =
-        runtime_description.pixel_shader->translated_binary().size();
+    if (InterpreterCanRun(runtime_description.pixel_shader->shader())) {
+      // The interpreter reads this shader's microcode from guest memory and
+      // executes it, instead of the driver compiling a host shader for it.
+      // It is bound identically - the same constant buffers, the same shared
+      // memory - so nothing else about the pipeline changes.
+      state_desc.PS.pShaderBytecode = shaders::microcode_interpreter_ps;
+      state_desc.PS.BytecodeLength = sizeof(shaders::microcode_interpreter_ps);
+    } else {
+      state_desc.PS.pShaderBytecode =
+          runtime_description.pixel_shader->translated_binary().data();
+      state_desc.PS.BytecodeLength =
+          runtime_description.pixel_shader->translated_binary().size();
+    }
   } else if (edram_rov_used) {
     state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
     state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
