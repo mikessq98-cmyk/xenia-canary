@@ -1583,7 +1583,7 @@ void PipelineCache::RunInterpreterProbe() {
   // constants and one texture as SRVs, one sampler, one constant buffer.
   D3D12_DESCRIPTOR_RANGE srv_range = {};
   srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  srv_range.NumDescriptors = 3;
+  srv_range.NumDescriptors = 4;
   srv_range.BaseShaderRegister = 0;
   D3D12_ROOT_PARAMETER root_parameters[2] = {};
   root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;

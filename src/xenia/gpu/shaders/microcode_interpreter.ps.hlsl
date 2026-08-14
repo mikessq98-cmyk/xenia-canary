@@ -25,6 +25,8 @@
 ByteAddressBuffer xe_microcode : register(t0);
 // Guest float constants, four floats each.
 ByteAddressBuffer xe_float_constants : register(t1);
+// Guest texture fetch constants - format, dimension, swizzle and signedness.
+ByteAddressBuffer xe_texture_fetch_constants : register(t3);
 Texture2DArray<float4> xe_texture : register(t2);
 SamplerState xe_sampler : register(s0);
 
@@ -414,9 +416,55 @@ float4 main(float4 position : SV_Position) : SV_Target {
     discard;
   }
 
-  // A generic sample so the texture path is present; the real thing decodes
-  // the format from the fetch constants the way the translator does.
-  float4 sampled =
-      xe_texture.SampleLevel(xe_sampler, float3(saturate(regs[0].xy), 0.0), 0.0);
-  return regs[1] * sampled;
+  // The texture path. This is the part the translator spends 62% of its output
+  // on - 2516 bytes and 63 instructions per fetch, because format, signedness,
+  // swizzle and filtering all come from the fetch constants at run time. An
+  // interpreter pays it ONCE instead of once per fetch in every shader, which
+  // is the whole argument for it, so the cost has to be in the measurement.
+  uint4 fetch_words = xe_texture_fetch_constants.Load4(0);
+  uint dimension = (fetch_words.z >> 9) & 3;
+  uint num_format = (fetch_words.w >> 15) & 1;
+  uint swizzle = (fetch_words.w >> 16) & 0xFFF;
+  uint signs = (fetch_words.x >> 2) & 0xFF;
+
+  float3 coordinates = float3(saturate(regs[0].xy), 0.0);
+  if (dimension == 2) {
+    coordinates.z = saturate(regs[0].z) * 5.0;
+  }
+
+  float4 sampled = xe_texture.SampleLevel(xe_sampler, coordinates, 0.0);
+
+  // Per-component sign handling: unsigned, signed, or biased.
+  float4 converted;
+  [unroll] for (uint c = 0; c < 4; ++c) {
+    uint component_sign = (signs >> (c * 2)) & 3;
+    float v = sampled[c];
+    if (component_sign == 1) {
+      v = v * 2.0 - 1.0;
+    } else if (component_sign == 2) {
+      v = v - 0.5;
+    }
+    converted[c] = v;
+  }
+
+  // Integer formats are delivered normalized and have to be scaled back.
+  if (num_format == 1) {
+    converted *= 255.0;
+  }
+
+  // Destination swizzle, three bits per component, with the constant sources
+  // the guest encoding allows.
+  float4 swizzled;
+  [unroll] for (uint s = 0; s < 4; ++s) {
+    uint selector = (swizzle >> (s * 3)) & 7;
+    if (selector == 4) {
+      swizzled[s] = 0.0;
+    } else if (selector == 5) {
+      swizzled[s] = 1.0;
+    } else {
+      swizzled[s] = converted[selector & 3];
+    }
+  }
+
+  return regs[1] * swizzled;
 }
