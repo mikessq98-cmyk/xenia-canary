@@ -116,6 +116,19 @@ class GpuCensus {
   void RecordTextureUsedByShaders(uint64_t texture_key_hash, uint64_t vs_hash,
                                   uint64_t ps_hash);
 
+  // ---- objects -------------------------------------------------------------
+  // There is no "object" on this hardware, but the guest address a mesh is
+  // fetched from is the nearest thing to one: the same mesh reads the same
+  // address frame after frame, while the shader pair only says what material
+  // it wears. Identity holds as long as the allocation does, which covers
+  // static world geometry and smears dynamic geometry written into a ring
+  // buffer - so read the counts with that in mind.
+  void RecordObjectDraw(uint64_t object_key, uint32_t vertex_base,
+                        uint32_t index_base, uint32_t index_count,
+                        uint64_t vs_hash, uint64_t ps_hash, uint64_t state_key,
+                        bool pipeline_ready);
+  std::string GetObjectReport();
+
   // ---- reporting ---------------------------------------------------------
   // A handful of lines for the periodic log: the worst offender in each
   // category, which is what a human reads first.
@@ -223,6 +236,23 @@ class GpuCensus {
   // this map is short, the state is not what multiplies.
   std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>
       distinct_render_states_;
+
+  struct ObjectEntry {
+    uint32_t vertex_base = 0;
+    uint32_t index_base = 0;
+    uint32_t index_count = 0;
+    std::mutex lock;
+    std::unordered_set<uint64_t> shader_pairs;
+    // Pipeline states this mesh is drawn in, and the ones already built. A
+    // mesh missing any of them is one that flickers.
+    std::unordered_set<uint64_t> states_wanted;
+    std::unordered_set<uint64_t> states_ready;
+    std::atomic<uint64_t> draws{0};
+    std::atomic<uint64_t> draws_skipped{0};
+  };
+  ObjectEntry* FindObject(uint64_t object_key);
+  std::mutex objects_lock_;
+  std::unordered_map<uint64_t, std::unique_ptr<ObjectEntry>> objects_;
 
   // texture -> the shader pairs that drew with it, and the reverse count.
   std::mutex texture_shader_lock_;

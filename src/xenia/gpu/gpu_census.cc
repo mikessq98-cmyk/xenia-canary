@@ -72,6 +72,10 @@ void GpuCensus::Shutdown() {
     std::lock_guard<std::mutex> lock(textures_lock_);
     textures_.clear();
   }
+  {
+    std::lock_guard<std::mutex> lock(objects_lock_);
+    objects_.clear();
+  }
   total_verification_syncs_.store(0, std::memory_order_relaxed);
   total_verification_wait_us_.store(0, std::memory_order_relaxed);
 }
@@ -350,6 +354,74 @@ void GpuCensus::RecordTextureUsedByShaders(uint64_t texture_key_hash,
   }
 }
 
+GpuCensus::ObjectEntry* GpuCensus::FindObject(uint64_t object_key) {
+  std::lock_guard<std::mutex> lock(objects_lock_);
+  auto it = objects_.find(object_key);
+  if (it != objects_.end()) {
+    return it->second.get();
+  }
+  auto entry = std::make_unique<ObjectEntry>();
+  ObjectEntry* raw = entry.get();
+  objects_.emplace(object_key, std::move(entry));
+  return raw;
+}
+
+void GpuCensus::RecordObjectDraw(uint64_t object_key, uint32_t vertex_base,
+                                 uint32_t index_base, uint32_t index_count,
+                                 uint64_t vs_hash, uint64_t ps_hash,
+                                 uint64_t state_key, bool pipeline_ready) {
+  if (!enabled_ || !object_key) {
+    return;
+  }
+  ObjectEntry* entry = FindObject(object_key);
+  (pipeline_ready ? entry->draws : entry->draws_skipped)
+      .fetch_add(1, std::memory_order_relaxed);
+  uint64_t pair[2] = {vs_hash, ps_hash};
+  std::lock_guard<std::mutex> lock(entry->lock);
+  entry->vertex_base = vertex_base;
+  entry->index_base = index_base;
+  entry->index_count = index_count;
+  if (entry->shader_pairs.size() < 64) {
+    entry->shader_pairs.insert(XXH3_64bits(pair, sizeof(pair)));
+  }
+  if (entry->states_wanted.size() < 64) {
+    entry->states_wanted.insert(state_key);
+  }
+  if (pipeline_ready && entry->states_ready.size() < 64) {
+    entry->states_ready.insert(state_key);
+  }
+}
+
+std::string GpuCensus::GetObjectReport() {
+  if (!enabled_) {
+    return std::string();
+  }
+  size_t total = 0, incomplete = 0, worst_missing = 0, multi_pass = 0;
+  {
+    std::lock_guard<std::mutex> lock(objects_lock_);
+    total = objects_.size();
+    for (const auto& pair : objects_) {
+      std::lock_guard<std::mutex> entry_lock(pair.second->lock);
+      size_t wanted = pair.second->states_wanted.size();
+      size_t ready = pair.second->states_ready.size();
+      if (wanted > 1) {
+        ++multi_pass;
+      }
+      if (ready < wanted) {
+        ++incomplete;
+        worst_missing = std::max(worst_missing, wanted - ready);
+      }
+    }
+  }
+  if (!total) {
+    return std::string();
+  }
+  return fmt::format(
+      "{} distinct meshes, {} drawn in more than one pipeline state, {} still "
+      "missing at least one of theirs (worst is short by {})",
+      total, multi_pass, incomplete, worst_missing);
+}
+
 std::string GpuCensus::GetHighlights() {
   if (!enabled_) {
     return std::string();
@@ -533,6 +605,25 @@ void GpuCensus::WriteTables() {
       std::lock_guard<std::mutex> lock(texture_shader_lock_);
       for (const auto& pair : texture_shader_pairs_) {
         file << fmt::format("{:016X},{}\n", pair.first, pair.second.size());
+      }
+    }
+  }
+  {
+    std::ofstream file(table_root_ /
+                       fmt::format("{:08X}.objects.csv", title_id_));
+    if (file) {
+      file << "object_key,vertex_base,index_base,index_count,shader_pairs,"
+              "states_wanted,states_ready,draws,draws_skipped\n";
+      std::lock_guard<std::mutex> lock(objects_lock_);
+      for (const auto& pair : objects_) {
+        ObjectEntry& e = *pair.second;
+        std::lock_guard<std::mutex> entry_lock(e.lock);
+        file << fmt::format("{:016X},{:08X},{:08X},{},{},{},{},{},{}\n",
+                            pair.first, e.vertex_base, e.index_base,
+                            e.index_count, e.shader_pairs.size(),
+                            e.states_wanted.size(), e.states_ready.size(),
+                            e.draws.load(std::memory_order_relaxed),
+                            e.draws_skipped.load(std::memory_order_relaxed));
       }
     }
   }

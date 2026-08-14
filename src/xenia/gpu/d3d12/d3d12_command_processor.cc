@@ -627,6 +627,10 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     if (!shape.empty()) {
       XELOGI("[MEM] pipeline shape: {}", shape);
     }
+    std::string objects = GpuCensus::Get().GetObjectReport();
+    if (!objects.empty()) {
+      XELOGI("[MEM] objects: {}", objects);
+    }
     // Written every report rather than only at shutdown: the sessions worth
     // reading the tables for are the ones that end in a device loss or with
     // the system terminating the app, and neither reaches a shutdown path.
@@ -3847,6 +3851,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   ID3D12RootSignature* root_signature;
 #if XE_PLATFORM_WINRT
   uint64_t pipeline_phase_start_ticks = Clock::QueryHostTickCount();
+  // The guest address a mesh is fetched from is the nearest thing to an object
+  // identity here - the shader pair says what material it wears, this says
+  // which geometry wears it.
+  uint64_t object_key = 0;
+  uint32_t object_vertex_base = 0;
+  uint32_t object_index_base =
+      index_buffer_info ? index_buffer_info->guest_base : 0;
+  {
+    const std::vector<Shader::VertexBinding>& vertex_bindings =
+        vertex_shader->vertex_bindings();
+    if (!vertex_bindings.empty()) {
+      object_vertex_base =
+          regs.GetVertexFetch(vertex_bindings[0].fetch_constant).address;
+    }
+    if (object_vertex_base || object_index_base) {
+      struct {
+        uint32_t vertex_base;
+        uint32_t index_base;
+        uint32_t index_count;
+      } key_data = {object_vertex_base, object_index_base, index_count};
+      object_key = XXH3_64bits(&key_data, sizeof(key_data));
+    }
+  }
 #endif  // XE_PLATFORM_WINRT
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
@@ -3904,6 +3931,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         GpuCensus::Get().RecordDrawSkipped(
             vertex_shader->ucode_data_hash(),
             pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+        GpuCensus::Get().RecordObjectDraw(
+            object_key, object_vertex_base, object_index_base, index_count,
+            vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+            pipeline_cache_->GetPipelineStateKeyByHandle(pipeline_handle),
+            /*pipeline_ready=*/false);
         if (n < 10 || (n % 1000) == 0) {
           XELOGI(
               "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, "
@@ -4344,6 +4377,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);
   uint64_t draw_state_key =
       pipeline_cache_->GetPipelineStateKeyByHandle(pipeline_handle);
+  GpuCensus::Get().RecordObjectDraw(object_key, object_vertex_base,
+                                    object_index_base, index_count,
+                                    draw_vs_hash, draw_ps_hash, draw_state_key,
+                                    /*pipeline_ready=*/true);
   bool verifying_new_pair = pipeline_cache_->SolverNeedsExecutionVerification(
       draw_vs_hash, draw_ps_hash, draw_state_key);
   if (verifying_new_pair &&
