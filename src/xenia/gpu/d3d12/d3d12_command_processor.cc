@@ -653,11 +653,9 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   }
   if (cvars::d3d12_interpreter_render) {
     XELOGI(
-        "[MEM] interpreter: {} draws executed by it, {} declined (too many "
-        "instructions, or no microcode address). Compare the frame rate with a "
-        "run at d3d12_interpreter_render off - that difference is what one "
-        "compiled shader per hundreds of materials costs per pixel.",
-        interpreter_draws_, interpreter_draws_declined_);
+        "[MEM] interpreter: {} draws executed by it, {} declined - {}",
+        interpreter_draws_, interpreter_draws_declined_,
+        PipelineCache::GetInterpreterDeclineReport());
     // Written every report rather than only at shutdown: the sessions worth
     // reading the tables for are the ones that end in a device loss or with
     // the system terminating the app, and neither reaches a shutdown path.

@@ -237,6 +237,9 @@ class PipelineCache {
   // Whether this guest pixel shader is one the microcode interpreter can
   // execute - see d3d12_interpreter_render.
   static bool InterpreterCanRun(const Shader& shader);
+  // Why the shaders it turned down were turned down - which restriction to
+  // lift next is not a guess if the reasons are counted apart.
+  static std::string GetInterpreterDeclineReport();
 
   void* GetReadySubstituteByHandle(void* handle);
   // The pixel shader a handle will actually execute with, so a draw taking a
@@ -737,6 +740,10 @@ class PipelineCache {
   // Parsed once at initialization - this is read per skipped draw.
   SubstituteMode substitute_mode_ = SubstituteMode::kOnce;
   SubstituteScope substitute_scope_ = SubstituteScope::kStrict;
+  static std::atomic<uint64_t> interpreter_declined_control_flow_;
+  static std::atomic<uint64_t> interpreter_declined_textures_;
+  static std::atomic<uint64_t> interpreter_declined_outputs_;
+  static std::atomic<uint64_t> interpreter_declined_length_;
   // Fields the driver can take from the command list, so pipelines are not
   // specialised for them - see d3d12_dynamic_pipeline_state.
   bool dynamic_depth_bias_ = false;

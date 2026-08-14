@@ -1664,6 +1664,21 @@ void PipelineCache::RunInterpreterProbe() {
       sizeof(shaders::microcode_interpreter_ps), ms);
 }
 
+std::atomic<uint64_t> PipelineCache::interpreter_declined_control_flow_{0};
+std::atomic<uint64_t> PipelineCache::interpreter_declined_textures_{0};
+std::atomic<uint64_t> PipelineCache::interpreter_declined_outputs_{0};
+std::atomic<uint64_t> PipelineCache::interpreter_declined_length_{0};
+
+std::string PipelineCache::GetInterpreterDeclineReport() {
+  return fmt::format(
+      "declined for control flow {}, for texture fetches {}, for kill/depth/"
+      "memexport {}, for length {}",
+      interpreter_declined_control_flow_.load(std::memory_order_relaxed),
+      interpreter_declined_textures_.load(std::memory_order_relaxed),
+      interpreter_declined_outputs_.load(std::memory_order_relaxed),
+      interpreter_declined_length_.load(std::memory_order_relaxed));
+}
+
 bool PipelineCache::InterpreterCanRun(const Shader& shader) {
   if (!cvars::d3d12_interpreter_render) {
     return false;
@@ -1678,17 +1693,24 @@ bool PipelineCache::InterpreterCanRun(const Shader& shader) {
   // because those leave through paths it does not carry. And a length the
   // shader's own loop bound can cover.
   if (!shader.label_addresses().empty()) {
+    interpreter_declined_control_flow_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   if (!shader.texture_bindings().empty()) {
+    interpreter_declined_textures_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   if (shader.kills_pixels() || shader.writes_depth() ||
       shader.memexport_eM_written()) {
+    interpreter_declined_outputs_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   size_t alu_instructions = shader.ucode_dword_count() / 3;
-  return alu_instructions > 0 && alu_instructions <= 512;
+  if (!alu_instructions || alu_instructions > 512) {
+    interpreter_declined_length_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  return true;
 }
 
 std::string PipelineCache::DescribeRenderState(
