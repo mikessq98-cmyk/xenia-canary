@@ -7,39 +7,53 @@
  ******************************************************************************
  */
 
-// A pixel shader that executes guest ALU microcode read from a buffer, instead
-// of being translated into one shader per material.
+// Executes guest pixel shader microcode read from guest memory, instead of
+// being translated into one host shader per material.
 //
-// The point is arithmetic, not elegance: this driver charges 358-808 ms to
-// compile a translated material and a title has hundreds of them, arriving
-// while the level streams in. One interpreter compiles once and covers all of
-// them. It pays for that with a loop and two switches per pixel, on a GPU
-// measured at 10-20% busy.
+// The arithmetic that justifies it: this driver charges 358-808 ms to compile a
+// translated material, a title has hundreds of them, and they arrive while a
+// level streams in. This compiles once - 19776 bytes, less than the smallest of
+// three titles' median materials - and covers all of them. It pays with a loop
+// and two switches per pixel, on a GPU measured at 10-20% busy.
 //
-// The instruction layout below is the real one from ucode.h - three dwords per
-// ALU instruction, with the fields in the order the hardware defines them.
-// Anything decoded wrongly here executes as garbage, so the bit positions are
-// the part to check first when the picture is wrong.
+// It is bound exactly like a translated pixel shader: the same constant
+// buffers at the same registers, the same shared memory raw SRV. That is what
+// lets it stand in for one inside a real draw rather than being a pass bolted
+// onto the frame - which is what took the device down twice when tried the
+// other way.
+//
+// The instruction layout is the one ucode.h defines. Anything decoded wrongly
+// here executes as garbage, so the bit positions are the first thing to check
+// when the picture is wrong.
 
-// Guest microcode dwords for the shader being interpreted.
-ByteAddressBuffer xe_microcode : register(t0);
-// Guest float constants, four floats each.
-ByteAddressBuffer xe_float_constants : register(t1);
-// Guest texture fetch constants - format, dimension, swizzle and signedness.
-ByteAddressBuffer xe_texture_fetch_constants : register(t3);
-Texture2DArray<float4> xe_texture : register(t2);
-SamplerState xe_sampler : register(s0);
-
-cbuffer XeInterpreterConstants : register(b0) {
-  uint xe_ucode_offset_dwords;
-  uint xe_ucode_alu_count;
-  uint xe_register_count;
-  uint xe_interpolator_count;
+// Constant buffers, matching DxbcShaderTranslator::CbufferRegister.
+cbuffer xe_system_constants : register(b0) {
+  uint4 xe_system_constants_data[64];
+};
+cbuffer xe_float_constants : register(b1) {
+  float4 xe_float_constants_data[256];
+};
+cbuffer xe_bool_loop_constants : register(b2) {
+  uint4 xe_bool_loop_constants_data[8];
+};
+cbuffer xe_fetch_constants : register(b3) {
+  uint4 xe_fetch_constants_data[48];
 };
 
-#define kXeMaxRegisters 64
+// Guest memory, at SRVMainRegister::kSharedMemory in SRVSpace::kMain. The
+// microcode is already in here - it is guest data - so nothing has to be
+// uploaded for the interpreter to read it.
+ByteAddressBuffer xe_shared_memory : register(t0, space0);
 
-// ---------------------------------------------------------------------------
+// Where in guest memory this draw's pixel shader microcode starts, and how
+// many ALU instructions to run. Passed through unused system constant slots so
+// no root signature change is needed.
+#define kXeUcodeAddressSlot 60
+#define kXeUcodeCountSlot 61
+
+#define kXeMaxRegisters 64
+#define kXeMaxAluInstructions 512
+
 // Vector opcodes, from AluVectorOpcode.
 #define kXeVectorAdd 0
 #define kXeVectorMul 1
@@ -61,10 +75,6 @@ cbuffer XeInterpreterConstants : register(b0) {
 #define kXeVectorDp2Add 17
 #define kXeVectorCube 18
 #define kXeVectorMax4 19
-#define kXeVectorSetpEqPush 20
-#define kXeVectorSetpNePush 21
-#define kXeVectorSetpGtPush 22
-#define kXeVectorSetpGePush 23
 #define kXeVectorKillEq 24
 #define kXeVectorKillGt 25
 #define kXeVectorKillGe 26
@@ -115,18 +125,11 @@ cbuffer XeInterpreterConstants : register(b0) {
 #define kXeScalarCos 49
 #define kXeScalarRetainPrev 50
 
-// ---------------------------------------------------------------------------
-
-// Component-relative swizzle: each 2-bit field is added to the component index
-// it applies to, which is how the guest encodes ".xyzw" as all zeroes.
+// Swizzles are component-relative: each two-bit field is added to the index of
+// the component it applies to, so all zeroes means .xyzw.
 float4 XeSwizzle(float4 v, uint swizzle) {
   return float4(v[((swizzle >> 0) + 0) & 3], v[((swizzle >> 2) + 1) & 3],
                 v[((swizzle >> 4) + 2) & 3], v[((swizzle >> 6) + 3) & 3]);
-}
-
-// A scalar source takes one component, selected the same way.
-float XeSwizzleScalar(float4 v, uint swizzle) {
-  return v[(swizzle >> 6) & 3];
 }
 
 float4 XeLoadSource(uint reg, uint swizzle, uint negate, uint from_temporary,
@@ -135,7 +138,7 @@ float4 XeLoadSource(uint reg, uint swizzle, uint negate, uint from_temporary,
   if (from_temporary) {
     value = regs[reg & (kXeMaxRegisters - 1)];
   } else {
-    value = asfloat(xe_float_constants.Load4((reg & 0xFF) << 4));
+    value = xe_float_constants_data[reg & 0xFF];
     if (absolute_constants) {
       value = abs(value);
     }
@@ -147,44 +150,25 @@ float4 XeLoadSource(uint reg, uint swizzle, uint negate, uint from_temporary,
 float4 XeExecuteVector(uint opcode, float4 src0, float4 src1, float4 src2,
                        inout bool kill) {
   switch (opcode) {
-    case kXeVectorAdd:
-      return src0 + src1;
-    case kXeVectorMul:
-      return src0 * src1;
-    case kXeVectorMax:
-      return max(src0, src1);
-    case kXeVectorMin:
-      return min(src0, src1);
-    case kXeVectorSeq:
-      return src0 == src1 ? 1.0 : 0.0;
-    case kXeVectorSgt:
-      return src0 > src1 ? 1.0 : 0.0;
-    case kXeVectorSge:
-      return src0 >= src1 ? 1.0 : 0.0;
-    case kXeVectorSne:
-      return src0 != src1 ? 1.0 : 0.0;
-    case kXeVectorFrc:
-      return frac(src0);
-    case kXeVectorTrunc:
-      return trunc(src0);
-    case kXeVectorFloor:
-      return floor(src0);
-    case kXeVectorMad:
-      return src0 * src1 + src2;
-    case kXeVectorCndEq:
-      return src0 == 0.0 ? src1 : src2;
-    case kXeVectorCndGe:
-      return src0 >= 0.0 ? src1 : src2;
-    case kXeVectorCndGt:
-      return src0 > 0.0 ? src1 : src2;
-    case kXeVectorDp4:
-      return dot(src0, src1);
-    case kXeVectorDp3:
-      return dot(src0.xyz, src1.xyz);
-    case kXeVectorDp2Add:
-      return dot(src0.xy, src1.xy) + src2.x;
+    case kXeVectorAdd: return src0 + src1;
+    case kXeVectorMul: return src0 * src1;
+    case kXeVectorMax: return max(src0, src1);
+    case kXeVectorMin: return min(src0, src1);
+    case kXeVectorSeq: return src0 == src1 ? 1.0 : 0.0;
+    case kXeVectorSgt: return src0 > src1 ? 1.0 : 0.0;
+    case kXeVectorSge: return src0 >= src1 ? 1.0 : 0.0;
+    case kXeVectorSne: return src0 != src1 ? 1.0 : 0.0;
+    case kXeVectorFrc: return frac(src0);
+    case kXeVectorTrunc: return trunc(src0);
+    case kXeVectorFloor: return floor(src0);
+    case kXeVectorMad: return src0 * src1 + src2;
+    case kXeVectorCndEq: return src0 == 0.0 ? src1 : src2;
+    case kXeVectorCndGe: return src0 >= 0.0 ? src1 : src2;
+    case kXeVectorCndGt: return src0 > 0.0 ? src1 : src2;
+    case kXeVectorDp4: return dot(src0, src1);
+    case kXeVectorDp3: return dot(src0.xyz, src1.xyz);
+    case kXeVectorDp2Add: return dot(src0.xy, src1.xy) + src2.x;
     case kXeVectorCube: {
-      // Cube map face selection: src0 is (z, y, x, ...) per the guest layout.
       float3 c = src0.zyx;
       float3 a = abs(c);
       float major = max(a.x, max(a.y, a.z));
@@ -202,127 +186,66 @@ float4 XeExecuteVector(uint opcode, float4 src0, float4 src1, float4 src2,
       }
       return float4(st.x, st.y, 2.0 * major, face);
     }
-    case kXeVectorMax4:
-      return max(max(src0.x, src0.y), max(src0.z, src0.w));
-    case kXeVectorKillEq:
-      kill = kill || any(src0 == src1);
-      return 0.0;
-    case kXeVectorKillGt:
-      kill = kill || any(src0 > src1);
-      return 0.0;
-    case kXeVectorKillGe:
-      kill = kill || any(src0 >= src1);
-      return 0.0;
-    case kXeVectorKillNe:
-      kill = kill || any(src0 != src1);
-      return 0.0;
-    case kXeVectorDst:
-      return float4(1.0, src0.y * src1.y, src0.z, src1.w);
-    case kXeVectorMaxA:
-      return max(src0, src1);
-    default:
-      return src0;
+    case kXeVectorMax4: return max(max(src0.x, src0.y), max(src0.z, src0.w));
+    case kXeVectorKillEq: kill = kill || any(src0 == src1); return 0.0;
+    case kXeVectorKillGt: kill = kill || any(src0 > src1); return 0.0;
+    case kXeVectorKillGe: kill = kill || any(src0 >= src1); return 0.0;
+    case kXeVectorKillNe: kill = kill || any(src0 != src1); return 0.0;
+    case kXeVectorDst: return float4(1.0, src0.y * src1.y, src0.z, src1.w);
+    case kXeVectorMaxA: return max(src0, src1);
+    default: return src0;
   }
 }
 
 float XeExecuteScalar(uint opcode, float a, float b, inout float previous,
                       inout bool kill) {
   switch (opcode) {
-    case kXeScalarAdds:
-      return a + b;
-    case kXeScalarAddsPrev:
-      return a + previous;
-    case kXeScalarMuls:
-      return a * b;
-    case kXeScalarMulsPrev:
-      return a * previous;
-    case kXeScalarMaxs:
-      return max(a, b);
-    case kXeScalarMins:
-      return min(a, b);
-    case kXeScalarSeqs:
-      return a == 0.0 ? 1.0 : 0.0;
-    case kXeScalarSgts:
-      return a > 0.0 ? 1.0 : 0.0;
-    case kXeScalarSges:
-      return a >= 0.0 ? 1.0 : 0.0;
-    case kXeScalarSnes:
-      return a != 0.0 ? 1.0 : 0.0;
-    case kXeScalarFrcs:
-      return frac(a);
-    case kXeScalarTruncs:
-      return trunc(a);
-    case kXeScalarFloors:
-      return floor(a);
-    case kXeScalarExp:
-      return exp2(a);
-    case kXeScalarLogc: {
-      float t = log2(a);
-      return isinf(t) ? -3.402823466e+38 : t;
-    }
-    case kXeScalarLog:
-      return log2(a);
-    case kXeScalarRcpc: {
-      float t = rcp(a);
-      return isinf(t) ? 3.402823466e+38 : t;
-    }
+    case kXeScalarAdds: return a + b;
+    case kXeScalarAddsPrev: return a + previous;
+    case kXeScalarMuls: return a * b;
+    case kXeScalarMulsPrev: return a * previous;
+    case kXeScalarMaxs: return max(a, b);
+    case kXeScalarMins: return min(a, b);
+    case kXeScalarSeqs: return a == 0.0 ? 1.0 : 0.0;
+    case kXeScalarSgts: return a > 0.0 ? 1.0 : 0.0;
+    case kXeScalarSges: return a >= 0.0 ? 1.0 : 0.0;
+    case kXeScalarSnes: return a != 0.0 ? 1.0 : 0.0;
+    case kXeScalarFrcs: return frac(a);
+    case kXeScalarTruncs: return trunc(a);
+    case kXeScalarFloors: return floor(a);
+    case kXeScalarExp: return exp2(a);
+    case kXeScalarLogc: { float t = log2(a); return isinf(t) ? -3.402823466e+38 : t; }
+    case kXeScalarLog: return log2(a);
+    case kXeScalarRcpc: { float t = rcp(a); return isinf(t) ? 3.402823466e+38 : t; }
     case kXeScalarRcpf:
-    case kXeScalarRcp:
-      return a == 0.0 ? 0.0 : rcp(a);
-    case kXeScalarRsqc: {
-      float t = rsqrt(a);
-      return isinf(t) ? 3.402823466e+38 : t;
-    }
+    case kXeScalarRcp: return a == 0.0 ? 0.0 : rcp(a);
+    case kXeScalarRsqc: { float t = rsqrt(a); return isinf(t) ? 3.402823466e+38 : t; }
     case kXeScalarRsqf:
-    case kXeScalarRsq:
-      return a <= 0.0 ? 0.0 : rsqrt(a);
+    case kXeScalarRsq: return a <= 0.0 ? 0.0 : rsqrt(a);
     case kXeScalarMaxAs:
-    case kXeScalarMaxAsf:
-      return max(a, b);
-    case kXeScalarSubs:
-      return a - b;
-    case kXeScalarSubsPrev:
-      return a - previous;
-    case kXeScalarKillsEq:
-      kill = kill || (a == 0.0);
-      return 0.0;
-    case kXeScalarKillsGt:
-      kill = kill || (a > 0.0);
-      return 0.0;
-    case kXeScalarKillsGe:
-      kill = kill || (a >= 0.0);
-      return 0.0;
-    case kXeScalarKillsNe:
-      kill = kill || (a != 0.0);
-      return 0.0;
-    case kXeScalarKillsOne:
-      kill = kill || (a == 1.0);
-      return 0.0;
-    case kXeScalarSqrt:
-      return sqrt(max(a, 0.0));
+    case kXeScalarMaxAsf: return max(a, b);
+    case kXeScalarSubs: return a - b;
+    case kXeScalarSubsPrev: return a - previous;
+    case kXeScalarKillsEq: kill = kill || (a == 0.0); return 0.0;
+    case kXeScalarKillsGt: kill = kill || (a > 0.0); return 0.0;
+    case kXeScalarKillsGe: kill = kill || (a >= 0.0); return 0.0;
+    case kXeScalarKillsNe: kill = kill || (a != 0.0); return 0.0;
+    case kXeScalarKillsOne: kill = kill || (a == 1.0); return 0.0;
+    case kXeScalarSqrt: return sqrt(max(a, 0.0));
     case kXeScalarMulsc0:
-    case kXeScalarMulsc1:
-      return a * b;
+    case kXeScalarMulsc1: return a * b;
     case kXeScalarAddsc0:
-    case kXeScalarAddsc1:
-      return a + b;
+    case kXeScalarAddsc1: return a + b;
     case kXeScalarSubsc0:
-    case kXeScalarSubsc1:
-      return a - b;
-    case kXeScalarSin:
-      return sin(a);
-    case kXeScalarCos:
-      return cos(a);
-    case kXeScalarRetainPrev:
-      return previous;
-    default:
-      return a;
+    case kXeScalarSubsc1: return a - b;
+    case kXeScalarSin: return sin(a);
+    case kXeScalarCos: return cos(a);
+    case kXeScalarRetainPrev: return previous;
+    default: return a;
   }
 }
 
 float4 main(float4 position : SV_Position) : SV_Target {
-  // The register file, indexed by values only known at run time - the cost
-  // this design trades a compilation for.
   float4 regs[kXeMaxRegisters];
   [unroll] for (uint init = 0; init < 4; ++init) {
     regs[init] = position * float(init + 1);
@@ -331,22 +254,24 @@ float4 main(float4 position : SV_Position) : SV_Target {
     regs[clear] = float4(0.0, 0.0, 0.0, 0.0);
   }
 
+  uint ucode_address = xe_system_constants_data[kXeUcodeAddressSlot].x;
+  // Bounded here as well as by the count that arrives: a loop whose limit
+  // comes from outside is a hung GPU and a lost device when it comes wrong,
+  // not a wrong picture.
+  uint alu_count =
+      min(xe_system_constants_data[kXeUcodeCountSlot].x, kXeMaxAluInstructions);
+
   float previous_scalar = 0.0;
   bool kill = false;
 
-  // Hard bound as well as the count. A loop whose limit arrives wrong is a
-  // hung GPU and a lost device, not a wrong picture - and the count comes from
-  // outside this shader.
-  uint alu_count = min(xe_ucode_alu_count, 512u);
   uint pc = 0;
   [loop] while (pc < alu_count) {
-    uint base = (xe_ucode_offset_dwords + pc * 3) << 2;
-    uint word0 = xe_microcode.Load(base);
-    uint word1 = xe_microcode.Load(base + 4);
-    uint word2 = xe_microcode.Load(base + 8);
+    uint base = ucode_address + pc * 12;
+    uint word0 = xe_shared_memory.Load(base);
+    uint word1 = xe_shared_memory.Load(base + 4);
+    uint word2 = xe_shared_memory.Load(base + 8);
     ++pc;
 
-    // Word 0, in the order ucode.h declares the bitfield.
     uint vector_dest = word0 & 0x3F;
     uint abs_constants = (word0 >> 7) & 1;
     uint scalar_dest = (word0 >> 8) & 0x3F;
@@ -357,7 +282,6 @@ float4 main(float4 position : SV_Position) : SV_Target {
     uint scalar_clamp = (word0 >> 25) & 1;
     uint scalar_opcode = (word0 >> 26) & 0x3F;
 
-    // Word 1.
     uint src3_swiz = word1 & 0xFF;
     uint src2_swiz = (word1 >> 8) & 0xFF;
     uint src1_swiz = (word1 >> 16) & 0xFF;
@@ -365,7 +289,6 @@ float4 main(float4 position : SV_Position) : SV_Target {
     uint src2_negate = (word1 >> 25) & 1;
     uint src1_negate = (word1 >> 26) & 1;
 
-    // Word 2.
     uint src3_reg = word2 & 0xFF;
     uint src2_reg = (word2 >> 8) & 0xFF;
     uint src1_reg = (word2 >> 16) & 0xFF;
@@ -381,24 +304,21 @@ float4 main(float4 position : SV_Position) : SV_Target {
     float4 src2 = XeLoadSource(src3_reg, src3_swiz, src3_negate, src3_sel,
                                abs_constants, regs);
 
-    float4 vector_result = XeExecuteVector(vector_opcode, src0, src1, src2, kill);
+    float4 vector_result =
+        XeExecuteVector(vector_opcode, src0, src1, src2, kill);
     if (vector_clamp) {
       vector_result = saturate(vector_result);
     }
 
-    // The scalar half takes its operand from the first source's selected
-    // component, and keeps a running "previous" the *_prev opcodes read.
-    float scalar_a = XeSwizzleScalar(src0, src1_swiz);
-    float scalar_b = XeSwizzleScalar(src1, src2_swiz);
-    float scalar_result =
-        XeExecuteScalar(scalar_opcode, scalar_a, scalar_b, previous_scalar, kill);
+    float scalar_a = src0[(src1_swiz >> 6) & 3];
+    float scalar_b = src1[(src2_swiz >> 6) & 3];
+    float scalar_result = XeExecuteScalar(scalar_opcode, scalar_a, scalar_b,
+                                          previous_scalar, kill);
     if (scalar_clamp) {
       scalar_result = saturate(scalar_result);
     }
     previous_scalar = scalar_result;
 
-    // Exports write both halves to the vector destination; otherwise each half
-    // writes its own register.
     uint vd = vector_dest & (kXeMaxRegisters - 1);
     float4 v = regs[vd];
     v.x = (vector_write_mask & 1) ? vector_result.x : v.x;
@@ -420,55 +340,10 @@ float4 main(float4 position : SV_Position) : SV_Target {
     discard;
   }
 
-  // The texture path. This is the part the translator spends 62% of its output
-  // on - 2516 bytes and 63 instructions per fetch, because format, signedness,
-  // swizzle and filtering all come from the fetch constants at run time. An
-  // interpreter pays it ONCE instead of once per fetch in every shader, which
-  // is the whole argument for it, so the cost has to be in the measurement.
-  uint4 fetch_words = xe_texture_fetch_constants.Load4(0);
-  uint dimension = (fetch_words.z >> 9) & 3;
-  uint num_format = (fetch_words.w >> 15) & 1;
-  uint swizzle = (fetch_words.w >> 16) & 0xFFF;
-  uint signs = (fetch_words.x >> 2) & 0xFF;
-
-  float3 coordinates = float3(saturate(regs[0].xy), 0.0);
-  if (dimension == 2) {
-    coordinates.z = saturate(regs[0].z) * 5.0;
-  }
-
-  float4 sampled = xe_texture.SampleLevel(xe_sampler, coordinates, 0.0);
-
-  // Per-component sign handling: unsigned, signed, or biased.
-  float4 converted;
-  [unroll] for (uint c = 0; c < 4; ++c) {
-    uint component_sign = (signs >> (c * 2)) & 3;
-    float v = sampled[c];
-    if (component_sign == 1) {
-      v = v * 2.0 - 1.0;
-    } else if (component_sign == 2) {
-      v = v - 0.5;
-    }
-    converted[c] = v;
-  }
-
-  // Integer formats are delivered normalized and have to be scaled back.
-  if (num_format == 1) {
-    converted *= 255.0;
-  }
-
-  // Destination swizzle, three bits per component, with the constant sources
-  // the guest encoding allows.
-  float4 swizzled;
-  [unroll] for (uint s = 0; s < 4; ++s) {
-    uint selector = (swizzle >> (s * 3)) & 7;
-    if (selector == 4) {
-      swizzled[s] = 0.0;
-    } else if (selector == 5) {
-      swizzled[s] = 1.0;
-    } else {
-      swizzled[s] = converted[selector & 3];
-    }
-  }
-
-  return regs[1] * swizzled;
+  // No texture sampling yet, deliberately. Reading a bindless descriptor that
+  // the draw did not fill in is a page fault at VA 0 and a lost device on this
+  // driver, and that failure has already been paid for twice today. Colour
+  // comes from the interpreted arithmetic alone, so a first run says whether
+  // the ALU path is right without being able to die on descriptors.
+  return regs[0];
 }

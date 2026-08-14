@@ -119,24 +119,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint64_t GetCurrentSubmission() const {
     return completion_timeline_->GetUpcomingSubmission();
   }
-  // Draws one full-screen pass with the microcode interpreter over a real
-  // guest pixel shader, to price what it costs per pixel. Nothing the game
-  // draws goes through it - see d3d12_interpreter_render.
-  void DrawInterpreterMeasurementPass(const D3D12Shader* pixel_shader);
-  bool EnsureInterpreterPipeline();
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> interpreter_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> interpreter_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> interpreter_microcode_buffer_;
-  uint64_t interpreter_microcode_hash_ = 0;
-  uint32_t interpreter_microcode_dwords_ = 0;
-  uint32_t interpreter_microcode_buffer_bytes_ = 0;
-  uint64_t interpreter_passes_ = 0;
-  uint64_t interpreter_passes_frame_ = UINT64_MAX;
-  // The largest guest pixel shader seen, so the pass prices a real material
-  // rather than whatever the frame happened to start with.
-  const D3D12Shader* interpreter_largest_shader_ = nullptr;
-  uint32_t interpreter_largest_dwords_ = 0;
-  bool interpreter_unavailable_ = false;
+  // How many draws ran on the interpreter instead of a translated shader.
+  uint64_t interpreter_draws_ = 0;
+  uint64_t interpreter_draws_declined_ = 0;
 
   // Sampled by the texture cache around its driver calls - see GpuCensus.
   uint32_t GetPipelinesBeingCreated();

@@ -51,16 +51,13 @@ DEFINE_bool(
     "whether an interpreter can replace hundreds of translated materials: the "
     "frame rate with this on against off is its per-pixel price, at the same "
     "1280x720 the guest renders at. The GPU sits at 10-20% busy, so there is "
-    "roughly a fivefold margin to fit into.",
-    "D3D12");
-DEFINE_int32(
-    d3d12_interpreter_render_passes, 1,
-    "How many full-screen interpreter passes to draw per frame when "
-    "d3d12_interpreter_render is on.\n"
-    "One pass gives a number, several give a slope - and the slope is what says "
-    "how the cost scales, which is what matters because a real scene shades far "
-    "more than one screen of pixels. Measure at 1, 4 and 16 and the per-pass "
-    "price falls out of the differences.",
+    "roughly a fivefold margin to fit into.\n"
+    "EXPERIMENTAL AND THE PICTURE WILL BE WRONG. Colour comes from the "
+    "interpreted arithmetic alone - no texture is sampled, because reading a "
+    "bindless descriptor the draw did not fill in is a lost device on this "
+    "driver. Control flow is not interpreted either, so only shaders that are "
+    "one straight run of ALU instructions are handed over; everything else "
+    "still uses its translated shader.",
     "D3D12");
 DEFINE_bool(d3d12_bindless, true,
             "Use bindless resources where available - may improve performance, "
@@ -656,15 +653,11 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   }
   if (cvars::d3d12_interpreter_render) {
     XELOGI(
-        "[MEM] interpreter: {} full-screen passes ({} per frame) over guest "
-        "shader {:016X} - {} microcode dwords, {} ALU instructions, against a "
-        "median material of 276 and 92. Compare the frame rate with a run at "
-        "d3d12_interpreter_render off, and vary "
-        "d3d12_interpreter_render_passes for the slope.",
-        interpreter_passes_,
-        std::max(cvars::d3d12_interpreter_render_passes, 1),
-        interpreter_microcode_hash_, interpreter_microcode_dwords_,
-        interpreter_microcode_dwords_ / 3);
+        "[MEM] interpreter: {} draws executed by it, {} declined (too many "
+        "instructions, or no microcode address). Compare the frame rate with a "
+        "run at d3d12_interpreter_render off - that difference is what one "
+        "compiled shader per hundreds of materials costs per pixel.",
+        interpreter_draws_, interpreter_draws_declined_);
     // Written every report rather than only at shutdown: the sessions worth
     // reading the tables for are the ones that end in a device loss or with
     // the system terminating the app, and neither reaches a shutdown path.
@@ -3658,177 +3651,6 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
   }
 }
 
-bool D3D12CommandProcessor::EnsureInterpreterPipeline() {
-  if (interpreter_pipeline_) {
-    return true;
-  }
-  if (interpreter_unavailable_) {
-    return false;
-  }
-  interpreter_unavailable_ = true;
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-
-  D3D12_DESCRIPTOR_RANGE srv_range = {};
-  srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  srv_range.NumDescriptors = 4;
-  srv_range.BaseShaderRegister = 0;
-  D3D12_ROOT_PARAMETER root_parameters[2] = {};
-  root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
-  root_parameters[0].DescriptorTable.pDescriptorRanges = &srv_range;
-  root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  root_parameters[1].Constants.ShaderRegister = 0;
-  root_parameters[1].Constants.Num32BitValues = 4;
-  root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  D3D12_STATIC_SAMPLER_DESC sampler = {};
-  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler.MaxLOD = D3D12_FLOAT32_MAX;
-  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
-  root_signature_desc.NumParameters = 2;
-  root_signature_desc.pParameters = root_parameters;
-  root_signature_desc.NumStaticSamplers = 1;
-  root_signature_desc.pStaticSamplers = &sampler;
-  interpreter_root_signature_.Attach(
-      ui::d3d12::util::CreateRootSignature(provider, root_signature_desc));
-  if (!interpreter_root_signature_) {
-    XELOGW("Interpreter pass: no root signature, measurement disabled");
-    return false;
-  }
-
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-  desc.pRootSignature = interpreter_root_signature_.Get();
-  desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
-  desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
-  desc.PS.pShaderBytecode = shaders::microcode_interpreter_ps;
-  desc.PS.BytecodeLength = sizeof(shaders::microcode_interpreter_ps);
-  // Nothing of the frame is disturbed: the pass runs with no render target and
-  // no depth, so it shades pixels and discards them. The cost is real, the
-  // output is not.
-  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
-  desc.SampleMask = UINT_MAX;
-  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  desc.NumRenderTargets = 0;
-  desc.SampleDesc.Count = 1;
-  if (FAILED(device->CreateGraphicsPipelineState(
-          &desc, IID_PPV_ARGS(&interpreter_pipeline_)))) {
-    XELOGW("Interpreter pass: no pipeline, measurement disabled");
-    return false;
-  }
-  interpreter_unavailable_ = false;
-  return true;
-}
-
-void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
-    const D3D12Shader* pixel_shader) {
-  if (!cvars::d3d12_interpreter_render || !pixel_shader) {
-    return;
-  }
-  const std::vector<uint32_t>& ucode = pixel_shader->ucode_data();
-  if (ucode.empty() || !EnsureInterpreterPipeline()) {
-    return;
-  }
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-
-  // Upload this shader's microcode once and keep it until another shader is
-  // chosen - the pass is a measurement, not a streaming path.
-  if (interpreter_microcode_hash_ != pixel_shader->ucode_data_hash()) {
-    // Padded well past what the shader can address: the interpreter reads
-    // constants by a register index up to 255, which is 4096 bytes, and a
-    // microcode buffer of a few hundred bytes bound to those slots was an
-    // out-of-bounds read on every instruction.
-    uint32_t used_bytes = uint32_t(ucode.size() * sizeof(uint32_t));
-    uint32_t size_bytes = std::max(used_bytes, 8192u);
-    D3D12_RESOURCE_DESC buffer_desc;
-    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size_bytes,
-                                            D3D12_RESOURCE_FLAG_NONE);
-    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    if (!provider.CreateUploadResource(provider.GetHeapFlagCreateNotZeroed(),
-                                       &buffer_desc,
-                                       D3D12_RESOURCE_STATE_GENERIC_READ,
-                                       IID_PPV_ARGS(&buffer))) {
-      interpreter_unavailable_ = true;
-      return;
-    }
-    void* mapping = nullptr;
-    D3D12_RANGE read_range = {};
-    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
-      interpreter_unavailable_ = true;
-      return;
-    }
-    std::memset(mapping, 0, size_bytes);
-    std::memcpy(mapping, ucode.data(), used_bytes);
-    buffer->Unmap(0, nullptr);
-    interpreter_microcode_buffer_ = buffer;
-    interpreter_microcode_hash_ = pixel_shader->ucode_data_hash();
-    interpreter_microcode_dwords_ = uint32_t(ucode.size());
-    interpreter_microcode_buffer_bytes_ = size_bytes;
-  }
-  if (!interpreter_microcode_buffer_) {
-    return;
-  }
-
-  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[4];
-  if (!RequestOneUseSingleViewDescriptors(4, descriptors)) {
-    return;
-  }
-  // Microcode, guest float constants, one texture, fetch constants. The last
-  // three are the interpreter's own view of state it would otherwise take from
-  // the draw; for pricing the shading they only have to be valid.
-  ui::d3d12::util::CreateBufferRawSRV(device, descriptors[0].first,
-                                      interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_buffer_bytes_);
-  ui::d3d12::util::CreateBufferRawSRV(device, descriptors[1].first,
-                                      interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_buffer_bytes_);
-  D3D12_SHADER_RESOURCE_VIEW_DESC texture_srv_desc = {};
-  texture_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  texture_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-  texture_srv_desc.Shader4ComponentMapping =
-      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  texture_srv_desc.Texture2DArray.MipLevels = 1;
-  texture_srv_desc.Texture2DArray.ArraySize = 1;
-  device->CreateShaderResourceView(nullptr, &texture_srv_desc,
-                                   descriptors[2].first);
-  ui::d3d12::util::CreateBufferRawSRV(device, descriptors[3].first,
-                                      interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_buffer_bytes_);
-
-  SetExternalPipeline(interpreter_pipeline_.Get());
-  deferred_command_list_.D3DSetGraphicsRootSignature(
-      interpreter_root_signature_.Get());
-  deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
-      0, descriptors[0].second);
-  // Three dwords per ALU instruction, so this is how many the loop runs.
-  uint32_t constants[4] = {0, interpreter_microcode_dwords_ / 3, 64, 4};
-  deferred_command_list_.D3DSetGraphicsRoot32BitConstants(1, 4, constants, 0);
-  deferred_command_list_.D3DIASetPrimitiveTopology(
-      D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  SubmitBarriers();
-  // Drawn more than once on request: one pass gives a number, several give a
-  // slope, and the slope is what says how the cost scales with the overdraw a
-  // real scene has.
-  uint32_t pass_count =
-      uint32_t(std::max(cvars::d3d12_interpreter_render_passes, 1));
-  for (uint32_t pass = 0; pass < pass_count; ++pass) {
-    deferred_command_list_.D3DDrawInstanced(3, 1, 0, 0);
-  }
-  interpreter_passes_ += pass_count;
-  // The pipeline and root signature are external now - make the next guest
-  // draw rebind its own.
-  current_guest_pipeline_ = nullptr;
-  current_graphics_root_signature_ = nullptr;
-  current_graphics_root_up_to_date_ = 0;
-}
-
 uint32_t D3D12CommandProcessor::GetPipelinesBeingCreated() {
   return pipeline_cache_ ? pipeline_cache_->GetPipelinesBeingCreated() : 0;
 }
@@ -4610,19 +4432,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // never been proven to survive execution. The last is the common one and
   // costs a synchronization per DISTINCT pair - once per game, not per draw.
   draws_issued_.fetch_add(1, std::memory_order_relaxed);
-  // One measurement pass per frame, over whichever real pixel shader the first
-  // eligible draw of that frame uses. The frame rate with it against without
-  // it is the interpreter's per-pixel cost - the last unmeasured term.
-  if (cvars::d3d12_interpreter_render && pixel_shader) {
-    // Only remembered here. The pass itself does NOT run inside a guest draw:
-    // injecting it there left the pipeline's zero render targets against the
-    // guest's bound ones, which D3D12 leaves undefined, and it took the device
-    // down with DXGI_ERROR_DEVICE_HUNG twice.
-    if (pixel_shader->ucode_data().size() > interpreter_largest_dwords_) {
-      interpreter_largest_dwords_ = uint32_t(pixel_shader->ucode_data().size());
-      interpreter_largest_shader_ = pixel_shader;
-    }
-  }
   GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);
   uint64_t draw_state_key =
       pipeline_cache_->GetPipelineStateKeyByHandle(pipeline_handle);
