@@ -53,6 +53,15 @@ DEFINE_bool(
     "1280x720 the guest renders at. The GPU sits at 10-20% busy, so there is "
     "roughly a fivefold margin to fit into.",
     "D3D12");
+DEFINE_int32(
+    d3d12_interpreter_render_passes, 1,
+    "How many full-screen interpreter passes to draw per frame when "
+    "d3d12_interpreter_render is on.\n"
+    "One pass gives a number, several give a slope - and the slope is what says "
+    "how the cost scales, which is what matters because a real scene shades far "
+    "more than one screen of pixels. Measure at 1, 4 and 16 and the per-pass "
+    "price falls out of the differences.",
+    "D3D12");
 DEFINE_bool(d3d12_bindless, true,
             "Use bindless resources where available - may improve performance, "
             "but may make debugging more complicated.",
@@ -647,11 +656,15 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
   }
   if (cvars::d3d12_interpreter_render) {
     XELOGI(
-        "[MEM] interpreter: {} full-screen passes drawn over guest shader "
-        "{:016X} ({} microcode dwords, {} ALU instructions) - compare this "
-        "session's frame rate against one with d3d12_interpreter_render off",
-        interpreter_passes_, interpreter_microcode_hash_,
-        interpreter_microcode_dwords_, interpreter_microcode_dwords_ / 3);
+        "[MEM] interpreter: {} full-screen passes ({} per frame) over guest "
+        "shader {:016X} - {} microcode dwords, {} ALU instructions, against a "
+        "median material of 276 and 92. Compare the frame rate with a run at "
+        "d3d12_interpreter_render off, and vary "
+        "d3d12_interpreter_render_passes for the slope.",
+        interpreter_passes_,
+        std::max(cvars::d3d12_interpreter_render_passes, 1),
+        interpreter_microcode_hash_, interpreter_microcode_dwords_,
+        interpreter_microcode_dwords_ / 3);
     // Written every report rather than only at shutdown: the sessions worth
     // reading the tables for are the ones that end in a device loss or with
     // the system terminating the app, and neither reaches a shutdown path.
@@ -3793,8 +3806,15 @@ void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
   deferred_command_list_.D3DIASetPrimitiveTopology(
       D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   SubmitBarriers();
-  deferred_command_list_.D3DDrawInstanced(3, 1, 0, 0);
-  ++interpreter_passes_;
+  // Drawn more than once on request: one pass gives a number, several give a
+  // slope, and the slope is what says how the cost scales with the overdraw a
+  // real scene has.
+  uint32_t pass_count =
+      uint32_t(std::max(cvars::d3d12_interpreter_render_passes, 1));
+  for (uint32_t pass = 0; pass < pass_count; ++pass) {
+    deferred_command_list_.D3DDrawInstanced(3, 1, 0, 0);
+  }
+  interpreter_passes_ += pass_count;
   // The pipeline and root signature are external now - make the next guest
   // draw rebind its own.
   current_guest_pipeline_ = nullptr;
@@ -4586,10 +4606,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // One measurement pass per frame, over whichever real pixel shader the first
   // eligible draw of that frame uses. The frame rate with it against without
   // it is the interpreter's per-pixel cost - the last unmeasured term.
-  if (cvars::d3d12_interpreter_render && frame_open_ &&
-      interpreter_passes_frame_ != frame_current_) {
-    interpreter_passes_frame_ = frame_current_;
-    DrawInterpreterMeasurementPass(pixel_shader);
+  if (cvars::d3d12_interpreter_render && pixel_shader) {
+    // The BIGGEST shader seen, not the first of the frame. The first draw of a
+    // frame is a clear or a UI quad - the first measurement ran three
+    // instructions where the median material has ninety-two, and a loop that
+    // short prices nothing.
+    if (pixel_shader->ucode_data().size() > interpreter_largest_dwords_) {
+      interpreter_largest_dwords_ = uint32_t(pixel_shader->ucode_data().size());
+      interpreter_largest_shader_ = pixel_shader;
+    }
+    if (frame_open_ && interpreter_passes_frame_ != frame_current_ &&
+        interpreter_largest_shader_) {
+      interpreter_passes_frame_ = frame_current_;
+      DrawInterpreterMeasurementPass(interpreter_largest_shader_);
+    }
   }
   GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);
   uint64_t draw_state_key =

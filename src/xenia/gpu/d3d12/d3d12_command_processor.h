@@ -131,6 +131,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   uint32_t interpreter_microcode_dwords_ = 0;
   uint64_t interpreter_passes_ = 0;
   uint64_t interpreter_passes_frame_ = UINT64_MAX;
+  // The largest guest pixel shader seen, so the pass prices a real material
+  // rather than whatever the frame happened to start with.
+  const D3D12Shader* interpreter_largest_shader_ = nullptr;
+  uint32_t interpreter_largest_dwords_ = 0;
   bool interpreter_unavailable_ = false;
 
   // Sampled by the texture cache around its driver calls - see GpuCensus.
