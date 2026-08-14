@@ -7,33 +7,28 @@
  ******************************************************************************
  */
 
-// FEASIBILITY PROBE, not a rendering path. Nothing binds this yet.
+// A pixel shader that executes guest ALU microcode read from a buffer, instead
+// of being translated into one shader per material.
 //
-// It exists to answer three questions that decide whether a GPU microcode
-// interpreter is worth months of work, and it answers them at BUILD time,
-// on the build machine, without a console:
-//   - how big is the DXBC of a shader that decodes and executes guest ALU
-//     microcode at runtime, against the 23-62 KB of a translated material;
-//   - does it compile at all, given the register file has to be a dynamically
-//     indexed array;
-//   - what shape does the dispatch take - one switch over 30 vector and 50
-//     scalar opcodes.
+// The point is arithmetic, not elegance: this driver charges 358-808 ms to
+// compile a translated material and a title has hundreds of them, arriving
+// while the level streams in. One interpreter compiles once and covers all of
+// them. It pays for that with a loop and two switches per pixel, on a GPU
+// measured at 10-20% busy.
 //
-// The structure is what matters for those answers, so the expensive parts are
-// real: the indexable register file, the operand fetch with swizzle and
-// modifiers, the full vector opcode switch, and the common scalar ones. The
-// texture path is a single generic sample rather than the full format decode -
-// that part would be shared with the existing translator either way.
+// The instruction layout below is the real one from ucode.h - three dwords per
+// ALU instruction, with the fields in the order the hardware defines them.
+// Anything decoded wrongly here executes as garbage, so the bit positions are
+// the part to check first when the picture is wrong.
 
-// Guest microcode, as uint dwords.
+// Guest microcode dwords for the shader being interpreted.
 ByteAddressBuffer xe_microcode : register(t0);
-// Guest float constants.
+// Guest float constants, four floats each.
 ByteAddressBuffer xe_float_constants : register(t1);
 Texture2DArray<float4> xe_texture : register(t2);
 SamplerState xe_sampler : register(s0);
 
 cbuffer XeInterpreterConstants : register(b0) {
-  // Where this shader's microcode starts, and how many instruction pairs.
   uint xe_ucode_offset_dwords;
   uint xe_ucode_alu_count;
   uint xe_register_count;
@@ -42,32 +37,290 @@ cbuffer XeInterpreterConstants : register(b0) {
 
 #define kXeMaxRegisters 64
 
-// A guest ALU instruction is two 32-bit words for the vector half and one more
-// for the scalar half plus operand encoding; the probe reads three dwords and
-// decodes the fields the real thing would.
-struct XeAluWords {
-  uint w0;
-  uint w1;
-  uint w2;
-};
+// ---------------------------------------------------------------------------
+// Vector opcodes, from AluVectorOpcode.
+#define kXeVectorAdd 0
+#define kXeVectorMul 1
+#define kXeVectorMax 2
+#define kXeVectorMin 3
+#define kXeVectorSeq 4
+#define kXeVectorSgt 5
+#define kXeVectorSge 6
+#define kXeVectorSne 7
+#define kXeVectorFrc 8
+#define kXeVectorTrunc 9
+#define kXeVectorFloor 10
+#define kXeVectorMad 11
+#define kXeVectorCndEq 12
+#define kXeVectorCndGe 13
+#define kXeVectorCndGt 14
+#define kXeVectorDp4 15
+#define kXeVectorDp3 16
+#define kXeVectorDp2Add 17
+#define kXeVectorCube 18
+#define kXeVectorMax4 19
+#define kXeVectorSetpEqPush 20
+#define kXeVectorSetpNePush 21
+#define kXeVectorSetpGtPush 22
+#define kXeVectorSetpGePush 23
+#define kXeVectorKillEq 24
+#define kXeVectorKillGt 25
+#define kXeVectorKillGe 26
+#define kXeVectorKillNe 27
+#define kXeVectorDst 28
+#define kXeVectorMaxA 29
 
-float4 XeApplyModifiers(float4 v, uint negate, uint absolute) {
-  v = absolute ? abs(v) : v;
-  return negate ? -v : v;
-}
+// Scalar opcodes, from AluScalarOpcode.
+#define kXeScalarAdds 0
+#define kXeScalarAddsPrev 1
+#define kXeScalarMuls 2
+#define kXeScalarMulsPrev 3
+#define kXeScalarMaxs 5
+#define kXeScalarMins 6
+#define kXeScalarSeqs 7
+#define kXeScalarSgts 8
+#define kXeScalarSges 9
+#define kXeScalarSnes 10
+#define kXeScalarFrcs 11
+#define kXeScalarTruncs 12
+#define kXeScalarFloors 13
+#define kXeScalarExp 14
+#define kXeScalarLogc 15
+#define kXeScalarLog 16
+#define kXeScalarRcpc 17
+#define kXeScalarRcpf 18
+#define kXeScalarRcp 19
+#define kXeScalarRsqc 20
+#define kXeScalarRsqf 21
+#define kXeScalarRsq 22
+#define kXeScalarMaxAs 23
+#define kXeScalarMaxAsf 24
+#define kXeScalarSubs 25
+#define kXeScalarSubsPrev 26
+#define kXeScalarKillsEq 35
+#define kXeScalarKillsGt 36
+#define kXeScalarKillsGe 37
+#define kXeScalarKillsNe 38
+#define kXeScalarKillsOne 39
+#define kXeScalarSqrt 40
+#define kXeScalarMulsc0 42
+#define kXeScalarMulsc1 43
+#define kXeScalarAddsc0 44
+#define kXeScalarAddsc1 45
+#define kXeScalarSubsc0 46
+#define kXeScalarSubsc1 47
+#define kXeScalarSin 48
+#define kXeScalarCos 49
+#define kXeScalarRetainPrev 50
 
+// ---------------------------------------------------------------------------
+
+// Component-relative swizzle: each 2-bit field is added to the component index
+// it applies to, which is how the guest encodes ".xyzw" as all zeroes.
 float4 XeSwizzle(float4 v, uint swizzle) {
-  return float4(v[(swizzle >> 0) & 3], v[(swizzle >> 2) & 3],
-                v[(swizzle >> 4) & 3], v[(swizzle >> 6) & 3]);
+  return float4(v[((swizzle >> 0) + 0) & 3], v[((swizzle >> 2) + 1) & 3],
+                v[((swizzle >> 4) + 2) & 3], v[((swizzle >> 6) + 3) & 3]);
 }
 
-// Only SV_Position, so this pairs with the fullscreen vertex shader the probe
-// is created with. A real interpreter takes interpolators; seeding the first
-// registers from the position instead costs the same four writes and keeps the
-// loop from being folded away, which is all this probe needs of them.
+// A scalar source takes one component, selected the same way.
+float XeSwizzleScalar(float4 v, uint swizzle) {
+  return v[(swizzle >> 6) & 3];
+}
+
+float4 XeLoadSource(uint reg, uint swizzle, uint negate, uint from_temporary,
+                    uint absolute_constants, float4 regs[kXeMaxRegisters]) {
+  float4 value;
+  if (from_temporary) {
+    value = regs[reg & (kXeMaxRegisters - 1)];
+  } else {
+    value = asfloat(xe_float_constants.Load4((reg & 0xFF) << 4));
+    if (absolute_constants) {
+      value = abs(value);
+    }
+  }
+  value = XeSwizzle(value, swizzle);
+  return negate ? -value : value;
+}
+
+float4 XeExecuteVector(uint opcode, float4 src0, float4 src1, float4 src2,
+                       inout bool kill) {
+  switch (opcode) {
+    case kXeVectorAdd:
+      return src0 + src1;
+    case kXeVectorMul:
+      return src0 * src1;
+    case kXeVectorMax:
+      return max(src0, src1);
+    case kXeVectorMin:
+      return min(src0, src1);
+    case kXeVectorSeq:
+      return src0 == src1 ? 1.0 : 0.0;
+    case kXeVectorSgt:
+      return src0 > src1 ? 1.0 : 0.0;
+    case kXeVectorSge:
+      return src0 >= src1 ? 1.0 : 0.0;
+    case kXeVectorSne:
+      return src0 != src1 ? 1.0 : 0.0;
+    case kXeVectorFrc:
+      return frac(src0);
+    case kXeVectorTrunc:
+      return trunc(src0);
+    case kXeVectorFloor:
+      return floor(src0);
+    case kXeVectorMad:
+      return src0 * src1 + src2;
+    case kXeVectorCndEq:
+      return src0 == 0.0 ? src1 : src2;
+    case kXeVectorCndGe:
+      return src0 >= 0.0 ? src1 : src2;
+    case kXeVectorCndGt:
+      return src0 > 0.0 ? src1 : src2;
+    case kXeVectorDp4:
+      return dot(src0, src1);
+    case kXeVectorDp3:
+      return dot(src0.xyz, src1.xyz);
+    case kXeVectorDp2Add:
+      return dot(src0.xy, src1.xy) + src2.x;
+    case kXeVectorCube: {
+      // Cube map face selection: src0 is (z, y, x, ...) per the guest layout.
+      float3 c = src0.zyx;
+      float3 a = abs(c);
+      float major = max(a.x, max(a.y, a.z));
+      float2 st;
+      float face;
+      if (a.x >= a.y && a.x >= a.z) {
+        st = float2(c.z, -c.y) * (c.x >= 0.0 ? 1.0 : -1.0);
+        face = c.x >= 0.0 ? 0.0 : 1.0;
+      } else if (a.y >= a.z) {
+        st = float2(c.x, c.z) * (c.y >= 0.0 ? 1.0 : -1.0);
+        face = c.y >= 0.0 ? 2.0 : 3.0;
+      } else {
+        st = float2(c.x, -c.y) * (c.z >= 0.0 ? 1.0 : -1.0);
+        face = c.z >= 0.0 ? 4.0 : 5.0;
+      }
+      return float4(st.x, st.y, 2.0 * major, face);
+    }
+    case kXeVectorMax4:
+      return max(max(src0.x, src0.y), max(src0.z, src0.w));
+    case kXeVectorKillEq:
+      kill = kill || any(src0 == src1);
+      return 0.0;
+    case kXeVectorKillGt:
+      kill = kill || any(src0 > src1);
+      return 0.0;
+    case kXeVectorKillGe:
+      kill = kill || any(src0 >= src1);
+      return 0.0;
+    case kXeVectorKillNe:
+      kill = kill || any(src0 != src1);
+      return 0.0;
+    case kXeVectorDst:
+      return float4(1.0, src0.y * src1.y, src0.z, src1.w);
+    case kXeVectorMaxA:
+      return max(src0, src1);
+    default:
+      return src0;
+  }
+}
+
+float XeExecuteScalar(uint opcode, float a, float b, inout float previous,
+                      inout bool kill) {
+  switch (opcode) {
+    case kXeScalarAdds:
+      return a + b;
+    case kXeScalarAddsPrev:
+      return a + previous;
+    case kXeScalarMuls:
+      return a * b;
+    case kXeScalarMulsPrev:
+      return a * previous;
+    case kXeScalarMaxs:
+      return max(a, b);
+    case kXeScalarMins:
+      return min(a, b);
+    case kXeScalarSeqs:
+      return a == 0.0 ? 1.0 : 0.0;
+    case kXeScalarSgts:
+      return a > 0.0 ? 1.0 : 0.0;
+    case kXeScalarSges:
+      return a >= 0.0 ? 1.0 : 0.0;
+    case kXeScalarSnes:
+      return a != 0.0 ? 1.0 : 0.0;
+    case kXeScalarFrcs:
+      return frac(a);
+    case kXeScalarTruncs:
+      return trunc(a);
+    case kXeScalarFloors:
+      return floor(a);
+    case kXeScalarExp:
+      return exp2(a);
+    case kXeScalarLogc: {
+      float t = log2(a);
+      return isinf(t) ? -3.402823466e+38 : t;
+    }
+    case kXeScalarLog:
+      return log2(a);
+    case kXeScalarRcpc: {
+      float t = rcp(a);
+      return isinf(t) ? 3.402823466e+38 : t;
+    }
+    case kXeScalarRcpf:
+    case kXeScalarRcp:
+      return a == 0.0 ? 0.0 : rcp(a);
+    case kXeScalarRsqc: {
+      float t = rsqrt(a);
+      return isinf(t) ? 3.402823466e+38 : t;
+    }
+    case kXeScalarRsqf:
+    case kXeScalarRsq:
+      return a <= 0.0 ? 0.0 : rsqrt(a);
+    case kXeScalarMaxAs:
+    case kXeScalarMaxAsf:
+      return max(a, b);
+    case kXeScalarSubs:
+      return a - b;
+    case kXeScalarSubsPrev:
+      return a - previous;
+    case kXeScalarKillsEq:
+      kill = kill || (a == 0.0);
+      return 0.0;
+    case kXeScalarKillsGt:
+      kill = kill || (a > 0.0);
+      return 0.0;
+    case kXeScalarKillsGe:
+      kill = kill || (a >= 0.0);
+      return 0.0;
+    case kXeScalarKillsNe:
+      kill = kill || (a != 0.0);
+      return 0.0;
+    case kXeScalarKillsOne:
+      kill = kill || (a == 1.0);
+      return 0.0;
+    case kXeScalarSqrt:
+      return sqrt(max(a, 0.0));
+    case kXeScalarMulsc0:
+    case kXeScalarMulsc1:
+      return a * b;
+    case kXeScalarAddsc0:
+    case kXeScalarAddsc1:
+      return a + b;
+    case kXeScalarSubsc0:
+    case kXeScalarSubsc1:
+      return a - b;
+    case kXeScalarSin:
+      return sin(a);
+    case kXeScalarCos:
+      return cos(a);
+    case kXeScalarRetainPrev:
+      return previous;
+    default:
+      return a;
+  }
+}
+
 float4 main(float4 position : SV_Position) : SV_Target {
-  // The register file. Dynamically indexed, which is the structural cost this
-  // probe exists to price - it becomes an indexable temp array in DXBC.
+  // The register file, indexed by values only known at run time - the cost
+  // this design trades a compilation for.
   float4 regs[kXeMaxRegisters];
   [unroll] for (uint init = 0; init < 4; ++init) {
     regs[init] = position * float(init + 1);
@@ -76,119 +329,70 @@ float4 main(float4 position : SV_Position) : SV_Target {
     regs[clear] = float4(0.0, 0.0, 0.0, 0.0);
   }
 
+  float previous_scalar = 0.0;
+  bool kill = false;
+
   uint pc = 0;
   [loop] while (pc < xe_ucode_alu_count) {
     uint base = (xe_ucode_offset_dwords + pc * 3) << 2;
-    XeAluWords words;
-    words.w0 = xe_microcode.Load(base);
-    words.w1 = xe_microcode.Load(base + 4);
-    words.w2 = xe_microcode.Load(base + 8);
+    uint word0 = xe_microcode.Load(base);
+    uint word1 = xe_microcode.Load(base + 4);
+    uint word2 = xe_microcode.Load(base + 8);
     ++pc;
 
-    // Decode the fields the translator decodes.
-    uint vector_opcode = (words.w0 >> 0) & 0x1F;
-    uint scalar_opcode = (words.w0 >> 5) & 0x3F;
-    uint vector_dest = (words.w1 >> 0) & 0x3F;
-    uint vector_write_mask = (words.w1 >> 6) & 0xF;
-    uint scalar_dest = (words.w1 >> 10) & 0x3F;
-    uint scalar_write_mask = (words.w1 >> 16) & 0xF;
-    uint src0_reg = (words.w2 >> 0) & 0x3F;
-    uint src1_reg = (words.w2 >> 6) & 0x3F;
-    uint src2_reg = (words.w2 >> 12) & 0x3F;
-    uint src0_swizzle = (words.w2 >> 18) & 0xFF;
-    uint src1_swizzle = (words.w0 >> 11) & 0xFF;
-    uint src2_swizzle = (words.w0 >> 19) & 0xFF;
-    uint src_negate = (words.w1 >> 20) & 7;
-    uint src_absolute = (words.w1 >> 23) & 7;
-    uint is_constant = (words.w1 >> 26) & 7;
+    // Word 0, in the order ucode.h declares the bitfield.
+    uint vector_dest = word0 & 0x3F;
+    uint abs_constants = (word0 >> 7) & 1;
+    uint scalar_dest = (word0 >> 8) & 0x3F;
+    uint export_data = (word0 >> 15) & 1;
+    uint vector_write_mask = (word0 >> 16) & 0xF;
+    uint scalar_write_mask = (word0 >> 20) & 0xF;
+    uint vector_clamp = (word0 >> 24) & 1;
+    uint scalar_clamp = (word0 >> 25) & 1;
+    uint scalar_opcode = (word0 >> 26) & 0x3F;
 
-    // Operand fetch: register file or float constants, then swizzle and
-    // modifiers. This is per-source, three times per instruction.
-    float4 src0 = (is_constant & 1)
-                      ? asfloat(xe_float_constants.Load4(src0_reg << 4))
-                      : regs[src0_reg & (kXeMaxRegisters - 1)];
-    float4 src1 = (is_constant & 2)
-                      ? asfloat(xe_float_constants.Load4(src1_reg << 4))
-                      : regs[src1_reg & (kXeMaxRegisters - 1)];
-    float4 src2 = (is_constant & 4)
-                      ? asfloat(xe_float_constants.Load4(src2_reg << 4))
-                      : regs[src2_reg & (kXeMaxRegisters - 1)];
-    src0 = XeApplyModifiers(XeSwizzle(src0, src0_swizzle), src_negate & 1,
-                            src_absolute & 1);
-    src1 = XeApplyModifiers(XeSwizzle(src1, src1_swizzle), src_negate & 2,
-                            src_absolute & 2);
-    src2 = XeApplyModifiers(XeSwizzle(src2, src2_swizzle), src_negate & 4,
-                            src_absolute & 4);
+    // Word 1.
+    uint src3_swiz = word1 & 0xFF;
+    uint src2_swiz = (word1 >> 8) & 0xFF;
+    uint src1_swiz = (word1 >> 16) & 0xFF;
+    uint src3_negate = (word1 >> 24) & 1;
+    uint src2_negate = (word1 >> 25) & 1;
+    uint src1_negate = (word1 >> 26) & 1;
 
-    float4 vector_result = float4(0.0, 0.0, 0.0, 0.0);
-    switch (vector_opcode) {
-      case 0: vector_result = src0 + src1; break;                    // add
-      case 1: vector_result = src0 * src1; break;                    // mul
-      case 2: vector_result = max(src0, src1); break;                // max
-      case 3: vector_result = min(src0, src1); break;                // min
-      case 4: vector_result = src0 == src1 ? 1.0 : 0.0; break;       // seq
-      case 5: vector_result = src0 > src1 ? 1.0 : 0.0; break;        // sgt
-      case 6: vector_result = src0 >= src1 ? 1.0 : 0.0; break;       // sge
-      case 7: vector_result = src0 != src1 ? 1.0 : 0.0; break;       // sne
-      case 8: vector_result = frac(src0); break;                     // frc
-      case 9: vector_result = trunc(src0); break;                    // trunc
-      case 10: vector_result = floor(src0); break;                   // floor
-      case 11: vector_result = src0 * src1 + src2; break;            // mad
-      case 12: vector_result = src2 >= 0.0 ? src0 : src1; break;     // cndeq-ish
-      case 13: vector_result = src2 > 0.0 ? src0 : src1; break;      // cndgt
-      case 14: vector_result = src2 >= 0.0 ? src0 : src1; break;     // cndge
-      case 15: vector_result = dot(src0.xyzw, src1.xyzw); break;     // dp4
-      case 16: vector_result = dot(src0.xyz, src1.xyz); break;       // dp3
-      case 17: vector_result = dot(src0.xy, src1.xy) + src0.z; break;  // dp2add
-      case 18: {                                                     // cube
-        float3 c = src0.xyz;
-        float3 a = abs(c);
-        vector_result = float4(c.x, c.y, a.z, max(a.x, max(a.y, a.z)));
-      } break;
-      case 19: vector_result = max(src0, src1) * src2; break;        // max4-ish
-      case 20: vector_result = src0 >= src1 ? 1.0 : 0.0; break;      // setp_eq
-      case 21: vector_result = src0 != src1 ? 1.0 : 0.0; break;      // setp_ne
-      case 22: vector_result = src0 > src1 ? 1.0 : 0.0; break;       // setp_gt
-      case 23: vector_result = src0 >= src1 ? 1.0 : 0.0; break;      // setp_ge
-      case 24: vector_result = src0; break;                          // kill_eq
-      case 25: vector_result = src0; break;                          // kill_gt
-      case 26: vector_result = src0; break;                          // kill_ge
-      case 27: vector_result = src0; break;                          // kill_ne
-      case 28: vector_result = src0 * src1 + src2; break;            // dst
-      case 29: vector_result = max(src0, src1); break;               // maxa
-      default: vector_result = src0; break;
+    // Word 2.
+    uint src3_reg = word2 & 0xFF;
+    uint src2_reg = (word2 >> 8) & 0xFF;
+    uint src1_reg = (word2 >> 16) & 0xFF;
+    uint vector_opcode = (word2 >> 24) & 0x1F;
+    uint src3_sel = (word2 >> 29) & 1;
+    uint src2_sel = (word2 >> 30) & 1;
+    uint src1_sel = (word2 >> 31) & 1;
+
+    float4 src0 = XeLoadSource(src1_reg, src1_swiz, src1_negate, src1_sel,
+                               abs_constants, regs);
+    float4 src1 = XeLoadSource(src2_reg, src2_swiz, src2_negate, src2_sel,
+                               abs_constants, regs);
+    float4 src2 = XeLoadSource(src3_reg, src3_swiz, src3_negate, src3_sel,
+                               abs_constants, regs);
+
+    float4 vector_result = XeExecuteVector(vector_opcode, src0, src1, src2, kill);
+    if (vector_clamp) {
+      vector_result = saturate(vector_result);
     }
 
-    float scalar_result = 0.0;
-    float s0 = src0.x;
-    float s1 = src1.x;
-    switch (scalar_opcode) {
-      case 0: scalar_result = s0 + s1; break;
-      case 1: scalar_result = s0 + s1; break;
-      case 2: scalar_result = s0 * s1; break;
-      case 3: scalar_result = min(s0, s1); break;
-      case 4: scalar_result = s0 == s1 ? 1.0 : 0.0; break;
-      case 5: scalar_result = s0 > s1 ? 1.0 : 0.0; break;
-      case 6: scalar_result = s0 >= s1 ? 1.0 : 0.0; break;
-      case 7: scalar_result = s0 != s1 ? 1.0 : 0.0; break;
-      case 8: scalar_result = frac(s0); break;
-      case 9: scalar_result = trunc(s0); break;
-      case 10: scalar_result = floor(s0); break;
-      case 11: scalar_result = exp2(s0); break;
-      case 12: scalar_result = log2(max(s0, 1e-30)); break;
-      case 13: scalar_result = rcp(s0); break;
-      case 14: scalar_result = rsqrt(max(s0, 1e-30)); break;
-      case 15: scalar_result = sqrt(max(s0, 0.0)); break;
-      case 16: scalar_result = sin(s0); break;
-      case 17: scalar_result = cos(s0); break;
-      case 18: scalar_result = max(s0, s1); break;
-      case 19: scalar_result = s0 * s1; break;
-      case 20: scalar_result = saturate(s0); break;
-      default: scalar_result = s0; break;
+    // The scalar half takes its operand from the first source's selected
+    // component, and keeps a running "previous" the *_prev opcodes read.
+    float scalar_a = XeSwizzleScalar(src0, src1_swiz);
+    float scalar_b = XeSwizzleScalar(src1, src2_swiz);
+    float scalar_result =
+        XeExecuteScalar(scalar_opcode, scalar_a, scalar_b, previous_scalar, kill);
+    if (scalar_clamp) {
+      scalar_result = saturate(scalar_result);
     }
+    previous_scalar = scalar_result;
 
-    // Write back, respecting the write masks - a per-component select, which
-    // is what the translator emits too.
+    // Exports write both halves to the vector destination; otherwise each half
+    // writes its own register.
     uint vd = vector_dest & (kXeMaxRegisters - 1);
     float4 v = regs[vd];
     v.x = (vector_write_mask & 1) ? vector_result.x : v.x;
@@ -197,7 +401,7 @@ float4 main(float4 position : SV_Position) : SV_Target {
     v.w = (vector_write_mask & 8) ? vector_result.w : v.w;
     regs[vd] = v;
 
-    uint sd = scalar_dest & (kXeMaxRegisters - 1);
+    uint sd = export_data ? vd : (scalar_dest & (kXeMaxRegisters - 1));
     float4 s = regs[sd];
     s.x = (scalar_write_mask & 1) ? scalar_result : s.x;
     s.y = (scalar_write_mask & 2) ? scalar_result : s.y;
@@ -206,8 +410,13 @@ float4 main(float4 position : SV_Position) : SV_Target {
     regs[sd] = s;
   }
 
-  // One generic texture read, so the probe is not measured without any.
+  if (kill) {
+    discard;
+  }
+
+  // A generic sample so the texture path is present; the real thing decodes
+  // the format from the fetch constants the way the translator does.
   float4 sampled =
-      xe_texture.SampleLevel(xe_sampler, float3(regs[0].xy, 0.0), 0.0);
+      xe_texture.SampleLevel(xe_sampler, float3(saturate(regs[0].xy), 0.0), 0.0);
   return regs[1] * sampled;
 }
