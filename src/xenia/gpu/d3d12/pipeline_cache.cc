@@ -1791,6 +1791,13 @@ bool PipelineCache::TranslateAnalyzedShader(
     shape.memexport = shader.memexport_eM_written() != 0;
     shape.kills_pixels = shader.kills_pixels();
     shape.writes_depth = shader.writes_depth();
+    const DxbcShaderTranslator::SectionBytes& sections =
+        translator.section_dwords();
+    shape.dxbc_prologue_and_control = sections.prologue_and_control * 4;
+    shape.dxbc_alu = sections.alu * 4;
+    shape.dxbc_texture_fetch = sections.texture_fetch * 4;
+    shape.dxbc_vertex_fetch = sections.vertex_fetch * 4;
+    shape.dxbc_epilogue = sections.epilogue * 4;
     GpuCensus::Get().RecordShaderTranslated(shader.ucode_data_hash(), shape,
                                             translation.modification(),
                                             translation.translated_binary().size());

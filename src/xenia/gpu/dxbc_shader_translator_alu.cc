@@ -1042,6 +1042,13 @@ void DxbcShaderTranslator::ProcessAluInstruction(
     // Don't even disassemble or update predication.
     return;
   }
+  struct AluSectionScope {
+    DxbcShaderTranslator& t;
+    explicit AluSectionScope(DxbcShaderTranslator& translator) : t(translator) {
+      t.SectionBegin();
+    }
+    ~AluSectionScope() { t.section_dwords_.alu += t.SectionEnd(); }
+  } alu_section_scope(*this);
 
   if (emit_source_map_) {
     instruction_disassembly_buffer_.Reset();

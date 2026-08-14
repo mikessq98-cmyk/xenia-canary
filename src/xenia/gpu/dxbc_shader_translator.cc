@@ -1056,6 +1056,8 @@ void DxbcShaderTranslator::StartPixelShader() {
 }
 
 void DxbcShaderTranslator::StartTranslation() {
+  section_dwords_ = SectionBytes();
+  section_mark_ = uint32_t(shader_code_.size());
   // Set up the input and output registers.
   Modification shader_modification = GetDxbcShaderModification();
   uint32_t interpolator_register_mask = GetModificationInterpolatorMask();
@@ -1376,6 +1378,9 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
 }
 
 void DxbcShaderTranslator::CompleteShaderCode() {
+  // Everything emitted since the last instruction is the epilogue - the output
+  // merger, the EDRAM emulation and the flow-control close.
+  section_dwords_.epilogue += SectionEnd();
   if (!is_depth_only_pixel_shader_) {
     // Close the last exec, there's nothing to merge it with anymore, and we're
     // closing upper-level flow control blocks.
@@ -1481,6 +1486,7 @@ void DxbcShaderTranslator::CompleteShaderCode() {
       PopSystemTemp();
     }
   }
+  section_dwords_.epilogue += SectionEnd();
 }
 
 std::vector<uint8_t> DxbcShaderTranslator::CompleteTranslation() {

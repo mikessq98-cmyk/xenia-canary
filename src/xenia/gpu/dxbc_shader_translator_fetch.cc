@@ -23,6 +23,14 @@ using namespace ucode;
 
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
+  struct VertexFetchSectionScope {
+    DxbcShaderTranslator& t;
+    explicit VertexFetchSectionScope(DxbcShaderTranslator& translator)
+        : t(translator) {
+      t.SectionBegin();
+    }
+    ~VertexFetchSectionScope() { t.section_dwords_.vertex_fetch += t.SectionEnd(); }
+  } vertex_fetch_section_scope(*this);
   if (emit_source_map_) {
     instruction_disassembly_buffer_.Reset();
     instr.Disassemble(&instruction_disassembly_buffer_);
@@ -596,6 +604,14 @@ uint32_t DxbcShaderTranslator::FindOrAddSamplerBinding(
 
 void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     const ParsedTextureFetchInstruction& instr) {
+  struct FetchSectionScope {
+    DxbcShaderTranslator& t;
+    explicit FetchSectionScope(DxbcShaderTranslator& translator)
+        : t(translator) {
+      t.SectionBegin();
+    }
+    ~FetchSectionScope() { t.section_dwords_.texture_fetch += t.SectionEnd(); }
+  } fetch_section_scope(*this);
   if (emit_source_map_) {
     instruction_disassembly_buffer_.Reset();
     instr.Disassemble(&instruction_disassembly_buffer_);

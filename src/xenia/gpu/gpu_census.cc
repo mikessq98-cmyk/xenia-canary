@@ -536,20 +536,25 @@ void GpuCensus::WriteTables() {
     if (file) {
       file << "ucode_hash,type,dxbc_variants,ucode_instructions,"
               "control_flow_labels,texture_fetches,vertex_fetches,memexport,"
-              "kills_pixels,writes_depth,dxbc_bytes,draws\n";
+              "kills_pixels,writes_depth,dxbc_bytes,draws,"
+              "dxbc_prologue_and_control,dxbc_alu,dxbc_texture_fetch,"
+              "dxbc_vertex_fetch,dxbc_epilogue\n";
       std::lock_guard<std::mutex> lock(shaders_lock_);
       for (const auto& pair : shaders_) {
         const ShaderEntry& e = *pair.second;
         file << fmt::format(
-            "{:016X},{},{},{},{},{},{},{},{},{},{},{}\n", pair.first,
-            e.shape.is_pixel_shader ? "PS" : "VS",
+            "{:016X},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            pair.first, e.shape.is_pixel_shader ? "PS" : "VS",
             e.modifications.load(std::memory_order_relaxed),
             e.shape.ucode_instructions, e.shape.control_flow_labels,
             e.shape.texture_fetches, e.shape.vertex_fetches,
             e.shape.memexport ? 1 : 0, e.shape.kills_pixels ? 1 : 0,
             e.shape.writes_depth ? 1 : 0,
             e.dxbc_bytes.load(std::memory_order_relaxed),
-            e.draws.load(std::memory_order_relaxed));
+            e.draws.load(std::memory_order_relaxed),
+            e.shape.dxbc_prologue_and_control, e.shape.dxbc_alu,
+            e.shape.dxbc_texture_fetch, e.shape.dxbc_vertex_fetch,
+            e.shape.dxbc_epilogue);
       }
     }
   }

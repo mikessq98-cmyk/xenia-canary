@@ -49,6 +49,13 @@ class GpuCensus {
     bool memexport = false;
     bool kills_pixels = false;
     bool writes_depth = false;
+    // Where the emitted DXBC went. Compile cost tracks DXBC size, so this is
+    // what says which part of the translator is worth shrinking.
+    uint32_t dxbc_prologue_and_control = 0;
+    uint32_t dxbc_alu = 0;
+    uint32_t dxbc_texture_fetch = 0;
+    uint32_t dxbc_vertex_fetch = 0;
+    uint32_t dxbc_epilogue = 0;
   };
   void RecordShaderTranslated(uint64_t ucode_hash, const ShaderShape& shape,
                               uint64_t modification, size_t dxbc_bytes);

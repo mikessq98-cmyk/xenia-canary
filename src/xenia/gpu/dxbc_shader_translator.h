@@ -1030,6 +1030,35 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Executable instructions - generated during translation.
   std::vector<uint32_t> shader_code_;
+
+ public:
+  // Which part of the translation emitted how many DXBC dwords. Compile cost
+  // tracks DXBC size (r=0.76 measured), so knowing the split is knowing which
+  // part of the translator is worth making smaller.
+  struct SectionBytes {
+    // The prologue plus the flow-control scaffolding between instructions -
+    // everything that is not an instruction and not the epilogue.
+    uint32_t prologue_and_control = 0;
+    uint32_t alu = 0;
+    uint32_t texture_fetch = 0;
+    uint32_t vertex_fetch = 0;
+    // The output merger and the EDRAM emulation.
+    uint32_t epilogue = 0;
+  };
+  const SectionBytes& section_dwords() const { return section_dwords_; }
+
+ private:
+  SectionBytes section_dwords_;
+  uint32_t section_mark_ = 0;
+  // Closes whatever was open and charges it to the scaffolding, so nothing
+  // emitted between instructions is silently lost.
+  void SectionBegin() { section_dwords_.prologue_and_control += SectionEnd(); }
+  uint32_t SectionEnd() {
+    uint32_t now = uint32_t(shader_code_.size());
+    uint32_t written = now >= section_mark_ ? now - section_mark_ : 0;
+    section_mark_ = now;
+    return written;
+  }
   // Complete shader object, with all the needed blobs and dcl_ instructions -
   // generated in the end of translation.
   std::vector<uint32_t> shader_object_;
