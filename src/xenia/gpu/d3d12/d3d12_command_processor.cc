@@ -3741,7 +3741,12 @@ void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
   // Upload this shader's microcode once and keep it until another shader is
   // chosen - the pass is a measurement, not a streaming path.
   if (interpreter_microcode_hash_ != pixel_shader->ucode_data_hash()) {
-    uint32_t size_bytes = uint32_t(ucode.size() * sizeof(uint32_t));
+    // Padded well past what the shader can address: the interpreter reads
+    // constants by a register index up to 255, which is 4096 bytes, and a
+    // microcode buffer of a few hundred bytes bound to those slots was an
+    // out-of-bounds read on every instruction.
+    uint32_t used_bytes = uint32_t(ucode.size() * sizeof(uint32_t));
+    uint32_t size_bytes = std::max(used_bytes, 8192u);
     D3D12_RESOURCE_DESC buffer_desc;
     ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size_bytes,
                                             D3D12_RESOURCE_FLAG_NONE);
@@ -3759,11 +3764,13 @@ void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
       interpreter_unavailable_ = true;
       return;
     }
-    std::memcpy(mapping, ucode.data(), size_bytes);
+    std::memset(mapping, 0, size_bytes);
+    std::memcpy(mapping, ucode.data(), used_bytes);
     buffer->Unmap(0, nullptr);
     interpreter_microcode_buffer_ = buffer;
     interpreter_microcode_hash_ = pixel_shader->ucode_data_hash();
     interpreter_microcode_dwords_ = uint32_t(ucode.size());
+    interpreter_microcode_buffer_bytes_ = size_bytes;
   }
   if (!interpreter_microcode_buffer_) {
     return;
@@ -3778,10 +3785,10 @@ void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
   // the draw; for pricing the shading they only have to be valid.
   ui::d3d12::util::CreateBufferRawSRV(device, descriptors[0].first,
                                       interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_dwords_ * 4);
+                                      interpreter_microcode_buffer_bytes_);
   ui::d3d12::util::CreateBufferRawSRV(device, descriptors[1].first,
                                       interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_dwords_ * 4);
+                                      interpreter_microcode_buffer_bytes_);
   D3D12_SHADER_RESOURCE_VIEW_DESC texture_srv_desc = {};
   texture_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   texture_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -3793,7 +3800,7 @@ void D3D12CommandProcessor::DrawInterpreterMeasurementPass(
                                    descriptors[2].first);
   ui::d3d12::util::CreateBufferRawSRV(device, descriptors[3].first,
                                       interpreter_microcode_buffer_.Get(),
-                                      interpreter_microcode_dwords_ * 4);
+                                      interpreter_microcode_buffer_bytes_);
 
   SetExternalPipeline(interpreter_pipeline_.Get());
   deferred_command_list_.D3DSetGraphicsRootSignature(
@@ -4607,18 +4614,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // eligible draw of that frame uses. The frame rate with it against without
   // it is the interpreter's per-pixel cost - the last unmeasured term.
   if (cvars::d3d12_interpreter_render && pixel_shader) {
-    // The BIGGEST shader seen, not the first of the frame. The first draw of a
-    // frame is a clear or a UI quad - the first measurement ran three
-    // instructions where the median material has ninety-two, and a loop that
-    // short prices nothing.
+    // Only remembered here. The pass itself does NOT run inside a guest draw:
+    // injecting it there left the pipeline's zero render targets against the
+    // guest's bound ones, which D3D12 leaves undefined, and it took the device
+    // down with DXGI_ERROR_DEVICE_HUNG twice.
     if (pixel_shader->ucode_data().size() > interpreter_largest_dwords_) {
       interpreter_largest_dwords_ = uint32_t(pixel_shader->ucode_data().size());
       interpreter_largest_shader_ = pixel_shader;
-    }
-    if (frame_open_ && interpreter_passes_frame_ != frame_current_ &&
-        interpreter_largest_shader_) {
-      interpreter_passes_frame_ = frame_current_;
-      DrawInterpreterMeasurementPass(interpreter_largest_shader_);
     }
   }
   GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);

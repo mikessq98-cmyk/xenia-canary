@@ -129,6 +129,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> interpreter_microcode_buffer_;
   uint64_t interpreter_microcode_hash_ = 0;
   uint32_t interpreter_microcode_dwords_ = 0;
+  uint32_t interpreter_microcode_buffer_bytes_ = 0;
   uint64_t interpreter_passes_ = 0;
   uint64_t interpreter_passes_frame_ = UINT64_MAX;
   // The largest guest pixel shader seen, so the pass prices a real material

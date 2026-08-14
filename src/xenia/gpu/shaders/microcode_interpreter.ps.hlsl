@@ -334,8 +334,12 @@ float4 main(float4 position : SV_Position) : SV_Target {
   float previous_scalar = 0.0;
   bool kill = false;
 
+  // Hard bound as well as the count. A loop whose limit arrives wrong is a
+  // hung GPU and a lost device, not a wrong picture - and the count comes from
+  // outside this shader.
+  uint alu_count = min(xe_ucode_alu_count, 512u);
   uint pc = 0;
-  [loop] while (pc < xe_ucode_alu_count) {
+  [loop] while (pc < alu_count) {
     uint base = (xe_ucode_offset_dwords + pc * 3) << 2;
     uint word0 = xe_microcode.Load(base);
     uint word1 = xe_microcode.Load(base + 4);
