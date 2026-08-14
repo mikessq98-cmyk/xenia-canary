@@ -716,6 +716,10 @@ class PipelineCache {
     kSimilar,
     kAny,
   };
+  // One pipeline from the microcode interpreter probe shader, timed. Nothing
+  // renders through it - see d3d12_interpreter_probe.
+  void RunInterpreterProbe();
+
   // Every field of the description except the shaders, for the census table.
   static std::string DescribeRenderState(const PipelineDescription& description);
 

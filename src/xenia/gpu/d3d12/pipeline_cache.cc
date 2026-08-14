@@ -205,6 +205,18 @@ DEFINE_bool(
     "D3D12");
 
 DEFINE_bool(
+    d3d12_interpreter_probe, true,
+    "Once per launch, create a pipeline from the microcode interpreter probe "
+    "shader and report what the driver charged for it.\n"
+    "Nothing renders through it. It answers the one question that decides "
+    "whether replacing hundreds of translated material shaders with a handful "
+    "of interpreters is worth building: this driver takes 358-808 ms to "
+    "compile a 23-62 KB material, and the probe is 6 KB - if it compiles in "
+    "proportion, the path is open; if this driver stumbles on it the way it "
+    "stumbled on pipeline libraries and cached blobs, that is worth knowing in "
+    "one run rather than after months.",
+    "D3D12");
+DEFINE_bool(
     d3d12_dynamic_pipeline_state, true,
     "Take the depth bias and the index buffer strip cut from the command list "
     "rather than baking them into every pipeline, where the driver supports "
@@ -276,6 +288,8 @@ namespace d3d12 {
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/adaptive_quad_hs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
+#include "xenia/gpu/shaders/bytecode/d3d12_5_1/microcode_interpreter_ps.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/adaptive_triangle_hs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/continuous_quad_1cp_hs.h"
 #include "xenia/gpu/shaders/bytecode/d3d12_5_1/continuous_quad_4cp_hs.h"
@@ -358,6 +372,7 @@ bool PipelineCache::Initialize() {
         dynamic_depth_bias_ ? "yes" : "no",
         dynamic_strip_cut_ ? "yes" : "no");
   }
+  RunInterpreterProbe();
   substitute_scope_ = SubstituteScope::kStrict;
   if (cvars::d3d12_substitute_scope == "similar") {
     substitute_scope_ = SubstituteScope::kSimilar;
@@ -1550,6 +1565,98 @@ uint64_t PipelineCache::ComputeSubstituteKey(
   key_data.description.pixel_shader_hash = 0;
   key_data.description.pixel_shader_modification = 0;
   return XXH3_64bits(&key_data, sizeof(key_data));
+}
+
+static HRESULT CreateGraphicsPipelineStateGuarded(
+    ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid, void** state_out, DWORD* exception_code_out);
+
+void PipelineCache::RunInterpreterProbe() {
+  if (!cvars::d3d12_interpreter_probe) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  // A root signature matching the probe's bindings: microcode, guest float
+  // constants and one texture as SRVs, one sampler, one constant buffer.
+  D3D12_DESCRIPTOR_RANGE srv_range = {};
+  srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_range.NumDescriptors = 3;
+  srv_range.BaseShaderRegister = 0;
+  D3D12_ROOT_PARAMETER root_parameters[2] = {};
+  root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+  root_parameters[0].DescriptorTable.pDescriptorRanges = &srv_range;
+  root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  root_parameters[1].Descriptor.ShaderRegister = 0;
+  root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_STATIC_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxLOD = D3D12_FLOAT32_MAX;
+  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
+  root_signature_desc.NumParameters = 2;
+  root_signature_desc.pParameters = root_parameters;
+  root_signature_desc.NumStaticSamplers = 1;
+  root_signature_desc.pStaticSamplers = &sampler;
+  root_signature_desc.Flags =
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
+  root_signature.Attach(
+      ui::d3d12::util::CreateRootSignature(provider, root_signature_desc));
+  if (!root_signature) {
+    XELOGW("Interpreter probe: could not create a root signature for it");
+    return;
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root_signature.Get();
+  desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
+  desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
+  desc.PS.pShaderBytecode = shaders::microcode_interpreter_ps;
+  desc.PS.BytecodeLength = sizeof(shaders::microcode_interpreter_ps);
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+
+  uint64_t start = xe::Clock::QueryHostTickCount();
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> state;
+  DWORD exception_code = 0;
+  HRESULT hr = CreateGraphicsPipelineStateGuarded(
+      device, &desc, IID_PPV_ARGS(&state), &exception_code);
+  double ms = double(xe::Clock::QueryHostTickCount() - start) * 1000.0 /
+              double(xe::Clock::QueryHostTickFrequency());
+  if (exception_code) {
+    XELOGE(
+        "Interpreter probe: the driver's compiler FAULTED on it (code "
+        "{:08X}) after {:.0f} ms - a microcode interpreter is not viable on "
+        "this driver",
+        uint32_t(exception_code), ms);
+    return;
+  }
+  if (FAILED(hr)) {
+    XELOGE(
+        "Interpreter probe: creation FAILED (hr=0x{:08X}) after {:.0f} ms",
+        uint32_t(hr), ms);
+    return;
+  }
+  XELOGI(
+      "Interpreter probe: {} bytes of DXBC compiled in {:.0f} ms. This driver "
+      "charges 358-808 ms for a 23-62 KB translated material; a handful of "
+      "these would replace hundreds of those.",
+      sizeof(shaders::microcode_interpreter_ps), ms);
 }
 
 std::string PipelineCache::DescribeRenderState(
