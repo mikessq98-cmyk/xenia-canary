@@ -361,8 +361,16 @@ void TextureCache::CompletedSubmissionUpdated(
     // The list is in use order, so once the oldest is too recent to go,
     // nothing after it qualifies either.
     uint64_t unused_for_ms = current_time - texture->last_usage_time();
-    if (unused_for_ms < idle_eviction_ms &&
-        !IsOwningShaderGone(*texture, completed_submission_index)) {
+    // A departed shader SHORTENS the lease, it does not cancel it. Cancelling
+    // it let a texture go the moment its shader left, and with substitution
+    // sharing textures between shaders that meant live surfaces disappearing
+    // and coming straight back - the flicker.
+    uint64_t texture_idle_ms =
+        IsOwningShaderGone(*texture, completed_submission_index)
+            ? std::max(idle_eviction_ms / kShaderGoneIdleDivisor,
+                       kMinEvictionAgeMs)
+            : idle_eviction_ms;
+    if (unused_for_ms < texture_idle_ms) {
       break;
     }
     if (released_this_pass >= max_bytes_this_pass) {
@@ -370,8 +378,7 @@ void TextureCache::CompletedSubmissionUpdated(
     }
     if (spare_streamed_past_only &&
         texture->used_submission_count() >= kFrequentUseSubmissions &&
-        unused_for_ms < idle_eviction_ms * kFrequentUseIdleMultiplier &&
-        !IsOwningShaderGone(*texture, completed_submission_index)) {
+        unused_for_ms < texture_idle_ms * kFrequentUseIdleMultiplier) {
       // Drawn with often enough to be part of the scene, and recently enough
       // for that to still be true. Kept while there is room.
       //
@@ -867,9 +874,10 @@ void TextureCache::Texture::MarkAsUsed() {
   GpuCensus::Get().RecordTextureUsedByShaders(
       key_hash, drawing_vs, texture_cache_.current_draw_ps_hash_);
   if (drawing_vs) {
-    if (!owning_vertex_shader_) {
-      owning_vertex_shader_ = drawing_vs;
-    }
+    // The MOST RECENT shader to draw with it, not the first. A texture picked
+    // up by a second shader would otherwise still be attributed to the first,
+    // and go when that one left the scene.
+    owning_vertex_shader_ = drawing_vs;
     texture_cache_.vertex_shader_last_submission_[drawing_vs] =
         texture_cache_.current_submission_index_;
   }

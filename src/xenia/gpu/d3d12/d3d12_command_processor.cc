@@ -3538,13 +3538,24 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
       pipeline_cache_->SetCreationPermits(permits + 1);
     }
     governor_catching_up_ = true;
+    governor_caught_up_samples_ = 0;
     governor_healthy_samples_ = 0;
     return;
   }
   if (governor_catching_up_) {
-    // Whole again - hand the cores back at once and resume the normal policy.
+    // Leaving catch-up costs one permit per sample, and only after the skipped
+    // share has stayed down. Dropping straight back to one on the first good
+    // sample made a sawtooth: 28 expansions in a session that ended on a single
+    // compiler, because the share climbed again the moment the cores went back.
+    if (++governor_caught_up_samples_ < kGovernorSamplesBeforeReleasing) {
+      return;
+    }
+    governor_caught_up_samples_ = 0;
+    if (permits > 1) {
+      pipeline_cache_->SetCreationPermits(permits - 1);
+      return;
+    }
     governor_catching_up_ = false;
-    pipeline_cache_->SetCreationPermits(1);
     governor_healthy_samples_ = 0;
     governor_expansion_cooldown_ = 0;
     return;

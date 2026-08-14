@@ -807,6 +807,7 @@ class TextureCache {
   // go at once instead of each waiting out its own idle timer.
   std::unordered_map<uint64_t, uint64_t> vertex_shader_last_submission_;
   static constexpr uint64_t kShaderGoneSubmissions = 120;
+  static constexpr uint64_t kShaderGoneIdleDivisor = 4;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
