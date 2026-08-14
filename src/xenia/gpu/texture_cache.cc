@@ -17,6 +17,7 @@
 #include "xenia/base/profiling.h"
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/xxhash.h"
+#include "xenia/gpu/gpu_census.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shared_memory.h"
 
@@ -51,6 +52,21 @@ DEFINE_uint32(
     "flickering.\n"
     "0 disables age-based release entirely; the memory core still asks for "
     "memory back when it needs it.",
+    "GPU");
+DEFINE_int32(
+    texture_cache_max_mb, 1280,
+    "Size in megabytes the texture cache aims to stay under. 0 lets it grow "
+    "until the memory core asks for memory back.\n"
+    "This is a target for the AGE test, not a hard limit and not a quota: over "
+    "it, a texture nothing has drawn with recently is released sooner, and the "
+    "further over it goes the shorter that idle window gets. A texture the "
+    "game is still drawing with is never released for size at any size.\n"
+    "It exists because waiting for a shortage is waiting too long. Measured "
+    "cold on Black Ops: the core reported no shortage for a whole session "
+    "while the cache grew to 2 GB, then forced trims took 6961 textures out of "
+    "the working set - because nothing else was left - and 30.9 GB of "
+    "re-uploads dropped the frame rate from 48 to 30. Releasing early costs a "
+    "texture nobody wanted; releasing late costs the ones everybody did.",
     "GPU");
 DEFINE_bool(
     texture_cache_skip_unchanged_uploads, false,
@@ -274,9 +290,48 @@ void TextureCache::CompletedSubmissionUpdated(
     default:
       break;
   }
+
+  // THE SIZE THE CACHE AIMS TO STAY UNDER, which is a different question from
+  // how much memory is free.
+  //
+  // Waiting for the core to report a shortage is waiting too long. Measured on
+  // 2026-08-13, cold Black Ops: pressure read `none` for the whole session
+  // while the cache grew to 2 GB, and then 48 forced trims took **6961**
+  // textures out of the WORKING SET - things the game was still drawing with -
+  // because by then nothing else was left to take. 30.9 GB of re-uploads
+  // followed and the frame rate fell from 48 to 30. The run that had room
+  // evicted nothing from its working set at all.
+  //
+  // So the cache aims at a size of its own, and the only thing that changes as
+  // it approaches it is how patient the AGE test is. Nothing is ever taken for
+  // being big, or for being expensive, or because a total was exceeded - only
+  // for not having been drawn with recently, which is the one question this
+  // cache can answer and the one the player cannot see the answer to.
+  uint64_t target_bytes =
+      uint64_t(std::max(cvars::texture_cache_max_mb, 0)) << 20;
+  if (target_bytes && textures_total_host_memory_usage_ > target_bytes) {
+    // Over the target: the working set's IDLE members become fair game too,
+    // and the window tightens the further over it goes - a quarter of the way
+    // over halves it, at twice the target it is at the floor. A texture being
+    // drawn with right now is still never touched at any size.
+    spare_streamed_past_only = false;
+    double over = double(textures_total_host_memory_usage_) /
+                  double(target_bytes);
+    idle_eviction_ms = uint64_t(double(idle_eviction_ms) / std::max(over, 1.0) /
+                                std::max(over, 1.0));
+    idle_eviction_ms = std::max(idle_eviction_ms, kMinEvictionAgeMs);
+  }
   if (!idle_eviction_ms) {
     return;
   }
+
+  // Over the target the sweep runs on every completed submission rather than
+  // every kIdleEvictionIntervalSubmissions. The batching exists to avoid
+  // paying ResetTextureBindings for a handful of textures; when the cache is
+  // over its target there is never a handful, and letting it drift further
+  // over between passes is how the working set ends up on the block.
+  bool over_target =
+      target_bytes && textures_total_host_memory_usage_ > target_bytes;
 
   // Releasing a handful every time a submission completes is worse than
   // releasing the same textures in one go: every eviction pass calls
@@ -284,7 +339,7 @@ void TextureCache::CompletedSubmissionUpdated(
   // is per pass rather than per texture. Nothing waits on this memory unless
   // the core says otherwise - under critical pressure something does, so the
   // batching is skipped.
-  if (pressure != GpuMemoryArbiter::Pressure::kCritical &&
+  if (pressure != GpuMemoryArbiter::Pressure::kCritical && !over_target &&
       completed_submission_index <
           last_idle_eviction_submission_ + kIdleEvictionIntervalSubmissions) {
     return;
@@ -360,6 +415,8 @@ void TextureCache::CompletedSubmissionUpdated(
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      GpuCensus::Get().RecordTextureEvicted(TextureKey::Hasher{}(texture->key()),
+                                            /*was_in_working_set=*/false);
       textures_.erase(found_texture_it);
       ++destroyed_count;
       // `texture` is invalid now.
@@ -436,6 +493,11 @@ uint64_t TextureCache::TrimTexturesForHostMemory(
       } else {
         ++destroyed_streaming;
       }
+      // Which pass took it is the whole diagnosis for churn: a texture the
+      // title had streamed past costs nothing to lose, one still in the
+      // working set comes straight back.
+      GpuCensus::Get().RecordTextureEvicted(TextureKey::Hasher{}(texture->key()),
+                                            take_frequently_used);
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
       released += texture_bytes;
@@ -811,6 +873,10 @@ void TextureCache::Texture::MarkAsUsed() {
   }
   last_usage_submission_index_ = texture_cache_.current_submission_index_;
   last_usage_time_ = texture_cache_.current_submission_time_;
+  // Counted per SUBMISSION, not per draw - the early return above means a
+  // texture bound a thousand times in one submission is one use, which is the
+  // unit the eviction policy thinks in and therefore the one worth recording.
+  GpuCensus::Get().RecordTextureBound(TextureKey::Hasher{}(key_));
   // One per submission the texture was actually drawn with - this is the
   // frequency half of the eviction decision. Saturating, because the only
   // question ever asked of it is whether it reached kFrequentUseSubmissions.
@@ -920,6 +986,18 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
+  {
+    GpuCensus::TextureShape shape;
+    shape.format = uint32_t(key.format);
+    shape.dimension = uint32_t(key.dimension);
+    shape.width = key.GetWidth();
+    shape.height = key.GetHeight();
+    shape.depth_or_array_size = key.GetDepthOrArraySize();
+    shape.mip_levels = key.mip_max_level + 1;
+    shape.scaled_resolve = key.scaled_resolve != 0;
+    GpuCensus::Get().RecordTextureCreated(TextureKey::Hasher{}(key), shape,
+                                          texture->GetHostMemoryUsage());
+  }
   return texture;
 }
 
@@ -1290,6 +1368,12 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       }
 
       texture->LogAction("Loaded");
+      // A texture whose load count climbs far past its creation count is one
+      // the title keeps having to fetch back - the churn signal, per texture
+      // rather than as one session-wide total.
+      GpuCensus::Get().RecordTextureLoaded(
+          TextureKey::Hasher{}(texture->key()), texture->GetGuestBaseSize(),
+          0.0);
     }
   }
 
@@ -1324,6 +1408,7 @@ std::string TextureCache::GetLoadCostReport() const {
       total_textures_loaded_, total_loaded_guest_bytes_ >> 20,
       total_texture_load_ms_);
 }
+
 bool TextureCache::LoadTextureData(Texture& texture) {
   // Lockless pre-check: if texture appears up-to-date, skip the lock.
   // This is safe because worst case is a false positive (we acquire lock

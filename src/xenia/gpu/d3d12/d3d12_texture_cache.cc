@@ -26,6 +26,7 @@
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
+#include "xenia/gpu/gpu_census.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/texture_util.h"
@@ -1959,14 +1960,40 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
     break;
   }
 
+  bool from_pool = resource != nullptr;
+  // Everything the driver call could plausibly depend on, sampled BEFORE it -
+  // the state it ran under, not the state it left behind.
+  GpuCensus::CreationContext context;
+  context.compilers_busy = command_processor_.GetPipelinesBeingCreated();
+  context.queue_depth = command_processor_.GetPipelineQueueDepth();
+  context.from_pool = from_pool;
+  context.pool_bytes = texture_resource_pool_bytes_;
+  context.free_host_bytes = command_processor_.GetHostMemoryFreeBytes();
+  context.host_bytes = uint64_t(desc.Width) * desc.Height *
+                       desc.DepthOrArraySize * desc.MipLevels;
+  context.format = uint32_t(key.format);
+  context.dimension = uint32_t(key.dimension);
+  context.width = key.GetWidth();
+  context.height = key.GetHeight();
+  context.mip_levels = key.mip_max_level + 1;
+
+  uint64_t create_start = xe::Clock::QueryHostTickCount();
   if (!resource) {
     if (FAILED(device->CreateCommittedResource(
             &ui::d3d12::util::kHeapPropertiesDefault,
             provider.GetHeapFlagCreateNotZeroed(), &desc, resource_state,
             nullptr, IID_PPV_ARGS(&resource)))) {
+      GpuCensus::Get().RecordTextureCreation(
+          context, double(xe::Clock::QueryHostTickCount() - create_start) *
+                       1000.0 / double(xe::Clock::QueryHostTickFrequency()),
+          /*succeeded=*/false);
       return nullptr;
     }
   }
+  GpuCensus::Get().RecordTextureCreation(
+      context, double(xe::Clock::QueryHostTickCount() - create_start) * 1000.0 /
+                   double(xe::Clock::QueryHostTickFrequency()),
+      /*succeeded=*/true);
   return std::unique_ptr<Texture>(
       new D3D12Texture(*this, key, resource.Get(), resource_state));
 }

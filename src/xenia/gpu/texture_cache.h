@@ -642,6 +642,7 @@ class TextureCache {
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
 
+
   static const LoadShaderInfo& GetLoadShaderInfo(
       LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);
