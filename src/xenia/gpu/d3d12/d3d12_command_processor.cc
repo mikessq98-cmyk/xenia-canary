@@ -623,6 +623,10 @@ void D3D12CommandProcessor::LogHostMemoryStatistics() {
     if (!creation.empty()) {
       XELOGI("[MEM] texture creation: {}", creation);
     }
+    std::string shape = GpuCensus::Get().GetPipelineShapeReport();
+    if (!shape.empty()) {
+      XELOGI("[MEM] pipeline shape: {}", shape);
+    }
     // Written every report rather than only at shutdown: the sessions worth
     // reading the tables for are the ones that end in a device loss or with
     // the system terminating the app, and neither reaches a shutdown path.
@@ -3515,14 +3519,38 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
     --governor_expansion_cooldown_;
   }
 
-  // A frame rate that has fallen is only the compilers' fault if the compilers
-  // are actually running. Measured on 2026-08-13: a Black Ops session collapsed
-  // from 46 fps to 1.2 while the compilers used 0.0-0.5 cores - the cause was
-  // the texture cache trimming its own working set every three seconds - and
-  // the governor cut permits from two to one anyway. That gave the guest
-  // nothing back, because there was nothing to give back, and it halved
-  // pipeline throughput at the exact moment 29574 draws were being skipped for
-  // want of one. Something else being wrong is not a reason to throttle this.
+  // While the picture is visibly incomplete, finishing pipelines outranks the
+  // frame rate; the frame-rate policy resumes once the queue drains.
+  uint64_t skipped = draws_skipped_.load(std::memory_order_relaxed);
+  uint64_t drawn = draws_issued_.load(std::memory_order_relaxed);
+  uint64_t skipped_delta = skipped - governor_last_skipped_;
+  uint64_t drawn_delta = drawn - governor_last_drawn_;
+  governor_last_skipped_ = skipped;
+  governor_last_drawn_ = drawn;
+  double requested = double(skipped_delta + drawn_delta);
+  double skipped_fraction = requested > 0.0 ? double(skipped_delta) / requested
+                                            : 0.0;
+
+  if (skipped_fraction > kGovernorSkippedFractionFloor) {
+    // One step per sample, not straight to the maximum - the driver charges
+    // more per pipeline the more compilers ask at once.
+    if (permits < max_permits) {
+      pipeline_cache_->SetCreationPermits(permits + 1);
+    }
+    governor_catching_up_ = true;
+    governor_healthy_samples_ = 0;
+    return;
+  }
+  if (governor_catching_up_) {
+    // Whole again - hand the cores back at once and resume the normal policy.
+    governor_catching_up_ = false;
+    pipeline_cache_->SetCreationPermits(1);
+    governor_healthy_samples_ = 0;
+    governor_expansion_cooldown_ = 0;
+    return;
+  }
+
+  // A fallen frame rate is only the compilers' fault if they are using CPU.
   // Speculative work runs on headroom the guest is not using, and nothing
   // else. This is a separate decision from the permit count: a title that is
   // struggling should still get the pipeline a draw is waiting on as fast as
@@ -3547,16 +3575,14 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
     // streaming in, which is when the guest threads need the console most.
     // Measured on 2026-08-13: five compilers gave 15.3 fps and two gave 33.5,
     // on the same scene with the same everything else.
+    // Backing off needs the same confirmation as expanding, or the loop flaps.
+    if (++governor_unhealthy_samples_ < kGovernorSamplesBeforeBackingOff) {
+      return;
+    }
+    governor_unhealthy_samples_ = 0;
     if (permits > 1) {
       pipeline_cache_->SetCreationPermits(permits - 1);
-      // AND DO NOT IMMEDIATELY TRY AGAIN.
-      //
-      // Without this the loop hunts. The first session with the governor
-      // expanded 24 times and backed off 25, flapping between one and two
-      // compilers every couple of samples for four minutes. Each failed
-      // attempt now buys a longer wait before the next one, so a title that
-      // genuinely has no room to spare converges on leaving it alone instead
-      // of paying the cost of rediscovering that every few seconds.
+      // Each failed attempt buys a longer wait before the next one.
       governor_expansion_cooldown_ =
           std::min(governor_expansion_cooldown_ * 2 +
                        kGovernorCooldownSamplesAfterBackoff,
@@ -3565,6 +3591,7 @@ void D3D12CommandProcessor::UpdatePipelineCreationGovernor() {
     governor_healthy_samples_ = 0;
     return;
   }
+  governor_unhealthy_samples_ = 0;
 
   // Expansion is the risky direction, so it needs the frame rate to be holding
   // AND real spare capacity AND to have been true for several samples running
@@ -3884,6 +3911,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 #if XE_PLATFORM_WINRT
   uint64_t texture_phase_start_ticks = Clock::QueryHostTickCount();
 #endif  // XE_PLATFORM_WINRT
+  texture_cache_->SetCurrentDrawShaders(
+      vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
 #if XE_PLATFORM_WINRT
   // Covers loading and converting guest textures - the other classic source
@@ -4292,13 +4322,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // to diagnose a hang, the solver is recovering from one, or this pair has
   // never been proven to survive execution. The last is the common one and
   // costs a synchronization per DISTINCT pair - once per game, not per draw.
+  draws_issued_.fetch_add(1, std::memory_order_relaxed);
   GpuCensus::Get().RecordDraw(draw_vs_hash, draw_ps_hash, index_count);
   uint64_t draw_state_key =
       pipeline_cache_->GetPipelineStateKeyByHandle(pipeline_handle);
   bool verifying_new_pair = pipeline_cache_->SolverNeedsExecutionVerification(
       draw_vs_hash, draw_ps_hash, draw_state_key);
+  if (verifying_new_pair &&
+      verifications_this_frame_ >= kMaxVerificationsPerFrame &&
+      !cvars::d3d12_serialize_draws_for_hang_diagnosis &&
+      !pipeline_cache_->solver_execution_safe_mode()) {
+    // Over budget: skip the draw rather than draw it unverified - unverified
+    // pairs reaching the GPU together is what makes a hang unattributable.
+    draws_skipped_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   if (cvars::d3d12_serialize_draws_for_hang_diagnosis || verifying_new_pair ||
       pipeline_cache_->solver_execution_safe_mode()) {
+    if (verifying_new_pair) {
+      ++verifications_this_frame_;
+    }
     // Written and flushed BEFORE the draw goes to the GPU, so if the device
     // dies here the file still names this draw.
     pipeline_cache_->SolverExecutionJournalDraw(draw_vs_hash, draw_ps_hash);
@@ -5007,6 +5050,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    verifications_this_frame_ = 0;
 
     // Swap all readback buffers for delayed sync (one frame behind)
     for (auto& pair : readback_buffers_) {

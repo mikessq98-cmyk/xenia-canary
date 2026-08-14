@@ -15,26 +15,21 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <memory>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace xe {
 namespace gpu {
 
-// A per-title record of WHAT the GPU side is actually doing, kept so the
-// question "why is this title slow here" can be answered from evidence instead
-// of from the shape of the code.
+// Per-object record of what the GPU side is doing - shaders, pipelines,
+// textures and host texture creation - written out as CSV tables next to the
+// shader storage and summarised in the periodic report.
 //
-// The periodic memory report already says how much everything costs in total.
-// That is enough to know a session is losing time and not enough to know to
-// what: a title that stutters on new pipelines and a title that stutters on
-// texture churn produce the same totals. This keeps the per-object detail -
-// which shader, in how many variants, costing how long to compile, drawing how
-// often; which texture, loaded how many times, thrown out and fetched back how
-// many times - and writes it out as three tables that can be sorted and read.
-//
-// Everything here is off the hot path by construction: recording is an atomic
-// increment into an entry found by hash, and the tables are only walked when a
-// report is asked for.
+// Recording is an atomic increment into an entry found by hash; the tables are
+// only walked when a report is asked for.
 class GpuCensus {
  public:
   static GpuCensus& Get();
@@ -44,11 +39,7 @@ class GpuCensus {
   bool enabled() const { return enabled_; }
 
   // ---- shaders -----------------------------------------------------------
-  // The shape of one guest shader, recorded once when it is first translated.
-  // "Modifications" is the count that matters most: one piece of guest
-  // microcode becomes a separate DXBC program for every interpolator layout,
-  // depth mode and param-gen combination it is drawn with, and every one of
-  // those is a separate ~500 ms trip through the driver's compiler.
+  // Shape of one guest shader, recorded when it is first translated.
   struct ShaderShape {
     bool is_pixel_shader = false;
     uint32_t ucode_instructions = 0;
@@ -90,11 +81,8 @@ class GpuCensus {
   void RecordTextureEvicted(uint64_t key_hash, bool was_in_working_set);
 
   // ---- host texture creation ---------------------------------------------
-  // The state the driver call ran under. Recorded for every creation, and the
-  // slow ones are kept individually - the buckets answer the hypothesis this
-  // was built for (does creation contend with the driver's shader compiler),
-  // and the raw rows are there so the next hypothesis does not need another
-  // build to test.
+  // State the driver call ran under. Slow ones are also kept individually so
+  // a later hypothesis can be tested without another build.
   struct CreationContext {
     uint32_t compilers_busy = 0;
     uint32_t queue_depth = 0;
@@ -112,6 +100,21 @@ class GpuCensus {
                              bool succeeded);
   // One line for the periodic report - the buckets, side by side.
   std::string GetCreationReport();
+
+  // ---- what actually multiplies the pipeline count ------------------------
+  // Shader pair, translation modification and render state counted apart, so
+  // which of the three multiplies the pipeline count can be read off.
+  void RecordPipelineDescription(uint64_t vs_hash, uint64_t vs_modification,
+                                 uint64_t ps_hash, uint64_t ps_modification,
+                                 uint64_t render_state_hash,
+                                 uint64_t description_hash,
+                                 const std::string& render_state_text);
+  std::string GetPipelineShapeReport();
+
+  // ---- which shaders read which textures -----------------------------------
+  // Which shader pairs drew with a texture.
+  void RecordTextureUsedByShaders(uint64_t texture_key_hash, uint64_t vs_hash,
+                                  uint64_t ps_hash);
 
   // ---- reporting ---------------------------------------------------------
   // A handful of lines for the periodic log: the worst offender in each
@@ -175,12 +178,7 @@ class GpuCensus {
   std::atomic<uint64_t> total_verification_syncs_{0};
   std::atomic<uint64_t> total_verification_wait_us_{0};
 
-  // Creation buckets. Deliberately more of them than the question needs:
-  // splitting only by "was the compiler busy" would confirm or deny one
-  // hypothesis and leave every other one needing a new build. Memory pressure,
-  // texture size, the reuse pool and the queue depth are all plausible
-  // explanations for a 90 ms CreateCommittedResource, and all of them are one
-  // counter each.
+  // More buckets than one hypothesis needs, so the next one costs no build.
   struct CreationBucket {
     std::atomic<uint64_t> count{0};
     std::atomic<uint64_t> us{0};
@@ -215,6 +213,23 @@ class GpuCensus {
   static constexpr double kSlowCreationMs = 4.0;
   std::mutex creation_events_lock_;
   std::vector<CreationEvent> creation_events_;
+
+  // The three ways a pipeline description can differ, counted apart.
+  std::mutex shape_lock_;
+  std::unordered_set<uint64_t> distinct_descriptions_;
+  std::unordered_set<uint64_t> distinct_shader_pairs_;
+  std::unordered_set<uint64_t> distinct_shader_combinations_;  // pair + mods
+  // Render state -> how many pipelines use it, and what it is in words. If
+  // this map is short, the state is not what multiplies.
+  std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>
+      distinct_render_states_;
+
+  // texture -> the shader pairs that drew with it, and the reverse count.
+  std::mutex texture_shader_lock_;
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>>
+      texture_shader_pairs_;
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>>
+      shader_pair_textures_;
 };
 
 }  // namespace gpu

@@ -291,29 +291,15 @@ void TextureCache::CompletedSubmissionUpdated(
       break;
   }
 
-  // THE SIZE THE CACHE AIMS TO STAY UNDER, which is a different question from
-  // how much memory is free.
-  //
-  // Waiting for the core to report a shortage is waiting too long. Measured on
-  // 2026-08-13, cold Black Ops: pressure read `none` for the whole session
-  // while the cache grew to 2 GB, and then 48 forced trims took **6961**
-  // textures out of the WORKING SET - things the game was still drawing with -
-  // because by then nothing else was left to take. 30.9 GB of re-uploads
-  // followed and the frame rate fell from 48 to 30. The run that had room
-  // evicted nothing from its working set at all.
-  //
-  // So the cache aims at a size of its own, and the only thing that changes as
-  // it approaches it is how patient the AGE test is. Nothing is ever taken for
-  // being big, or for being expensive, or because a total was exceeded - only
-  // for not having been drawn with recently, which is the one question this
-  // cache can answer and the one the player cannot see the answer to.
+  // A size the cache aims at, separate from how much memory is free: waiting
+  // for the core to report a shortage means only the working set is left to
+  // take. Over the target the AGE test grows impatient; nothing is ever taken
+  // for being big.
   uint64_t target_bytes =
       uint64_t(std::max(cvars::texture_cache_max_mb, 0)) << 20;
   if (target_bytes && textures_total_host_memory_usage_ > target_bytes) {
-    // Over the target: the working set's IDLE members become fair game too,
-    // and the window tightens the further over it goes - a quarter of the way
-    // over halves it, at twice the target it is at the floor. A texture being
-    // drawn with right now is still never touched at any size.
+    // Idle members of the working set become fair game, and the window
+    // tightens the further over the target the cache is.
     spare_streamed_past_only = false;
     double over = double(textures_total_host_memory_usage_) /
                   double(target_bytes);
@@ -325,11 +311,8 @@ void TextureCache::CompletedSubmissionUpdated(
     return;
   }
 
-  // Over the target the sweep runs on every completed submission rather than
-  // every kIdleEvictionIntervalSubmissions. The batching exists to avoid
-  // paying ResetTextureBindings for a handful of textures; when the cache is
-  // over its target there is never a handful, and letting it drift further
-  // over between passes is how the working set ends up on the block.
+  // Over the target the sweep runs every submission - the batching below only
+  // exists to avoid paying ResetTextureBindings for a handful of textures.
   bool over_target =
       target_bytes && textures_total_host_memory_usage_ > target_bytes;
 
@@ -378,7 +361,8 @@ void TextureCache::CompletedSubmissionUpdated(
     // The list is in use order, so once the oldest is too recent to go,
     // nothing after it qualifies either.
     uint64_t unused_for_ms = current_time - texture->last_usage_time();
-    if (unused_for_ms < idle_eviction_ms) {
+    if (unused_for_ms < idle_eviction_ms &&
+        !IsOwningShaderGone(*texture, completed_submission_index)) {
       break;
     }
     if (released_this_pass >= max_bytes_this_pass) {
@@ -386,7 +370,8 @@ void TextureCache::CompletedSubmissionUpdated(
     }
     if (spare_streamed_past_only &&
         texture->used_submission_count() >= kFrequentUseSubmissions &&
-        unused_for_ms < idle_eviction_ms * kFrequentUseIdleMultiplier) {
+        unused_for_ms < idle_eviction_ms * kFrequentUseIdleMultiplier &&
+        !IsOwningShaderGone(*texture, completed_submission_index)) {
       // Drawn with often enough to be part of the scene, and recently enough
       // for that to still be true. Kept while there is room.
       //
@@ -876,7 +861,18 @@ void TextureCache::Texture::MarkAsUsed() {
   // Counted per SUBMISSION, not per draw - the early return above means a
   // texture bound a thousand times in one submission is one use, which is the
   // unit the eviction policy thinks in and therefore the one worth recording.
-  GpuCensus::Get().RecordTextureBound(TextureKey::Hasher{}(key_));
+  uint64_t key_hash = TextureKey::Hasher{}(key_);
+  GpuCensus::Get().RecordTextureBound(key_hash);
+  uint64_t drawing_vs = texture_cache_.current_draw_vs_hash_;
+  GpuCensus::Get().RecordTextureUsedByShaders(
+      key_hash, drawing_vs, texture_cache_.current_draw_ps_hash_);
+  if (drawing_vs) {
+    if (!owning_vertex_shader_) {
+      owning_vertex_shader_ = drawing_vs;
+    }
+    texture_cache_.vertex_shader_last_submission_[drawing_vs] =
+        texture_cache_.current_submission_index_;
+  }
   // One per submission the texture was actually drawn with - this is the
   // frequency half of the eviction decision. Saturating, because the only
   // question ever asked of it is whether it reached kFrequentUseSubmissions.
@@ -925,6 +921,21 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
+}
+
+bool TextureCache::IsOwningShaderGone(const Texture& texture,
+                                      uint64_t completed_submission_index) {
+  // Nothing draws with this texture any more because the shader that did has
+  // stopped drawing - a scene change, not an idle timer.
+  if (!texture.owning_vertex_shader_) {
+    return false;
+  }
+  auto it = vertex_shader_last_submission_.find(texture.owning_vertex_shader_);
+  if (it == vertex_shader_last_submission_.end()) {
+    return false;
+  }
+  return completed_submission_index > it->second &&
+         completed_submission_index - it->second >= kShaderGoneSubmissions;
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {

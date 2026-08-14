@@ -4395,6 +4395,36 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   ToxicShaderSolver::CreationProbe solver_probe(solver_, vs_hash, ps_hash);
   uint64_t description_hash = XXH3_64bits(&description, sizeof(description));
 
+  {
+    // The same description with the shader identity removed - what is left is
+    // the fixed-function state alone, so the two multipliers can be counted
+    // apart instead of being read off one combined total.
+    PipelineDescription state_only = description;
+    state_only.vertex_shader_hash = 0;
+    state_only.vertex_shader_modification = 0;
+    state_only.pixel_shader_hash = 0;
+    state_only.pixel_shader_modification = 0;
+    GpuCensus::Get().RecordPipelineDescription(
+        description.vertex_shader_hash, description.vertex_shader_modification,
+        description.pixel_shader_hash, description.pixel_shader_modification,
+        XXH3_64bits(&state_only, sizeof(state_only)), description_hash,
+        fmt::format(
+            "topo {} cut {} gs {} wire {} cull {} ccw {} clip {} msaa {} "
+            "depth_fmt {} depth_func {} depth_write {} stencil {} bias {}",
+            uint32_t(description.primitive_topology_type_or_tessellation_mode),
+            uint32_t(description.strip_cut_index),
+            uint32_t(description.geometry_shader),
+            uint32_t(description.fill_mode_wireframe),
+            uint32_t(description.cull_mode),
+            uint32_t(description.front_counter_clockwise),
+            uint32_t(description.depth_clip),
+            uint32_t(description.host_msaa_samples),
+            uint32_t(description.depth_format),
+            uint32_t(description.depth_func),
+            uint32_t(description.depth_write),
+            uint32_t(description.stencil_enable), description.depth_bias));
+  }
+
   DWORD creation_exception_code = 0;
   uint64_t driver_compile_start = xe::Clock::QueryHostTickCount();
   HRESULT hr = CreateGraphicsPipelineStateGuarded(

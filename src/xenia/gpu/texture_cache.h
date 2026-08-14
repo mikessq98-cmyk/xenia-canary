@@ -371,6 +371,8 @@ class TextureCache {
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
     uint32_t used_submission_count_ = 1;
+    // The vertex shader that first drew with this texture.
+    uint64_t owning_vertex_shader_ = 0;
     // Hash of the guest bytes this texture was last built from, 0 when never
     // measured. Only maintained while the duplicate measurement is on.
     uint64_t measured_content_hash_ = 0;
@@ -641,6 +643,8 @@ class TextureCache {
   // create the texture - if it's nullptr, occasionally a recreation attempt
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
+  bool IsOwningShaderGone(const Texture& texture,
+                          uint64_t completed_submission_index);
 
 
   static const LoadShaderInfo& GetLoadShaderInfo(
@@ -784,6 +788,25 @@ class TextureCache {
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+
+  // The shaders of the draw currently being set up, so a texture binding can
+  // be attributed to what is drawing with it. Written by the command processor
+  // immediately before RequestTextures, read on the same thread.
+ public:
+  void SetCurrentDrawShaders(uint64_t vertex_shader_hash,
+                             uint64_t pixel_shader_hash) {
+    current_draw_vs_hash_ = vertex_shader_hash;
+    current_draw_ps_hash_ = pixel_shader_hash;
+  }
+
+ private:
+  uint64_t current_draw_vs_hash_ = 0;
+  uint64_t current_draw_ps_hash_ = 0;
+  // Submission each vertex shader last drew in. 78% of textures are used by
+  // exactly one shader pair, so when a shader stops drawing its textures can
+  // go at once instead of each waiting out its own idle timer.
+  std::unordered_map<uint64_t, uint64_t> vertex_shader_last_submission_;
+  static constexpr uint64_t kShaderGoneSubmissions = 120;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;

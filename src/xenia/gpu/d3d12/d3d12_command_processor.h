@@ -490,6 +490,19 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Below this much compiler CPU, a dropped frame rate has some other cause
   // and taking a compiler away cannot help it.
   static constexpr double kGovernorMinCompilerCoresToBlame = 0.5;
+  // Backing off needs as much confirmation as expanding - see the governor.
+  static constexpr uint32_t kGovernorSamplesBeforeBackingOff = 2;
+  // Above this share of requested draws going unrendered, the picture is
+  // visibly incomplete and finishing the pipelines outranks the frame rate.
+  static constexpr double kGovernorSkippedFractionFloor = 0.10;
+  // Each verification is a full GPU drain; a scene introducing many unproven
+  // pairs at once would otherwise pay for all of them in one frame.
+  static constexpr uint32_t kMaxVerificationsPerFrame = 2;
+  uint32_t verifications_this_frame_ = 0;
+  uint32_t governor_unhealthy_samples_ = 0;
+  uint64_t governor_last_skipped_ = 0;
+  uint64_t governor_last_drawn_ = 0;
+  bool governor_catching_up_ = false;
   uint64_t governor_last_ticks_ = 0;
   uint64_t governor_last_frames_ = 0;
   uint64_t governor_last_cpu_100ns_ = 0;
@@ -698,6 +711,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // session - the question that decides what is worth optimizing.
   std::atomic<uint32_t> draws_skipped_{0};
   std::atomic<uint32_t> draws_substituted_{0};
+  // Draws that reached the GPU, so the governor can weigh how much of what the
+  // game asked for is actually being rendered.
+  std::atomic<uint64_t> draws_issued_{0};
 
   static constexpr size_t kConstantBufferPoolKeep = 4;
 

@@ -290,6 +290,66 @@ std::string GpuCensus::GetCreationReport() {
       creation_failures_.load(std::memory_order_relaxed));
 }
 
+void GpuCensus::RecordPipelineDescription(uint64_t vs_hash,
+                                          uint64_t vs_modification,
+                                          uint64_t ps_hash,
+                                          uint64_t ps_modification,
+                                          uint64_t render_state_hash,
+                                          uint64_t description_hash,
+                                          const std::string& render_state_text) {
+  if (!enabled_) {
+    return;
+  }
+  uint64_t pair_key[2] = {vs_hash, ps_hash};
+  uint64_t combo_key[4] = {vs_hash, vs_modification, ps_hash, ps_modification};
+  std::lock_guard<std::mutex> lock(shape_lock_);
+  distinct_descriptions_.insert(description_hash);
+  distinct_shader_pairs_.insert(XXH3_64bits(pair_key, sizeof(pair_key)));
+  distinct_shader_combinations_.insert(
+      XXH3_64bits(combo_key, sizeof(combo_key)));
+  auto& entry = distinct_render_states_[render_state_hash];
+  ++entry.first;
+  if (entry.second.empty()) {
+    entry.second = render_state_text;
+  }
+}
+
+std::string GpuCensus::GetPipelineShapeReport() {
+  if (!enabled_) {
+    return std::string();
+  }
+  std::lock_guard<std::mutex> lock(shape_lock_);
+  if (distinct_descriptions_.empty()) {
+    return std::string();
+  }
+  return fmt::format(
+      "{} distinct pipelines = {} shader pair(s) x {} pair+modification "
+      "combination(s) x {} distinct render state(s)",
+      distinct_descriptions_.size(), distinct_shader_pairs_.size(),
+      distinct_shader_combinations_.size(), distinct_render_states_.size());
+}
+
+void GpuCensus::RecordTextureUsedByShaders(uint64_t texture_key_hash,
+                                           uint64_t vs_hash,
+                                           uint64_t ps_hash) {
+  if (!enabled_ || !vs_hash) {
+    return;
+  }
+  uint64_t pair[2] = {vs_hash, ps_hash};
+  uint64_t pair_key = XXH3_64bits(pair, sizeof(pair));
+  std::lock_guard<std::mutex> lock(texture_shader_lock_);
+  // Bounded: a texture every shader in the game touches would otherwise grow a
+  // set the size of the shader list, per texture.
+  auto& pairs = texture_shader_pairs_[texture_key_hash];
+  if (pairs.size() < 64) {
+    pairs.insert(pair_key);
+  }
+  auto& textures = shader_pair_textures_[pair_key];
+  if (textures.size() < 256) {
+    textures.insert(texture_key_hash);
+  }
+}
+
 std::string GpuCensus::GetHighlights() {
   if (!enabled_) {
     return std::string();
@@ -446,6 +506,33 @@ void GpuCensus::WriteTables() {
                             e.context.format, e.context.dimension,
                             e.context.width, e.context.height,
                             e.context.mip_levels);
+      }
+    }
+  }
+  {
+    // The question this file exists for: how many DIFFERENT fixed-function
+    // states does the title actually draw in. If the list is short, the
+    // pipeline count is driven by shader combinations alone, and only a
+    // different way of shading brings it down.
+    std::ofstream file(table_root_ /
+                       fmt::format("{:08X}.states.csv", title_id_));
+    if (file) {
+      file << "render_state_hash,pipelines_using_it,state\n";
+      std::lock_guard<std::mutex> lock(shape_lock_);
+      for (const auto& pair : distinct_render_states_) {
+        file << fmt::format("{:016X},{},\"{}\"\n", pair.first,
+                            pair.second.first, pair.second.second);
+      }
+    }
+  }
+  {
+    std::ofstream file(table_root_ /
+                       fmt::format("{:08X}.texture_shaders.csv", title_id_));
+    if (file) {
+      file << "texture_key_hash,distinct_shader_pairs\n";
+      std::lock_guard<std::mutex> lock(texture_shader_lock_);
+      for (const auto& pair : texture_shader_pairs_) {
+        file << fmt::format("{:016X},{}\n", pair.first, pair.second.size());
       }
     }
   }
